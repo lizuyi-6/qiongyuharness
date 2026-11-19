@@ -87,6 +87,7 @@
 .response-byline svg { width: 15px; height: 15px; }
 .response-byline strong { font-size: 13px; font-weight: 670; }
 .response-copy { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.75; }
+.output-warnings { padding: 7px 10px; border-left: 2px solid var(--amber); background: var(--wash); color: var(--amber); font-size: 12px; line-height: 1.55; }
 .tool-trace {
   width: fit-content;
   max-width: 100%;

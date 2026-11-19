@@ -240,7 +240,14 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
         }
       });
       emit({ type: "step", label: "处理完成" });
-      return { text, usage: gateway.usage, model: job.model };
+      return {
+        text,
+        usage: gateway.usage,
+        model: job.model,
+        max_tokens_clamped: gateway.max_tokens_clamped,
+        finish_reasons: gateway.finish_reasons,
+        truncated: gateway.truncated
+      };
     } catch (error) {
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;

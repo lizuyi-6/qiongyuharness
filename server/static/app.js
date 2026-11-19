@@ -237,7 +237,9 @@ async function executeDesktopPlan(task, data, form) {
       updateAgentRunStatus(form,"正在保存大纲…");
       phase="complete";
       return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
-        run_id:prepared.run_id,text:result.text,usage:result.usage,model:result.model || model
+        run_id:prepared.run_id,text:result.text,
+        usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
       });
     });
     updateAgentRunStatus(form,"");
@@ -519,7 +521,7 @@ async function handleForm(event) {
       const result=desktopRequired?await executeDesktopPlan(task,data,form):
         await post(task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan",data);
       if (state.agent===agent && state.route[0]==="agent" && form.isConnected) {
-        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null});
+        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null,outputTelemetry:result.usage});
         saveAgent();
         localRefresh();
         document.querySelector("#plan")?.scrollIntoView({behavior:"smooth",block:"nearest"});

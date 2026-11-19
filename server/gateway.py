@@ -104,8 +104,23 @@ def usage_from(data):
         return {}
     values = {}
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        if isinstance(data.get(key), int) and data[key] >= 0:
+        if isinstance(data.get(key), int) and not isinstance(data[key], bool) and data[key] >= 0:
             values[key] = data[key]
+    clamped = data.get("max_tokens_clamped")
+    if (isinstance(clamped, list) and len(clamped) <= 4
+            and all(isinstance(item, dict)
+                    and isinstance(item.get("requested"), int) and not isinstance(item.get("requested"), bool)
+                    and isinstance(item.get("applied"), int) and not isinstance(item.get("applied"), bool)
+                    for item in clamped)):
+        values["max_tokens_clamped"] = [
+            {"requested": item["requested"], "applied": item["applied"]} for item in clamped
+        ]
+    reasons = data.get("finish_reasons")
+    if (isinstance(reasons, list) and len(reasons) <= 4
+            and all(isinstance(reason, str) and 0 < len(reason) <= 64 for reason in reasons)):
+        values["finish_reasons"] = list(reasons)
+    if isinstance(data.get("truncated"), bool):
+        values["truncated"] = data["truncated"]
     return values
 
 
