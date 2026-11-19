@@ -177,7 +177,7 @@ function quotaErrorDetails(upstream, body) {
 
 async function pipeResponse(upstream, response, state) {
   const contentType = upstream.headers.get("content-type") || "application/json";
-  if (upstream.ok) state.quota_error = null;
+  if (upstream.ok && !state.sticky_quota_error) state.quota_error = null;
   if (!upstream.ok) {
     const body = await readErrorBody(upstream);
     const quotaError = quotaErrorDetails(upstream, body);
@@ -229,7 +229,8 @@ async function pipeResponse(upstream, response, state) {
   }
 }
 
-async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = [], fetchImpl = globalThis.fetch }) {
+async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = [], stickyQuotaError = false,
+  fetchImpl = globalThis.fetch }) {
   if (typeof baseUrl !== "string" || !baseUrl.startsWith("https://") && !baseUrl.startsWith("http://127.0.0.1:")) {
     throw new Error("模型服务地址无效");
   }
@@ -245,13 +246,18 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     max_tokens_clamped: [],
     finish_reasons: [],
     truncated: false,
-    quota_error: null
+    quota_error: null,
+    sticky_quota_error: stickyQuotaError === true
   };
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const server = http.createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions" ||
         !bearerMatches(request.headers.authorization, key)) {
       replyError(response, 403, "请求未获授权");
+      return;
+    }
+    if (state.sticky_quota_error && state.quota_error) {
+      replyError(response, 429, "模型额度已用尽");
       return;
     }
 

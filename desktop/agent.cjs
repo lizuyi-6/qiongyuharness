@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { createLoopbackGateway } = require("./lib/loopback-gateway.cjs");
 const { runDsh } = require("./lib/dsh-bridge.cjs");
+const { runPipeline } = require("./lib/pipeline.cjs");
 const { listModelsWithRefresh, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
@@ -37,7 +38,53 @@ function responseError(payload, status, fallback) {
   return modelServiceError(status, undefined) || fallback;
 }
 
-function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
+const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
+const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
+const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validPipelineModel(value) {
+  return typeof value === "string" && value.length >= 1 && value.length <= 200 && !/[\s\x00-\x1f\x7f]/u.test(value);
+}
+
+function sanitizePipelineConfig(payload) {
+  if (!isObject(payload) || typeof payload.enabled !== "boolean" ||
+      typeof payload.version !== "string" || payload.version.length < 1 || payload.version.length > 32 ||
+      !isObject(payload.roles) || !isObject(payload.limits) || !isObject(payload.prompts) ||
+      payload.limits.max_exec_rounds !== 2 || payload.limits.deadline_ms !== 270_000) {
+    throw new Error("智能分工配置无效");
+  }
+  const roles = {};
+  for (const role of PIPELINE_ROLES) {
+    if (!validPipelineModel(payload.roles[role])) throw new Error("智能分工配置无效");
+    roles[role] = payload.roles[role];
+  }
+  const prompts = {};
+  for (const name of ["understand", "accept", "review", "revise"]) {
+    const value = payload.prompts[name];
+    if (typeof value !== "string" || !value.length || value.length > 8_000) {
+      throw new Error("智能分工配置无效");
+    }
+    prompts[name] = value;
+  }
+  return {
+    enabled: payload.enabled,
+    version: payload.version,
+    roles,
+    limits: { max_exec_rounds: 2, deadline_ms: 270_000 },
+    prompts
+  };
+}
+
+function unavailableRole(config, models, role) {
+  if (models.includes(config.roles[role])) return null;
+  return `智能分工不可用：未开放模型 ${config.roles[role]}（角色：${PIPELINE_ROLE_LABELS[role]}）`;
+}
+
+function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, dependencies = {} }) {
   const credentialRoot = path.join(app.getPath("userData"), "qo-model-credentials");
   const runtimePaths = resolveRuntimePaths(app.isPackaged ? process.resourcesPath : undefined, __dirname);
 
@@ -161,11 +208,40 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
     );
   }
 
+  const readFreshModels = dependencies.freshModels || freshModels;
+  const getCredentialImpl = dependencies.getCredential || getCredential;
+  const readSessionJson = dependencies.fetchSessionJson || fetchSessionJson;
+  const makeGateway = dependencies.createLoopbackGateway || createLoopbackGateway;
+  const runDshStage = dependencies.runDsh || runDsh;
+  const readUsage = dependencies.requestUsage || requestUsage;
+  const clockNow = dependencies.now || Date.now;
+  const getNodeExecutable = dependencies.nodeExecutable || nodeExecutable;
+
+  async function loadPipelineConfig(origin) {
+    const payload = await readSessionJson(origin, `${origin}/api/v1/me/pipeline`);
+    return sanitizePipelineConfig(payload);
+  }
+
+  async function pipelineStatus(origin, available) {
+    try {
+      const config = await loadPipelineConfig(origin);
+      if (!config.enabled) return { available: false, reason: "智能分工未开放", roles: config.roles };
+      const missing = REQUIRED_PIPELINE_ROLES.map((role) => unavailableRole(config, available, role)).find(Boolean);
+      if (missing) return { available: false, reason: missing, roles: config.roles };
+      return { available: true, roles: config.roles };
+    } catch {
+      return { available: false, reason: "智能分工配置获取失败" };
+    }
+  }
+
   async function models() {
     try {
-      return { models: await freshModels() };
+      const available = await readFreshModels();
+      const pipeline = await pipelineStatus(getOrigin(), available);
+      return { models: available, pipeline };
     } catch (error) {
-      return { models: [], error: error.message || "模型列表加载失败" };
+      return { models: [], error: error.message || "模型列表加载失败",
+        pipeline: { available: false, reason: "模型列表获取失败" } };
     }
   }
 
@@ -196,84 +272,146 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" || typeof job.model !== "string") {
       throw new Error("桌面执行请求无效");
     }
+    const startedAt = clockNow();
+    const pipelineRequested = job.model === "qo:pipeline";
     const origin = getOrigin();
-    emit({ type: "step", label: job.context ? "载入项目资料" : "准备执行环境" });
-    const available = await freshModels();
-    if (!available.includes(job.model)) throw new Error("该模型已不再对你开放，请重新选择");
-    const { credential } = await getCredential(origin);
-
-    const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
-    let gateway;
-    try {
-      let contextPath;
-      let contextPatchPath;
-      if (job.context !== undefined && job.context !== null) {
-        contextPath = path.join(place, "office-context.json");
-        await fs.writeFile(contextPath, JSON.stringify(job.context), { encoding: "utf8", mode: 0o600 });
-        contextPatchPath = path.join(place, "office-context.patch.yml");
-        await fs.writeFile(contextPatchPath,
-          `- insert:\n    - id: office-context\n      name: ${JSON.stringify(runtimePaths.contextPlugin)}\n`,
-          { encoding: "utf8", mode: 0o600 });
+    const hasContext = job.context !== undefined && job.context !== null;
+    emit({ type: "step", label: hasContext ? "载入项目资料" : "准备执行环境" });
+    const available = await readFreshModels();
+    let config;
+    if (pipelineRequested) {
+      try {
+        config = await loadPipelineConfig(origin);
+      } catch {
+        throw new Error("智能分工配置获取失败");
       }
+      if (!config.enabled) throw new Error("智能分工未开放");
+      for (const role of REQUIRED_PIPELINE_ROLES) {
+        const missing = unavailableRole(config, available, role);
+        if (missing) throw new Error(missing);
+      }
+    } else if (!available.includes(job.model)) {
+      throw new Error("该模型已不再对你开放，请重新选择");
+    }
+    const { credential } = await getCredentialImpl(origin);
 
-      gateway = await createLoopbackGateway({
-        baseUrl: credential.baseUrl,
-        apiKey: credential.apiKey,
-        model: job.model,
-        allowedTools: contextPath ? ["office_context_read"] : [],
-        fetchImpl: (url, options) => net.fetch(url, options)
-      });
+    async function runStage(stage) {
+      const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
+      let gateway;
+      try {
+        let contextPath;
+        let contextPatchPath;
+        if (stage.withContext && hasContext) {
+          contextPath = path.join(place, "office-context.json");
+          await fs.writeFile(contextPath, JSON.stringify(job.context), { encoding: "utf8", mode: 0o600 });
+          contextPatchPath = path.join(place, "office-context.patch.yml");
+          await fs.writeFile(contextPatchPath,
+            `- insert:\n    - id: office-context\n      name: ${JSON.stringify(runtimePaths.contextPlugin)}\n`,
+            { encoding: "utf8", mode: 0o600 });
+        }
 
-      const env = buildRuntimeEnv({
-        baseEnv: process.env,
-        home: place,
-        gatewayUrl: gateway.url,
-        gatewayKey: gateway.key,
+        gateway = await makeGateway({
+          baseUrl: credential.baseUrl,
+          apiKey: credential.apiKey,
+          model: stage.model,
+          allowedTools: contextPath ? ["office_context_read"] : [],
+          stickyQuotaError: pipelineRequested,
+          fetchImpl: (url, options) => net.fetch(url, options)
+        });
+
+        const env = buildRuntimeEnv({
+          baseEnv: process.env,
+          home: place,
+          gatewayUrl: gateway.url,
+          gatewayKey: gateway.key,
+          model: stage.model,
+          system: stage.system,
+          contextPath,
+          dshBin: runtimePaths.dshBin
+        });
+        const node = getNodeExecutable();
+        Object.assign(env, node.extraEnv);
+        emit({ type: "step", label: "正在调用模型" });
+        const text = await runDshStage({
+          ...node,
+          dshBin: runtimePaths.dshBin,
+          patchPath: runtimePaths.patchPath,
+          contextPatchPath,
+          cwd: place,
+          env,
+          model: stage.model,
+          prompt: stage.prompt,
+          timeoutMs: stage.timeoutMs,
+          onEvent: (event) => {
+            if (event?.type === "step" && typeof event.label === "string") emit(event);
+          }
+        });
+        if (pipelineRequested && gateway?.quota_error) {
+          const failure = new Error("模型额度已用尽");
+          failure.quota_error = gateway.quota_error;
+          throw failure;
+        }
+        return {
+          text,
+          usage: {
+            ...gateway.usage,
+            max_tokens_clamped: gateway.max_tokens_clamped,
+            finish_reasons: gateway.finish_reasons,
+            truncated: gateway.truncated
+          }
+        };
+      } catch (error) {
+        if (gateway?.quota_error) {
+          let usageSnapshot;
+          try {
+            const result = await readUsage(credential, (url, options) => net.fetch(url, options));
+            if (result.state === "available") usageSnapshot = result.usage;
+          } catch {}
+          const message = quotaExhaustionMessage(gateway.quota_error, usageSnapshot);
+          const failure = new Error(message || error.message || "模型额度已用尽");
+          failure.quota_error = gateway.quota_error;
+          throw failure;
+        }
+        if (/桌面 Harness 调用超时/.test(error?.message || "")) error.code = "STAGE_TIMEOUT";
+        throw error;
+      } finally {
+        if (gateway) await gateway.close().catch(() => {});
+        await fs.rm(place, { recursive: true, force: true });
+      }
+    }
+
+    try {
+      if (pipelineRequested) {
+        return await runPipeline({
+          job,
+          config,
+          availableModels: available,
+          runStage,
+          emit,
+          now: clockNow,
+          startedAt
+        });
+      }
+      const result = await runStage({
+        role: "execute",
         model: job.model,
         system: job.system,
-        contextPath,
-        dshBin: runtimePaths.dshBin
-      });
-      const node = nodeExecutable();
-      Object.assign(env, node.extraEnv);
-      emit({ type: "step", label: "正在调用模型" });
-      const text = await runDsh({
-        ...node,
-        dshBin: runtimePaths.dshBin,
-        patchPath: runtimePaths.patchPath,
-        contextPatchPath,
-        cwd: place,
-        env,
-        model: job.model,
         prompt: job.prompt,
-        onEvent: (event) => {
-          if (event?.type === "step" && typeof event.label === "string") emit(event);
-        }
+        withContext: hasContext,
+        timeoutMs: 95_000
       });
       emit({ type: "step", label: "处理完成" });
       return {
-        text,
-        usage: gateway.usage,
+        text: result.text,
+        usage: result.usage,
         model: job.model,
-        max_tokens_clamped: gateway.max_tokens_clamped,
-        finish_reasons: gateway.finish_reasons,
-        truncated: gateway.truncated
+        max_tokens_clamped: result.usage.max_tokens_clamped,
+        finish_reasons: result.usage.finish_reasons,
+        truncated: result.usage.truncated
       };
     } catch (error) {
-      if (gateway?.quota_error) {
-        let usageSnapshot;
-        try {
-          const result = await requestUsage(credential, (url, options) => net.fetch(url, options));
-          if (result.state === "available") usageSnapshot = result.usage;
-        } catch {}
-        const message = quotaExhaustionMessage(gateway.quota_error, usageSnapshot);
-        if (message) error = new Error(message);
-      }
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;
-    } finally {
-      if (gateway) await gateway.close().catch(() => {});
-      await fs.rm(place, { recursive: true, force: true });
     }
   }
 
@@ -287,4 +425,4 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
   };
 }
 
-module.exports = { createDesktopAgent, nodeAtLeast, validateBaseUrl };
+module.exports = { createDesktopAgent, nodeAtLeast, sanitizePipelineConfig, validateBaseUrl };

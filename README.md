@@ -79,6 +79,21 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 - **收回模型权限：**在 sub2api 停用该密钥或该用户，或将员工从 QO 名单移除。按 sub2api 开通接口契约，已停用、过期或额度用尽的同名密钥返回 403 `key_disabled`，不会被自动补发；用户停用返回 403 `user_disabled`。删除密钥会被视为重置；下次登录请求开通时，接口会重新创建同名密钥。名单移除则在下一次服务启动同步时禁用工作台账号并清会话。
 - **管理员邮箱：**不要用 sub2api 管理员账号绑定的邮箱作为员工名单邮箱，否则开通接口会返回 403 `admin_user_not_provisionable`。
 
+## 桌面智能分工
+
+桌面聊天模型列表顶部提供“智能分工（理解→执行→验收）”。角色模型和阶段提示词由已登录桌面客户端从 `/api/v1/me/pipeline` 获取；配置失败或理解、执行、验收任一模型未包含在员工实时 `/v1/models` 列表中时，智能分工不可用，普通模型仍可选择。轻量和复核角色缺少模型时分别按标准流程执行、或将复核记为不可用并保留验收结论。
+
+服务端环境变量：
+
+- `QO_PIPELINE_ENABLED` 只接受 `0` 或 `1`，缺省为 `1`。
+- `QO_PIPELINE_MODEL_UNDERSTAND` 缺省 `glm-5.3`。
+- `QO_PIPELINE_MODEL_EXECUTE` 缺省 `step-5-preview`。
+- `QO_PIPELINE_MODEL_ACCEPT` 缺省 `glm-5.3`。
+- `QO_PIPELINE_MODEL_REVIEW` 缺省 `k3.1-pro`。
+- `QO_PIPELINE_MODEL_LIGHT` 缺省 `deepseek-v4.1-flash-1017`。
+
+模型值须为 1–200 个字符且不含空白或控制字符；无效配置会阻止服务启动。上述缺省模型 ID 于 2026-11-19 与 sub2api 穹驭分组（id 22）的 `/v1/models` 列表逐一比对过，五个 ID 均在列表中，并经 `/v1/chat/completions` 实测返回 200；分组模型变动后应重新核对并按需覆盖。流水线最多执行两轮，阶段调用上限为 8 次，全程时限为 270 秒；本机按每阶段最多 95 秒执行。流水线遇到额度 429 后会阻止该阶段的后续上游请求，并停止后续阶段；单模型执行仍遵循原有额度恢复行为。线程记录的验收和复核徽标来自服务端保存的流水线 trace。
+
 ## 已知限制
 
 - 中国大陆 IP 直连 sub2api 会返回 451；桌面端通过 Electron `net.fetch` 请求模型服务并使用 Electron 系统代理配置。模型列表路径会把 451 显示为“当前网络无法访问模型服务(451)”；生成请求经本机回环网关转发，非 2xx 上游响应会被网关改成 502。工作台服务端访问 OIDC 和 sub2api 的请求使用 `httpx` 且设置 `trust_env=False`，不会继承环境代理。

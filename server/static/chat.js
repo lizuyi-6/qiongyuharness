@@ -4,6 +4,7 @@ import { deckFiles, deckPanel, selectionChip } from "./slides.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
+const PIPELINE_MODEL = "qo:pipeline";
 let usageRequestId = 0;
 
 function clientExecutionRequired() {
@@ -160,15 +161,23 @@ export async function loadDesktopModelState() {
     const result=await window.officeDesktop.models();
     const models=[...new Set((Array.isArray(result?.models)?result.models:[])
       .filter(model=>typeof model==="string" && model.trim()).map(model=>model.trim()))];
-    const invalidated=Boolean(storedModel && !models.includes(storedModel));
-    const selectedModel=invalidated?"":storedModel;
+    const pipelineAvailable=result?.pipeline?.available===true;
+    const pipelineReason=typeof result?.pipeline?.reason==="string"?result.pipeline.reason:"";
+    const storedModelAvailable=storedModel===PIPELINE_MODEL?pipelineAvailable:models.includes(storedModel);
+    const invalidated=Boolean(storedModel && !storedModelAvailable);
+    const selectedModel=invalidated?"":storedModel || (pipelineAvailable?PIPELINE_MODEL:"");
     if (invalidated) saveDraft(modelDraftKey,{model:""});
     const modelNotice=invalidated?"上次选择的模型已不可用，已清空，请重新选择。":
-      result?.error || (models.length?"":"暂无可用模型，请联系管理员开通。");
-    return {models,selectedModel,modelNotice};
+      result?.error || (models.length || pipelineAvailable?"":"暂无可用模型，请联系管理员开通。");
+    return {models,selectedModel,modelNotice,pipelineAvailable,pipelineReason};
   } catch (error) {
     return {models:[],selectedModel:"",modelNotice:error.message || "模型列表获取失败，请重试。"};
   }
+}
+
+function selectedModelAvailable(workspace) {
+  return workspace?.selectedModel===PIPELINE_MODEL?workspace.pipelineAvailable===true:
+    Boolean(workspace?.selectedModel && workspace.models?.includes(workspace.selectedModel));
 }
 
 function draftFor(workspace) {
@@ -223,6 +232,10 @@ export function showConversationHistory() {
 
 function turnView(turn) {
   const reply=turn.reply || turn.error || (turn.status === "running" ? "正在执行…" : "");
+  const pipeline=turn.pipeline;
+  const pipelineLabel=pipeline?.verdict==="pass"?"验收通过":pipeline?.verdict==="fail"?"验收未通过":
+    pipeline?.verdict==="skipped" && pipeline?.tier==="light"?"轻量任务·未验收":"";
+  const reviewLabels={pass:"复核：通过",fail:"复核：未通过",not_needed:"复核：无需复核",unavailable:"复核：不可用"};
   return `<section class="conversation-turn">
     <div class="request-entry"><p>${turn.selection?`<small class="request-scope">第 ${turn.selection.slide} 页${turn.selection.shape_id?" · 文本框":""}</small>`:""}${e(turn.message)}</p></div>
     ${reply ? `<div class="response-entry">
@@ -230,6 +243,12 @@ function turnView(turn) {
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行记录 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map(step=>`<li>${icon("check")}${e(step)}</li>`).join("")}</ul></details>` : ""}
       <p class="${turn.error?"error":"response-copy"}">${e(reply)}</p>
+      ${pipeline && pipelineLabel?`<div class="pipeline-result">
+        <div class="pipeline-result-status"><span class="pipeline-badge ${pipeline.verdict==="fail"?"failed":pipeline.verdict==="skipped"?"skipped":"passed"}">${e(pipelineLabel)}</span>
+          <span class="pipeline-review">${e(reviewLabels[pipeline.review] || "复核：未知")}</span></div>
+        ${pipeline.verdict==="fail" && Array.isArray(pipeline.issues) && pipeline.issues.length?
+          `<ul class="pipeline-issues">${pipeline.issues.map(issue=>`<li>${e(issue)}</li>`).join("")}</ul>`:""}
+      </div>`:""}
       ${outputWarnings(turn.output_telemetry)}
       ${turn.file ? `<div class="session-file">${fileMarkup(turn.file,{edit:true})}</div>` : ""}
     </div>` : ""}
@@ -298,7 +317,7 @@ function composer(workspace) {
   const draft=draftFor(workspace);
   const desktopRequired=clientExecutionRequired();
   const desktopAvailable=typeof window.officeDesktop?.runAgent === "function";
-  const modelSelected=Boolean(workspace.selectedModel && workspace.models?.includes(workspace.selectedModel));
+  const modelSelected=selectedModelAvailable(workspace);
   const blocked=desktopRequired && !desktopAvailable;
   const modelRequired=desktopRequired && desktopAvailable;
   if (workspace.task && !active(workspace.task.status)) {
@@ -321,12 +340,13 @@ function composer(workspace) {
       </div>
       ${modelRequired?`<label class="chat-model-picker"><span>模型</span><select data-chat-model aria-label="执行模型"
         ${workspace.models?.length?"":"disabled"}>
-        <option value="">${workspace.models?.length?"请选择模型":"暂无可用模型"}</option>
+        <option value="${PIPELINE_MODEL}" ${workspace.selectedModel===PIPELINE_MODEL?"selected":""} ${workspace.pipelineAvailable?"":"disabled"}>智能分工（理解→执行→验收）</option>
+        <option value="" ${workspace.selectedModel?"":"selected"}>${workspace.models?.length?"请选择模型":"暂无可用模型"}</option>
         ${(workspace.models || []).map(model=>`<option value="${e(model)}" ${workspace.selectedModel===model?"selected":""}>${e(model)}</option>`).join("")}
       </select></label>`:""}
       <button class="button primary" type="submit" ${blocked || (modelRequired && !modelSelected)?"disabled":""}>${icon("arrow")}发送</button>
     </div>
-    ${modelRequired && workspace.modelNotice?`<p class="chat-model-status ${workspace.models?.length?"":"error"}" data-chat-model-status role="status">${e(workspace.modelNotice)}</p>`:""}
+    ${modelRequired && (workspace.modelNotice || workspace.pipelineReason)?`<p class="chat-model-status ${workspace.models?.length?"":"error"}" data-chat-model-status role="status">${e([workspace.modelNotice,workspace.pipelineReason].filter(Boolean).join(" "))}</p>`:""}
   </form>
   </div>`;
 }
@@ -371,7 +391,8 @@ export function saveWorkspaceInput(form) {
 
 export function selectDesktopModel(select, workspace, statusSelector="[data-chat-model-status]") {
   const submit=select.form?.querySelector('button[type="submit"]');
-  if (!workspace?.models?.includes(select.value)) {
+  const allowed=select.value===PIPELINE_MODEL?workspace?.pipelineAvailable===true:workspace?.models?.includes(select.value);
+  if (!allowed) {
     if (workspace) workspace.selectedModel="";
     if (submit) submit.disabled=true;
     return false;
@@ -381,7 +402,10 @@ export function selectDesktopModel(select, workspace, statusSelector="[data-chat
   workspace.modelNotice="";
   saveDraft(modelDraftKey,{model:select.value});
   const status=document.querySelector(statusSelector);
-  if (status) { status.hidden=true; status.textContent=""; }
+  if (status) {
+    status.textContent=workspace.pipelineReason || "";
+    status.hidden=!workspace.pipelineReason;
+  }
   return true;
 }
 
@@ -557,7 +581,7 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
   const desktop=window.officeDesktop;
   if (typeof desktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
   const model=workspace.selectedModel;
-  if (!workspace.models?.includes(model)) throw new Error(workspace.models?.length?"请先选择可用模型":"暂无可用模型，请联系管理员开通。");
+  if (!selectedModelAvailable(workspace)) throw new Error(workspace.models?.length?"请先选择可用模型":"暂无可用模型，请联系管理员开通。");
 
   const base="/conversations/"+encodeURIComponent(threadId)+"/turns";
   let prepared;
@@ -578,7 +602,8 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       phase="complete";
       return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
         text:result.text,usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
-          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model,
+        ...(result.pipeline?{pipeline:result.pipeline}:{})
       });
     });
   } catch (error) {
@@ -611,7 +636,7 @@ export async function sendMessage(form, rerender) {
   const payload={message,mode:draft.selection?"auto":form.elements.mode.value,material_ids:selected.map(file=>file.id),
     ...(draft.selection?{selection:draft.selection}:{})};
   const signature=JSON.stringify(payload);
-  if (clientExecutionRequired() && !workspace.models?.includes(workspace.selectedModel)) {
+  if (clientExecutionRequired() && !selectedModelAvailable(workspace)) {
     throw new Error(workspace.models?.length?"请先选择可用模型":"暂无可用模型，请联系管理员开通。");
   }
   const requestId=draft.pending?.signature===signature?draft.pending.id:uuid();
