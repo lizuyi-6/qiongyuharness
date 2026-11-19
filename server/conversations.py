@@ -88,7 +88,7 @@ def public_turn(row):
     result = unpack(row["result"])
     body=unpack(row["input"])
     return {"id": row["id"], "message": body["message"], "selection":body.get("selection"), "status": row["status"],
-            **{name: result[name] for name in ("reply", "steps", "file", "error") if name in result}}
+            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry") if name in result}}
 
 
 def conversation_summary(row):
@@ -448,6 +448,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         fail(502, message)
 
     stored_usage = {"model": payload.model, **gateway.usage_from(payload.usage)}
+    output_telemetry = {key: stored_usage[key] for key in
+                        ("max_tokens_clamped", "finish_reasons", "truncated") if key in stored_usage}
     with database(write=True) as db:
         owned_thread(db, key, user)
         writable_task(db, assignment, user)
@@ -463,6 +465,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
                      "运行本地办公演示" if expected_engine == "demo" else
                      "DeepSeek Harness 返回办公方案" if expected_engine == "dsh" else "公司模型网关返回办公方案")
         result.update(reply=clean_text(decision.reply, 6500), steps=steps)
+        if output_telemetry:
+            result["output_telemetry"] = output_telemetry
         if revised:
             artifact = add_file(db, user["id"], target["name"], revised, "pptx", "generated",
                                 assignment=assignment, parent=target["id"], run=run)

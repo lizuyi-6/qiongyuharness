@@ -56,7 +56,7 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertIn("prompt", prepared)
         return prepared
 
-    def complete(self, key, prepared, actor="lin", text=None):
+    def complete(self, key, prepared, actor="lin", text=None, usage=None):
         value = text or json.dumps({
             "action": "export", "reply": "已整理演示稿", "kind": "pptx",
             "plan": {"title": "桌面执行验证", "subtitle": "", "sections": [
@@ -66,17 +66,24 @@ class DesktopTurnTest(unittest.TestCase):
         }, ensure_ascii=False)
         return self.clients[actor].post(
             f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/complete",
-            json={"text": value, "usage": {"prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22},
+            json={"text": value, "usage": usage or {"prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22},
                   "model": "desktop-test-model"},
         )
 
     def test_prepare_complete_exports_and_records_model_usage(self):
         key = self.conversation()
         prepared = self.prepare(key)
-        response = self.complete(key, prepared)
+        telemetry = {
+            "prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22,
+            "max_tokens_clamped": [{"requested": 5000, "applied": 3500}],
+            "finish_reasons": ["length"], "truncated": True,
+        }
+        response = self.complete(key, prepared, usage=telemetry)
         self.assertEqual(response.status_code, 200, response.text)
         turn = response.json()
         self.assertEqual(turn["status"], "completed")
+        self.assertEqual(turn["output_telemetry"], {key: telemetry[key] for key in
+                         ("max_tokens_clamped", "finish_reasons", "truncated")})
         self.assertTrue(turn["file"]["name"].endswith(".pptx"))
         duplicate = self.complete(key, prepared)
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
@@ -87,8 +94,16 @@ class DesktopTurnTest(unittest.TestCase):
         from server.store import database, unpack
         with database() as db:
             usage = unpack(db.one("SELECT usage FROM runs WHERE id=?", (prepared["run_id"],))["usage"])
+            audit = unpack(db.one("SELECT payload FROM events WHERE type='agent.completed' AND payload LIKE ?",
+                                  (f'%{prepared["run_id"]}%',))["payload"])
         self.assertEqual(usage["model"], "desktop-test-model")
         self.assertEqual(usage["total_tokens"], 22)
+        self.assertEqual(usage["max_tokens_clamped"], [{"requested": 5000, "applied": 3500}])
+        self.assertEqual(usage["finish_reasons"], ["length"])
+        self.assertIs(usage["truncated"], True)
+        self.assertEqual(audit["usage"]["max_tokens_clamped"], [{"requested": 5000, "applied": 3500}])
+        self.assertEqual(audit["usage"]["finish_reasons"], ["length"])
+        self.assertIs(audit["usage"]["truncated"], True)
 
     def test_invalid_model_json_fails_run_and_second_completion_conflicts(self):
         key = self.conversation()

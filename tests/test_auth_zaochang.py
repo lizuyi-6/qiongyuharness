@@ -148,7 +148,7 @@ class ZaochangAuthTest(unittest.TestCase):
             patch.object(sub2api, "DEMO", False),
             patch.dict(os.environ, {
                 "QO_SUB2API_URL": "https://aethernettech.dev",
-                "QO_SUB2API_PROVISION_KEY": "restricted-provision-key",
+                "QO_SUB2API_PROVISION_KEY": "adm_sc_test_restricted-provision-key",
                 "QO_SUB2API_DEFAULT_GROUP_ID": "7",
                 "QO_SUB2API_KEY_NAME": "qiongyu-office",
             }),
@@ -163,7 +163,8 @@ class ZaochangAuthTest(unittest.TestCase):
 
         def endpoint(request):
             self.assertEqual(request.url, "https://aethernettech.dev/api/v1/admin/provision/user-key")
-            self.assertEqual(request.headers["authorization"], "Bearer restricted-provision-key")
+            self.assertEqual(request.headers["x-api-key"], "adm_sc_test_restricted-provision-key")
+            self.assertNotIn("authorization", request.headers)
             self.assertEqual(json.loads(request.content), {
                 "email": "worker@example.com",
                 "display_name": "经办员工",
@@ -224,7 +225,7 @@ class ZaochangAuthTest(unittest.TestCase):
     def test_sub2api_enterprise_configuration_validation(self):
         good = {
             "QO_SUB2API_URL": "https://aethernettech.dev",
-            "QO_SUB2API_PROVISION_KEY": "restricted-key",
+            "QO_SUB2API_PROVISION_KEY": "adm_sc_test_0123456789abcdef",
             "QO_SUB2API_DEFAULT_GROUP_ID": "7",
             "QO_SUB2API_KEY_NAME": "qiongyu-office",
         }
@@ -235,10 +236,15 @@ class ZaochangAuthTest(unittest.TestCase):
                 {"QO_SUB2API_URL": "https://aethernettech.dev/v1"},
                 {"QO_SUB2API_DEFAULT_GROUP_ID": "0"},
                 {"QO_SUB2API_PROVISION_KEY": ""},
+                {"QO_SUB2API_PROVISION_KEY": "   "},
+                {"QO_SUB2API_PROVISION_KEY": "restricted-key"},
+                {"QO_SUB2API_PROVISION_KEY": "adm_sc_"},
                 {"QO_SUB2API_KEY_NAME": "Invalid Name"},
             ):
                 with patch.dict(os.environ, overrides, clear=False), self.assertRaises(RuntimeError):
                     sub2api.validate_config()
+            with patch.dict(os.environ, {"QO_SUB2API_PROVISION_KEY": "  adm_sc_test_key  "}, clear=False):
+                sub2api.validate_config()
 
     def test_sqlite_legacy_users_and_flows_get_new_columns(self):
         legacy_dir = Path(self.temp.name) / "legacy"

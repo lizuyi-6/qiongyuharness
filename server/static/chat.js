@@ -1,4 +1,4 @@
-import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, post, readDraft, saveDraft,
+import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, selectionChip } from "./slides.js";
 
@@ -89,6 +89,7 @@ function turnView(turn) {
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行记录 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map(step=>`<li>${icon("check")}${e(step)}</li>`).join("")}</ul></details>` : ""}
       <p class="${turn.error?"error":"response-copy"}">${e(reply)}</p>
+      ${outputWarnings(turn.output_telemetry)}
       ${turn.file ? `<div class="session-file">${fileMarkup(turn.file,{edit:true})}</div>` : ""}
     </div>` : ""}
   </section>`;
@@ -426,7 +427,8 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
       phase="complete";
       return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
-        text:result.text,usage:result.usage,model:result.model || model
+        text:result.text,usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
       });
     });
   } catch (error) {

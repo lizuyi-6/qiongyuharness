@@ -24,7 +24,7 @@ function allowedFunction(value, allowed) {
   return isObject(value) && typeof value.name === "string" && allowed.has(value.name);
 }
 
-function sanitizeRequest(value, model, allowedTools) {
+function sanitizeRequest(value, model, allowedTools, stats = null) {
   if (!isObject(value) || value.model !== model || !Array.isArray(value.messages)) {
     throw new Error("invalid request");
   }
@@ -52,11 +52,15 @@ function sanitizeRequest(value, model, allowedTools) {
   if (tools.length) params.tools = tools;
 
   let maxTokens = value.max_tokens;
-  if (maxTokens === undefined || maxTokens === null || maxTokens === 0) maxTokens = TOKEN_LIMIT;
+  if (maxTokens === undefined || maxTokens === null) maxTokens = TOKEN_LIMIT;
   if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || !Number.isInteger(maxTokens)) {
     throw new Error("invalid max_tokens");
   }
-  params.max_tokens = Math.min(Math.max(maxTokens, 1), TOKEN_LIMIT);
+  if (maxTokens <= 0) throw new Error("invalid max_tokens");
+  params.max_tokens = Math.min(maxTokens, TOKEN_LIMIT);
+  if (maxTokens > TOKEN_LIMIT && stats) {
+    stats.max_tokens_clamped.push({ requested: maxTokens, applied: TOKEN_LIMIT });
+  }
   return params;
 }
 
@@ -89,24 +93,33 @@ function usageFromPayload(payload) {
     Number.isSafeInteger(value) && value >= 0));
 }
 
-function usageFromResponse(contentType, body) {
+function responseDetails(contentType, body) {
+  const finishReasons = [];
+  let usage = {};
+  const collect = (payload) => {
+    const nextUsage = usageFromPayload(payload);
+    if (Object.keys(nextUsage).length) usage = nextUsage;
+    for (const choice of Array.isArray(payload?.choices) ? payload.choices : []) {
+      if (typeof choice?.finish_reason === "string") finishReasons.push(choice.finish_reason);
+    }
+  };
   if (contentType.includes("text/event-stream")) {
-    let latest = {};
     for (const line of body.toString("utf8").split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
       if (!data || data === "[DONE]") continue;
       try {
-        latest = usageFromPayload(JSON.parse(data)) || latest;
+        collect(JSON.parse(data));
       } catch {}
     }
-    return latest;
+    return { usage, finishReasons };
   }
   try {
-    return usageFromPayload(JSON.parse(body.toString("utf8")));
+    collect(JSON.parse(body.toString("utf8")));
   } catch {
-    return {};
+    return { usage: {}, finishReasons: [] };
   }
+  return { usage, finishReasons };
 }
 
 function addUsage(target, next) {
@@ -151,7 +164,12 @@ async function pipeResponse(upstream, response, state) {
       if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
     }
     response.end();
-    addUsage(state.usage, usageFromResponse(contentType, Buffer.concat(chunks, total)));
+    const details = responseDetails(contentType, Buffer.concat(chunks, total));
+    addUsage(state.usage, details.usage);
+    for (const reason of details.finishReasons) {
+      if (state.finish_reasons.length < MAX_CALLS) state.finish_reasons.push(reason);
+      if (reason === "length") state.truncated = true;
+    }
   } catch (error) {
     try { await reader.cancel(); } catch {}
     if (!response.destroyed) response.destroy(error);
@@ -167,7 +185,14 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
   }
 
   const key = randomBytes(35).toString("base64url");
-  const state = { calls: 0, usage: {}, allowedTools: new Set(allowedTools) };
+  const state = {
+    calls: 0,
+    usage: {},
+    allowedTools: new Set(allowedTools),
+    max_tokens_clamped: [],
+    finish_reasons: [],
+    truncated: false
+  };
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const server = http.createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions" ||
@@ -177,9 +202,10 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     }
 
     let params;
+    const clampEventsBefore = state.max_tokens_clamped.length;
     try {
       const raw = await readBody(request);
-      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools);
+      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools, state);
     } catch (error) {
       replyError(response, error.statusCode || 422, "请求格式或工具权限无效");
       return;
@@ -187,6 +213,7 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
 
     state.calls += 1;
     if (state.calls > MAX_CALLS) {
+      state.max_tokens_clamped.splice(clampEventsBefore);
       replyError(response, 429, "本轮模型调用次数已达上限");
       return;
     }
@@ -219,6 +246,9 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     key,
     url: `http://127.0.0.1:${address.port}/v1`,
     get usage() { return { ...state.usage }; },
+    get max_tokens_clamped() { return state.max_tokens_clamped.map((item) => ({ ...item })); },
+    get finish_reasons() { return [...state.finish_reasons]; },
+    get truncated() { return state.truncated; },
     async close() {
       if (!server.listening) return;
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

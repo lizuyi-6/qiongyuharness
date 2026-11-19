@@ -57,9 +57,9 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 
 只有 `employee`、`manager`、`admin` 角色能请求模型凭证；`reviewer` 可以登录工作台，但请求模型凭证会被拒绝。
 
-部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID 和密钥名填入 `.env`。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
+部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID 和密钥名填入 `.env`。部署前在同一 shell 加载这两个环境变量并运行 `python scripts/check_sub2api_key.py`；探测不通过时不要启动服务。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
 
-当前服务启动校验检查 sub2api URL 是无路径的 HTTPS origin、provision key 非空、分组 ID 为正整数、key name 符合格式；它不会检查密钥是否以 `adm_sc_` 开头或是否真的只有 `users.provision.write` 权限。密钥的前缀与权限需要在 sub2api 管理端正确设置。
+服务启动校验会检查 sub2api URL 是无路径的 HTTPS origin、provision key 去除首尾空白后以 `adm_sc_` 开头且带有后缀、分组 ID 为正整数、key name 符合格式。它不会向 sub2api 发请求；部署探测脚本会用无效邮箱验证开通接口返回 `400 invalid_email`，并验证读取用户列表返回 `403`。这些探测不替代在 sub2api 管理端确认密钥权限配置。
 
 ### 5. 启动与安装桌面端
 
@@ -78,7 +78,7 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 - 中国大陆 IP 直连 sub2api 会返回 451；桌面端通过 Electron `net.fetch` 请求模型服务并使用 Electron 系统代理配置。模型列表路径会把 451 显示为“当前网络无法访问模型服务(451)”；生成请求经本机回环网关转发，非 2xx 上游响应会被网关改成 502。工作台服务端访问 OIDC 和 sub2api 的请求使用 `httpx` 且设置 `trust_env=False`，不会继承环境代理。
 - 如果 sub2api 分组中的上游账号开启了“账号级破甲”，sub2api 会将 `max_tokens` 提高到 8192 并改写提示词，可能破坏穹驭办公要求的 JSON 输出格式。给穹驭办公使用的分组应选择未开启该选项的账号。
 - `runs.usage` 中保存的模型名和用量来自桌面客户端上报；计费与实际用量以 sub2api 为准。
-- 桌面本机回环网关将每轮 `max_tokens` 限制在 3500 以内，每轮最多转发 4 次模型调用，只放行本轮授权的 `office_context_read` 工具；未启用上下文工具的请求不放行工具调用。
+- 桌面本机回环网关将每轮 `max_tokens` 限制在 3500 以内：非正整数请求会拒绝，超过 3500 的请求会夹逼并在结果旁提示；上游 `finish_reason=length` 时也会提示回复被截断。每轮最多转发 4 次模型调用，只放行本轮授权的 `office_context_read` 工具；未启用上下文工具的请求不放行工具调用。
 
 ## 验证命令
 
