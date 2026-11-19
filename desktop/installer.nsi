@@ -47,4 +47,5 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\穹驭办公.lnk"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\QiongyuOffice"
   RMDir /r "$LOCALAPPDATA\Programs\QiongyuOffice"
+  RMDir /r "$APPDATA\QiongyuOffice"
 SectionEnd
