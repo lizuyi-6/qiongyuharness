@@ -135,7 +135,7 @@
   color: var(--muted);
   font-size: 12px;
 }
-.chat-model-picker select {
+.composer-actions .chat-model-picker select {
   max-width: min(220px, 48vw);
   min-height: 31px;
   padding: 4px 7px;

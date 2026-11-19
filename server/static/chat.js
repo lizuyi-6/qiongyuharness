@@ -220,8 +220,14 @@ export function saveWorkspaceInput(form) {
 
 export function selectChatModel(select) {
   const workspace=state.chatWorkspace;
-  if (!workspace?.models?.includes(select.value)) return;
+  const submit=select.form?.querySelector('button[type="submit"]');
+  if (!workspace?.models?.includes(select.value)) {
+    if (workspace) workspace.selectedModel="";
+    if (submit) submit.disabled=true;
+    return;
+  }
   workspace.selectedModel=select.value;
+  if (submit) submit.disabled=false;
   workspace.modelNotice="";
   saveDraft(modelDraftKey,{model:select.value});
   const status=document.querySelector("[data-chat-model-status]");
