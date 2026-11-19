@@ -1,5 +1,6 @@
 const http = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
+const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
 const RESPONSE_LIMIT = 3 * 1024 * 1024;
@@ -134,9 +135,61 @@ function replyError(response, status, message) {
   response.end(JSON.stringify({ error: { message } }));
 }
 
+async function readErrorBody(upstream, limit = 64 * 1024) {
+  if (!upstream.body) return "";
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        return "";
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch {
+    try { await reader.cancel(); } catch {}
+    return "";
+  }
+}
+
+function quotaErrorDetails(upstream, body) {
+  if (upstream.status !== 429) return null;
+  let payload;
+  try { payload = JSON.parse(body); } catch { return null; }
+  const error = payload?.error;
+  if (!isObject(error) || error.type !== "rate_limit_exceeded" && error.code !== "rate_limit_exceeded") return null;
+
+  const details = { type: "rate_limit_exceeded" };
+  if (typeof error.code === "string" && error.code.length <= 120) details.code = error.code;
+  if (typeof error.message === "string" && error.message.length <= 400) details.message = error.message;
+  const resetAt = error.metadata?.window_resets_at;
+  if (isIsoDateTime(resetAt)) details.resetAt = resetAt;
+  const retryAfter = Number(upstream.headers.get("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 30 * 24 * 60 * 60) details.retryAfter = retryAfter;
+  return details;
+}
+
 async function pipeResponse(upstream, response, state) {
   const contentType = upstream.headers.get("content-type") || "application/json";
-  if (!upstream.ok || !upstream.body) {
+  if (upstream.ok) state.quota_error = null;
+  if (!upstream.ok) {
+    const body = await readErrorBody(upstream);
+    const quotaError = quotaErrorDetails(upstream, body);
+    if (quotaError) {
+      state.quota_error = quotaError;
+      replyError(response, 429, "模型额度已用尽");
+      return;
+    }
+    replyError(response, 502, "模型服务请求失败");
+    return;
+  }
+  if (!upstream.body) {
     replyError(response, 502, "模型服务请求失败");
     return;
   }
@@ -191,7 +244,8 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     allowedTools: new Set(allowedTools),
     max_tokens_clamped: [],
     finish_reasons: [],
-    truncated: false
+    truncated: false,
+    quota_error: null
   };
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const server = http.createServer(async (request, response) => {
@@ -249,6 +303,7 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     get max_tokens_clamped() { return state.max_tokens_clamped.map((item) => ({ ...item })); },
     get finish_reasons() { return [...state.finish_reasons]; },
     get truncated() { return state.truncated; },
+    get quota_error() { return state.quota_error ? { ...state.quota_error } : null; },
     async close() {
       if (!server.listening) return;
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

@@ -122,6 +122,11 @@ ipcMain.handle("qo:models", async (event) => {
   return desktopAgent.models();
 });
 
+ipcMain.handle("qo:usage", async (event) => {
+  if (!trusted(event)) throw new Error("页面无权读取模型额度");
+  return desktopAgent.usage();
+});
+
 ipcMain.handle("qo:run-agent", async (event, job) => {
   if (!trusted(event)) throw new Error("页面无权启动桌面执行");
   return desktopAgent.runAgent(job);

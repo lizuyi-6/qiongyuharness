@@ -5,7 +5,7 @@ import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pa
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { attachFiles, chooseSources, loadDesktopModelState, loadEarlier, loadWorkspace, removeSource, runDesktopAgent,
-  saveWorkspaceInput, selectDesktopModel,
+  refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel, toggleDesktopUsage,
   scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
@@ -314,6 +314,8 @@ async function onClick(event) {
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
+    case "usage-toggle": await toggleDesktopUsage(target); break;
+    case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace, target.closest("[data-usage-panel]")); break;
     case "slides-clear": clearSelection(); break;
     case "project-create": projectDialog("create"); break;
     case "project-join": projectDialog("join"); break;
