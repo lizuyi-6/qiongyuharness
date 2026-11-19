@@ -34,5 +34,12 @@ qoSkipLongPathRemoval:
 
   ${ifNot} ${isUpdated}
     RMDir /r "$APPDATA\QiongyuOffice"
+    ; installer.nsh:93 copies the installer (~327 MB) to $LOCALAPPDATA\${APP_INSTALLER_STORE_FILE}
+    ; (qiongyu-office-desktop-updater\installer.exe, appInfo.js:126-127) and the default uninstaller
+    ; never removes it.
+    !ifdef APP_INSTALLER_STORE_FILE
+      Delete "$LOCALAPPDATA\${APP_INSTALLER_STORE_FILE}"
+    !endif
+    RMDir /r "$LOCALAPPDATA\qiongyu-office-desktop-updater"
   ${endif}
 !macroend
