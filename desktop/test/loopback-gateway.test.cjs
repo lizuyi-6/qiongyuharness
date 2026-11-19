@@ -179,3 +179,30 @@ test("回环网关兼容上游仅返回 rate_limit_exceeded 消息和 Retry-Afte
     now: Date.parse("2026-11-19T12:00:00Z"), timeZone: "UTC"
   }), /额度已用尽（周），将于 2026年11月19日 12:00:45 恢复/);
 });
+
+test("流水线网关在 429 后阻止后续上游请求并保留 quota_error", async (t) => {
+  let calls = 0;
+  const upstream = await startServer((_request, response) => {
+    calls += 1;
+    if (calls === 1) {
+      response.writeHead(429, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { type: "rate_limit_exceeded", code: "quota_exhausted" } }));
+      return;
+    }
+    sseResponse(response);
+  });
+  const gateway = await createLoopbackGateway({
+    baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL, stickyQuotaError: true
+  });
+  t.after(async () => { await gateway.close(); await upstream.close(); });
+
+  const exhausted = await post(gateway, validRequest());
+  assert.equal(exhausted.status, 429);
+  await exhausted.text();
+  assert.equal(gateway.quota_error.code, "quota_exhausted");
+  const blocked = await post(gateway, validRequest());
+  assert.equal(blocked.status, 429);
+  await blocked.text();
+  assert.equal(calls, 1);
+  assert.equal(gateway.quota_error.code, "quota_exhausted");
+});

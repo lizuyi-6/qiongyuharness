@@ -8,7 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from . import gateway
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
@@ -63,10 +63,54 @@ class SlideChange(BaseModel):
     changes: list[Replacement] = Field(min_length=1,max_length=45)
 
 
+class PipelineStage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    role: Literal["understand", "execute", "accept", "review", "light"]
+    model: str = Field(min_length=1, max_length=200)
+    outcome: Literal["ok", "format_error", "pass", "fail"]
+    usage: dict[str, Any]
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def clean_usage(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("stage usage must be an object")
+        return gateway.usage_from(value)
+
+
+class PipelineTrace(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    tier: Literal["light", "standard", "critical"]
+    verdict: Literal["pass", "fail", "skipped"]
+    review: Literal["pass", "fail", "not_needed", "unavailable"]
+    issues: list[str] = Field(max_length=10)
+    stages: list[PipelineStage] = Field(min_length=1, max_length=8)
+    rounds: int = Field(ge=1, le=2)
+    version: str = Field(min_length=1, max_length=32)
+
+    @field_validator("issues")
+    @classmethod
+    def validate_issues(cls, value):
+        if any(not isinstance(item, str) or not 1 <= len(item) <= 300 for item in value):
+            raise ValueError("pipeline issues must contain 1-300 character strings")
+        return value
+
+    @model_validator(mode="after")
+    def validate_skipped(self):
+        if self.verdict == "skipped" and self.tier != "light":
+            raise ValueError("only light pipeline traces may skip acceptance")
+        return self
+
+
 class TurnCompletion(BaseModel):
     text: str
     usage: dict[str, Any]
     model: str = Field(min_length=1, max_length=200)
+    pipeline: PipelineTrace | None = None
+
+    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class TurnFailure(BaseModel):
@@ -88,7 +132,7 @@ def public_turn(row):
     result = unpack(row["result"])
     body=unpack(row["input"])
     return {"id": row["id"], "message": body["message"], "selection":body.get("selection"), "status": row["status"],
-            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry") if name in result}}
+            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry", "pipeline") if name in result}}
 
 
 def conversation_summary(row):
@@ -467,6 +511,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         result.update(reply=clean_text(decision.reply, 6500), steps=steps)
         if output_telemetry:
             result["output_telemetry"] = output_telemetry
+        if payload.pipeline is not None:
+            result["pipeline"] = payload.pipeline.model_dump()
         if revised:
             artifact = add_file(db, user["id"], target["name"], revised, "pptx", "generated",
                                 assignment=assignment, parent=target["id"], run=run)

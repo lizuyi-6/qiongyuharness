@@ -2,8 +2,10 @@ import json
 import os
 import tempfile
 import unittest
+import asyncio
 from uuid import uuid4
 from io import BytesIO
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from pptx import Presentation
@@ -22,6 +24,7 @@ class DesktopTurnTest(unittest.TestCase):
         from server.app import app
 
         cls.gateway = gateway
+        cls.app = app
         cls.original_mode = gateway.MODE
         gateway.MODE = "desktop"
         cls.clients = {}
@@ -56,7 +59,7 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertIn("prompt", prepared)
         return prepared
 
-    def complete(self, key, prepared, actor="lin", text=None, usage=None):
+    def complete(self, key, prepared, actor="lin", text=None, usage=None, pipeline=None):
         value = text or json.dumps({
             "action": "export", "reply": "已整理演示稿", "kind": "pptx",
             "plan": {"title": "桌面执行验证", "subtitle": "", "sections": [
@@ -64,11 +67,77 @@ class DesktopTurnTest(unittest.TestCase):
                 {"heading": "安排", "points": ["补充验证记录"]},
             ]},
         }, ensure_ascii=False)
+        payload = {"text": value, "usage": usage or {"prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22},
+                   "model": "desktop-test-model"}
+        if pipeline is not None:
+            payload["pipeline"] = pipeline
         return self.clients[actor].post(
             f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/complete",
-            json={"text": value, "usage": usage or {"prompt_tokens": 13, "completion_tokens": 9, "total_tokens": 22},
-                  "model": "desktop-test-model"},
+            json=payload,
         )
+
+    def test_pipeline_config_is_authenticated_and_has_expected_shape(self):
+        anonymous = TestClient(self.app).get("/api/v1/me/pipeline")
+        self.assertEqual(anonymous.status_code, 401, anonymous.text)
+
+        response = self.clients["lin"].get("/api/v1/me/pipeline")
+        self.assertEqual(response.status_code, 200, response.text)
+        value = response.json()
+        self.assertIs(value["enabled"], True)
+        self.assertEqual(set(value["roles"]), {"understand", "execute", "accept", "review", "light"})
+        self.assertEqual(value["limits"], {"max_exec_rounds": 2, "deadline_ms": 270000})
+        self.assertEqual(set(value["prompts"]), {"understand", "accept", "review", "revise"})
+        self.assertEqual(len(value["version"]), 12)
+
+    def test_invalid_pipeline_environment_value_fails_app_startup(self):
+        async def enter_lifespan():
+            async with self.app.router.lifespan_context(self.app):
+                return None
+
+        for values, expected in [
+            ({"QO_PIPELINE_ENABLED": "yes"}, "QO_PIPELINE_ENABLED"),
+            ({"QO_PIPELINE_ENABLED": "1", "QO_PIPELINE_MODEL_ACCEPT": "bad model"}, "QO_PIPELINE_MODEL_ACCEPT"),
+        ]:
+            with self.subTest(values=values), patch.dict(os.environ, values):
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    asyncio.run(enter_lifespan())
+
+    def test_pipeline_trace_model_rejects_invalid_values_and_preserves_legacy_shape(self):
+        from pydantic import ValidationError
+        from server.conversations import TurnCompletion
+
+        stage = {"role": "execute", "model": "step-5-preview", "outcome": "ok",
+                 "usage": {"prompt_tokens": 4, "private": "drop"}}
+        base = {"tier": "standard", "verdict": "pass", "review": "not_needed", "issues": [],
+                "stages": [stage], "rounds": 1, "version": "0123456789ab"}
+        completion = TurnCompletion(text='{"action":"reply","reply":"ok"}', usage={}, model="desktop-test",
+                                    pipeline=base)
+        self.assertEqual(completion.pipeline.stages[0].usage, {"prompt_tokens": 4})
+        self.assertIsNone(TurnCompletion(text="{}", usage={}, model="legacy-client").pipeline)
+
+        with self.assertRaises(ValidationError):
+            TurnCompletion(text="{}", usage={}, model="x", pipeline={**base, "verdict": "skipped"})
+        with self.assertRaises(ValidationError):
+            TurnCompletion(text="{}", usage={}, model="x", pipeline={**base, "stages": [{**stage, "role": "unknown"}]})
+        with self.assertRaises(ValidationError):
+            TurnCompletion(text="{}", usage={}, model="x", pipeline={**base, "issues": ["x" * 301]})
+
+    def test_pipeline_trace_is_stored_in_turn_result(self):
+        key = self.conversation()
+        prepared = self.prepare(key)
+        trace = {
+            "tier": "standard", "verdict": "pass", "review": "not_needed", "issues": [],
+            "stages": [{"role": "understand", "model": "glm-5.3", "outcome": "ok",
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}],
+            "rounds": 1, "version": "0123456789ab",
+        }
+        response = self.complete(key, prepared, pipeline=trace)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["pipeline"], trace)
+        from server.store import database, unpack
+        with database() as db:
+            stored = unpack(db.one("SELECT result FROM office_turns WHERE id=?", (prepared["run_id"],))["result"])
+        self.assertEqual(stored["pipeline"], trace)
 
     def test_prepare_complete_exports_and_records_model_usage(self):
         key = self.conversation()

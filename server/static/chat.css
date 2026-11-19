@@ -115,6 +115,14 @@
 .tool-trace ul { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 4px; }
 .tool-trace li { display: flex; align-items: center; gap: 5px; }
 .tool-trace svg { width: 13px; height: 13px; color: var(--accent); }
+.pipeline-result { display: grid; gap: 7px; width: fit-content; max-width: 100%; }
+.pipeline-result-status { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.pipeline-badge { padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; font-size: 12px; font-weight: 640; }
+.pipeline-badge.passed { color: var(--accent); background: var(--wash); }
+.pipeline-badge.failed { color: var(--alert); background: var(--wash); }
+.pipeline-badge.skipped { color: var(--muted); background: var(--wash); }
+.pipeline-review { color: var(--muted); font-size: 12px; }
+.pipeline-issues { margin: 0; padding: 7px 10px 7px 28px; border-left: 2px solid var(--alert); color: var(--alert); background: var(--wash); font-size: 12px; line-height: 1.55; }
 .session-file { max-width: 545px; }
 .session-file .file { min-height: 49px; border-color: var(--control-line); padding-inline: 9px; }
 .running-note { color: var(--muted); font-size: 13px; }
