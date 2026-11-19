@@ -137,11 +137,23 @@ ipcMain.handle("qo:generate-image", async (event, request) => {
   return desktopAgent.generateImage(request);
 });
 
+ipcMain.handle("qo:cancel-agent", (event) => {
+  if (!trusted(event)) throw new Error("页面无权停止桌面执行");
+  return desktopAgent.cancelAgent();
+});
+
+ipcMain.handle("qo:open-connect", async (event) => {
+  if (!trusted(event)) throw new Error("页面无权打开连接设置");
+  desktopAgent?.cancelAgent();
+  if (window && !window.isDestroyed()) await window.loadFile("connect.html");
+  return true;
+});
+
 app.whenReady().then(() => {
   try { origin = config(); } catch { origin = undefined; }
   window = new BrowserWindow({
     width: 1420, height: 960, minWidth: 780, minHeight: 570,
-    title: "穹驭办公", backgroundColor: "#f4f6fa", autoHideMenuBar: true,
+    title: "穹驭办公", backgroundColor: "#fffefa", autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true, nodeIntegration: false, sandbox: true,

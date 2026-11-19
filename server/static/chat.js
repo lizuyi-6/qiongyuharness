@@ -1,12 +1,14 @@
 import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, selectionChip } from "./slides.js";
+import { renderMarkdown } from "./markdown.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
 const PIPELINE_MODEL = "qo:pipeline";
 const imageAutoPreferenceKey = "qo/chat/allow-ai-images";
 let usageRequestId = 0;
+let activeTurnCancel = null;
 
 function imageAutoPreference() {
   try {
@@ -30,7 +32,19 @@ function desktopUsageEnabled() {
 }
 
 function formatUsageAmount(value, unit = "USD") {
-  return new Intl.NumberFormat(undefined, { style: "currency", currency: unit, maximumFractionDigits: 2 }).format(value);
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "—";
+  const small = num !== 0 && Math.abs(num) < 0.01;
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: unit,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: small ? 4 : 2
+    }).format(num);
+  } catch {
+    return `${num.toFixed(small ? 4 : 2)} ${unit}`;
+  }
 }
 
 function formatUsageTime(value) {
@@ -150,9 +164,20 @@ export async function refreshDesktopUsage(workspace = state.chatWorkspace, panel
   try { result = await window.officeDesktop.usage(); }
   catch { result = { state: "unavailable" }; }
   if (requestId !== usageRequestId) return result;
+  state.usageState = result;
   if (workspace) workspace.usageState = result;
   if (content?.isConnected) renderUsageResult(content, result);
   return result;
+}
+
+export function syncDesktopUsagePanel() {
+  if (!desktopUsageEnabled() || !state.usageOpen) return;
+  const panel = document.querySelector("[data-usage-panel]");
+  const content = panel?.querySelector("[data-usage-content]");
+  if (!panel || !content) return;
+  panel.hidden = false;
+  if (state.usageState) renderUsageResult(content, state.usageState);
+  else void refreshDesktopUsage(state.chatWorkspace, panel);
 }
 
 export async function toggleDesktopUsage(button) {
@@ -160,16 +185,17 @@ export async function toggleDesktopUsage(button) {
   const panel = thread?.querySelector("[data-usage-panel]");
   if (!panel) return;
   const opening = panel.hidden;
+  state.usageOpen = opening;
   panel.hidden = !opening;
   button.setAttribute("aria-expanded", String(opening));
   if (opening) await refreshDesktopUsage(state.chatWorkspace, panel);
 }
 
-export async function loadDesktopModelState() {
+export async function loadDesktopModelState({ allowPipeline = true, draftKey = modelDraftKey } = {}) {
   if (!clientExecutionRequired()) return {};
   if (typeof window.officeDesktop?.runAgent !== "function") return {models:[], image_models:[], selectedModel:"", modelNotice:""};
 
-  const storedModel=readDraft(modelDraftKey)?.model || "";
+  const storedModel=readDraft(draftKey)?.model || "";
   try {
     if (typeof window.officeDesktop.models !== "function") throw new Error("当前桌面客户端不支持模型列表");
     const result=await window.officeDesktop.models();
@@ -177,12 +203,12 @@ export async function loadDesktopModelState() {
       .filter(model=>typeof model==="string" && model.trim()).map(model=>model.trim()))];
     const image_models=[...new Set((Array.isArray(result?.image_models)?result.image_models:[])
       .filter(model=>typeof model==="string" && /^gpt-image-/.test(model.trim())).map(model=>model.trim()))].sort();
-    const pipelineAvailable=result?.pipeline?.available===true;
-    const pipelineReason=typeof result?.pipeline?.reason==="string"?result.pipeline.reason:"";
+    const pipelineAvailable=allowPipeline && result?.pipeline?.available===true;
+    const pipelineReason=allowPipeline && typeof result?.pipeline?.reason==="string"?result.pipeline.reason:"";
     const storedModelAvailable=storedModel===PIPELINE_MODEL?pipelineAvailable:models.includes(storedModel);
     const invalidated=Boolean(storedModel && !storedModelAvailable);
     const selectedModel=invalidated?"":storedModel || (pipelineAvailable?PIPELINE_MODEL:"");
-    if (invalidated) saveDraft(modelDraftKey,{model:""});
+    if (invalidated) saveDraft(draftKey,{model:""});
     const modelNotice=invalidated?"上次选择的模型已不可用，已清空，请重新选择。":
       result?.error || (models.length || pipelineAvailable?"":"暂无可用模型，请联系管理员开通。");
     return {models,image_models,selectedModel,modelNotice,pipelineAvailable,pipelineReason};
@@ -194,6 +220,23 @@ export async function loadDesktopModelState() {
 function selectedModelAvailable(workspace) {
   return workspace?.selectedModel===PIPELINE_MODEL?workspace.pipelineAvailable===true:
     Boolean(workspace?.selectedModel && workspace.models?.includes(workspace.selectedModel));
+}
+
+export function canSubmitChat(workspace = state.chatWorkspace) {
+  if (!workspace) return false;
+  if (workspace.task && !active(workspace.task.status)) return false;
+  const desktopRequired = clientExecutionRequired();
+  if (!desktopRequired) return true;
+  if (typeof window.officeDesktop?.runAgent !== "function") return false;
+  return selectedModelAvailable(workspace);
+}
+
+export function syncChatSubmit(form = chatForm(), workspace = state.chatWorkspace) {
+  if (!form) return;
+  const disabled = Boolean(form.dataset.busy) || !canSubmitChat(workspace);
+  form.querySelectorAll('button[type="submit"]').forEach((control) => {
+    control.disabled = disabled;
+  });
 }
 
 function draftFor(workspace) {
@@ -218,6 +261,7 @@ export async function loadWorkspace(parts) {
   const group=session?.project_id || (scope==="project"?assignment:null);
   const [task,project]=await Promise.all([bound?api("/assignments/"+encodeURIComponent(bound)):null,
     group?api("/projects/"+encodeURIComponent(group)):null]);
+  state.conversations = conversations;
   return {
     session, conversations, task, project, ...desktopModels,
     tasks:today.items.filter(task=>active(task.status)),
@@ -241,12 +285,35 @@ export function conversationNav(workspace) {
 }
 
 export function showConversationHistory() {
-  const sessions=state.chatWorkspace?.conversations || [];
+  const sessions=state.chatWorkspace?.conversations || state.conversations || [];
   modal("最近会话", `<div class="stack">${sessions.map((session)=>
     button(session.title,"route",{id:"chat/"+session.id,icon:"message"})).join("")}</div>`);
 }
 
-function turnView(turn) {
+export async function copyReply(index) {
+  const turn = state.chatWorkspace?.session?.turns?.[Number(index)];
+  const text = turn?.reply;
+  if (!text) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    toastMessage("已复制回复内容");
+  } catch {
+    toastMessage("复制失败，请手动选择文本复制");
+  }
+}
+
+function turnView(turn, index) {
   const reply=turn.reply || turn.error || (turn.status === "running" ? "正在执行…" : "");
   const images=Array.isArray(turn.images)?turn.images:[];
   const pipeline=turn.pipeline;
@@ -256,10 +323,13 @@ function turnView(turn) {
   return `<section class="conversation-turn">
     <div class="request-entry"><p>${turn.selection?`<small class="request-scope">第 ${turn.selection.slide} 页${turn.selection.shape_id?" · 文本框":""}</small>`:""}${e(turn.message)}</p></div>
     ${reply || images.length ? `<div class="response-entry">
-      <p class="response-byline">${icon("mark")}<strong>办公助理</strong></p>
+      <div class="response-head">
+        <p class="response-byline">${icon("mark")}<strong>办公助理</strong></p>
+        ${turn.reply && !turn.error ? `<button type="button" class="text-button copy-button" data-act="copy-reply" data-id="${index}" aria-label="复制回复">${icon("copy")}<span>复制</span></button>` : ""}
+      </div>
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行记录 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map(step=>`<li>${icon("check")}${e(step)}</li>`).join("")}</ul></details>` : ""}
-      <p class="${turn.error?"error":"response-copy"}">${e(reply)}</p>
+      ${turn.error ? `<p class="error">${e(reply)}</p>` : `<div class="response-copy md-body">${renderMarkdown(reply)}</div>`}
       ${pipeline && pipelineLabel?`<div class="pipeline-result">
         <div class="pipeline-result-status"><span class="pipeline-badge ${pipeline.verdict==="fail"?"failed":pipeline.verdict==="skipped"?"skipped":"passed"}">${e(pipelineLabel)}</span>
           <span class="pipeline-review">${e(reviewLabels[pipeline.review] || "复核：未知")}</span></div>
@@ -285,7 +355,7 @@ function turnView(turn) {
 
 function historyView(workspace) {
   const session=workspace.session;
-  return `${session?.has_earlier?button("加载更早的消息","chat-earlier"):""}${(session?.turns || []).map(turnView).join("")}`;
+  return `${session?.has_earlier?button("加载更早的消息","chat-earlier"):""}${(session?.turns || []).map((turn,i)=>turnView(turn,i)).join("")}`;
 }
 
 function welcome(workspace) {
@@ -406,10 +476,10 @@ export function workspaceView(workspace) {
         <div class="thread-header-actions">
           ${state.engine?.engine==="demo" ? '<span class="thread-engine">本地演示</span>' :
             state.engine?.model ? `<span class="thread-engine">${e(state.engine.model)}</span>` : ""}
-          ${showUsage?'<button class="button usage-toggle" type="button" data-act="usage-toggle" aria-expanded="false">模型额度</button>':""}
+          ${showUsage?`<button class="button usage-toggle" type="button" data-act="usage-toggle" aria-expanded="${state.usageOpen?"true":"false"}">模型额度</button>`:""}
         </div>
       </header>
-      ${showUsage?`<section class="usage-panel" data-usage-panel aria-label="模型额度" hidden>
+      ${showUsage?`<section class="usage-panel" data-usage-panel aria-label="模型额度" ${state.usageOpen?"":"hidden"}>
         <div class="usage-panel-heading"><h2>模型额度</h2>
           <button class="button" type="button" data-act="usage-refresh">刷新</button></div>
         <div data-usage-content><p class="hint" role="status">打开面板后获取额度。</p></div>
@@ -432,7 +502,7 @@ export function saveWorkspaceInput(form) {
   writeDraft(state.chatWorkspace, form);
 }
 
-export function selectDesktopModel(select, workspace, statusSelector="[data-chat-model-status]") {
+export function selectDesktopModel(select, workspace, statusSelector="[data-chat-model-status]", draftKey = modelDraftKey) {
   const submit=select.form?.querySelector('button[type="submit"]');
   const allowed=select.value===PIPELINE_MODEL?workspace?.pipelineAvailable===true:workspace?.models?.includes(select.value);
   if (!allowed) {
@@ -441,9 +511,9 @@ export function selectDesktopModel(select, workspace, statusSelector="[data-chat
     return false;
   }
   workspace.selectedModel=select.value;
-  if (submit) submit.disabled=false;
+  if (submit) submit.disabled=Boolean(select.form?.dataset.busy);
   workspace.modelNotice="";
-  saveDraft(modelDraftKey,{model:select.value});
+  saveDraft(draftKey,{model:select.value});
   const status=document.querySelector(statusSelector);
   if (status) {
     status.textContent=workspace.pipelineReason || "";
@@ -493,7 +563,7 @@ export async function attachFiles(files, input) {
     }
     if (files.length) toastMessage("附件已加入会话");
   } finally {
-    controls?.forEach(control=>{control.disabled=false;});
+    syncChatSubmit(chatForm(), workspace);
     if (input) input.value="";
   }
 }
@@ -578,16 +648,44 @@ async function readEvents(response, progress) {
 function startProgress(form, message) {
   document.querySelector(".workspace-empty")?.remove();
   const messages=document.querySelector("[data-chat-turns]");
+  const canCancel = !clientExecutionRequired() || typeof window.officeDesktop?.cancelAgent === "function";
   messages.insertAdjacentHTML("beforeend", `<section class="conversation-turn pending-turn">
     <div class="request-entry"><p>${e(message)}</p></div>
     <div class="response-entry">
       <p class="response-byline">${icon("mark")}<strong>办公助理</strong></p>
       <details class="tool-trace" data-progress-trace hidden><summary>执行记录 · 0 步</summary><ul></ul></details>
-      <p class="running-note" role="status">准备执行…</p>
+      <div class="running-bar">
+        <p class="running-note" role="status">准备执行…</p>
+        ${canCancel ? `<button type="button" class="button stop-button" data-act="chat-cancel">${icon("stop")}停止生成</button>` : ""}
+      </div>
     </div></section>`);
   form.elements.message.value="";
   scrollToLatest();
   return messages.lastElementChild;
+}
+
+function setComposerLocked(form, locked, workspace = state.chatWorkspace) {
+  if (!form?.isConnected) return;
+  for (const field of form.querySelectorAll("textarea, select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source]")) {
+    field.disabled = locked;
+  }
+  if (!locked) {
+    const modelSelect = form.querySelector("[data-chat-model]");
+    if (modelSelect) modelSelect.disabled = !workspace?.models?.length;
+    syncChatSubmit(form, workspace);
+  }
+}
+
+export async function cancelActiveChat() {
+  if (typeof activeTurnCancel !== "function") return;
+  const cancel = activeTurnCancel;
+  activeTurnCancel = null;
+  const stopBtn = document.querySelector("[data-act=chat-cancel]");
+  if (stopBtn) {
+    stopBtn.disabled = true;
+    stopBtn.textContent = "正在停止…";
+  }
+  await cancel();
 }
 
 function appendProgressStep(progress, label) {
@@ -629,8 +727,18 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
   const base="/conversations/"+encodeURIComponent(threadId)+"/turns";
   let prepared;
   let phase="prepare";
+  let cancelled=false;
+  const prepareAbort=new AbortController();
+  activeTurnCancel=async ()=>{
+    cancelled=true;
+    if (phase==="prepare") prepareAbort.abort();
+    else if (phase==="agent" && typeof desktop.cancelAgent==="function") {
+      try { await desktop.cancelAgent(); } catch {}
+    }
+  };
   try {
-    prepared=await post(base+"/prepare",{id:requestId,...payload});
+    prepared=await api(base+"/prepare",{method:"POST",body:{id:requestId,...payload},signal:prepareAbort.signal});
+    if (cancelled) throw new Error("已停止生成");
     if (!prepared?.run_id) throw new Error("服务端未返回本轮运行编号");
     for (const step of prepared.steps || []) appendProgressStep(progress,step);
     const note=progress?.querySelector(".running-note");
@@ -643,15 +751,23 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       appendProgressStep(progress,label);
       if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
     },async result=>{
-      if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
       const images=Array.isArray(result.images)?result.images:[];
       let imageSaveFailures=0;
+      if (progress?.isConnected) {
+        progress.querySelector(".running-note").textContent="正在保存结果…";
+        progress.querySelector("[data-act=chat-cancel]")?.remove();
+      }
+      // 图片已在 sub2api 计费：即使用户已点停止，也先把它们存进本轮记录，避免已付费的图片丢失。
       for (const image of images) {
         try {
           await post(base+"/"+encodeURIComponent(prepared.run_id)+"/images",image);
         } catch {
           imageSaveFailures+=1;
         }
+      }
+      if (cancelled) {
+        const saved=images.length-imageSaveFailures;
+        throw new Error(images.length?`已停止生成（本轮已生成并计费 ${images.length} 张图片，${saved} 张已保存在本轮记录中${imageSaveFailures?`，${imageSaveFailures} 张保存失败`:""}）`:"已停止生成");
       }
       phase="complete";
       const completed=await post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
@@ -663,6 +779,9 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       return completed;
     });
   } catch (error) {
+    if ((cancelled || error?.name==="AbortError") && !String(error?.message || "").startsWith("已停止生成")) {
+      error=new Error("已停止生成");
+    }
     // turns/prepare never replays a request id (any existing turn with that id is a 409),
     // so reusing the pending id would block every retry of this message.
     error.retryAsNew=true;
@@ -676,6 +795,8 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       }
     }
     throw error;
+  } finally {
+    activeTurnCancel=null;
   }
 }
 
@@ -796,6 +917,7 @@ export async function sendMessage(form, rerender) {
   writeDraft(workspace, form, {newId:threadId,pending:{id:requestId,signature}});
   const inView=()=>form.isConnected && state.me?.id===user;
   let progress;
+  setComposerLocked(form, true, workspace);
   try {
     if (!workspace.session) {
       workspace.session=await post("/conversations",{id:threadId,assignment_id:workspace.task?.id || null,
@@ -811,13 +933,23 @@ export async function sendMessage(form, rerender) {
       completed=await executeDesktopTurn(workspace,threadId,requestId,payload,progress,
         form.elements.allow_ai_images?.checked===true);
     } else {
-      const response=await fetch("/api/v1/conversations/"+encodeURIComponent(threadId)+"/turns", {
-        method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
-        body:JSON.stringify({id:requestId,...payload})
-      });
-      completed=await readEvents(response,label=>{
-        if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
-      });
+      const controller=new AbortController();
+      activeTurnCancel=async ()=>{ controller.abort(); };
+      try {
+        const response=await fetch("/api/v1/conversations/"+encodeURIComponent(threadId)+"/turns", {
+          method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
+          signal:controller.signal,
+          body:JSON.stringify({id:requestId,...payload})
+        });
+        completed=await readEvents(response,label=>{
+          if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
+        });
+      } catch (error) {
+        if (error?.name==="AbortError") throw Object.assign(new Error("已停止生成"),{retryAsNew:true});
+        throw error;
+      } finally {
+        activeTurnCancel=null;
+      }
     }
     if (state.me?.id!==user) return;
     writeDraft(workspace,null,{message:"",newId:null,pending:null,selection:null});
@@ -847,6 +979,7 @@ export async function sendMessage(form, rerender) {
     void refreshDesktopUsage().catch(()=>{});
   } catch (error) {
     if (state.me?.id===user && inView()) {
+      progress?.querySelector("[data-act=chat-cancel]")?.remove();
       const current=progress?.querySelector(".running-note");
       if (current) { current.textContent=error.message; current.classList.add("error"); }
       form.elements.message.value=message;
@@ -856,5 +989,8 @@ export async function sendMessage(form, rerender) {
       workspace.draftKey=key;
     }
     throw error;
+  } finally {
+    activeTurnCancel=null;
+    setComposerLocked(form, false, workspace);
   }
 }

@@ -3,7 +3,8 @@ export const dialog = document.querySelector("#dialog");
 const toast = document.querySelector("#toast");
 export const state = {
   config: null, me: null, engine: null, route: [], today: [], filter: "all", focused: null,
-  agent: null, chatWorkspace: null, admin: { offset: 0, department: "", status: "", date: "" }, auditOffset: 0
+  agent: null, chatWorkspace: null, conversations: [], usageOpen: false, usageState: null,
+  admin: { offset: 0, department: "", status: "", date: "" }, auditOffset: 0
 };
 const paths = {
   mark: '<path d="M3 5h10l8 8v6h-6v-4l-5-5H3z" fill="currentColor" stroke="none"/><path d="M4 13h5l5 5v4H4z" fill="currentColor" opacity=".65" stroke="none"/>',
@@ -32,7 +33,9 @@ const paths = {
   plus: '<path d="M12 5v14M5 12h14"/>', x:'<path d="m6 6 12 12M6 18 18 6"/>',
   logout:'<path d="M11 4H4v16h7m5-13 5 5-5 5m5-5H8"/>',
   link:'<path d="M13 5h6v6m0-6-8 8M9 5H5v14h14v-4"/>',
-  clip:'<path d="m9 11 5-5a3 3 0 1 1 4 4l-8 8a4 4 0 1 1-6-6l8-8"/>'
+  clip:'<path d="m9 11 5-5a3 3 0 1 1 4 4l-8 8a4 4 0 1 1-6-6l8-8"/>',
+  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  stop:'<rect x="6" y="6" width="12" height="12" rx="2"/>'
 };
 export function icon(name) {
   return `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.docx}</svg>`;
