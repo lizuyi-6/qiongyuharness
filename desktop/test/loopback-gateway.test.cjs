@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createLoopbackGateway } = require("../lib/loopback-gateway.cjs");
+const { quotaExhaustionMessage } = require("../lib/usage.cjs");
 const { readJson, sseResponse, startServer } = require("./helpers.cjs");
 
 const MODEL = "mock-model";
@@ -119,4 +120,62 @@ test("回环网关拒绝超过 2 MB 的请求体", async (t) => {
 
   const response = await post(gateway, JSON.stringify(validRequest({ content: "x".repeat(2 * 1024 * 1024) })));
   assert.equal(response.status, 413);
+});
+
+test("回环网关保留 429 额度错误类型、窗口重置时间和 Retry-After", async (t) => {
+  const resetAt = "2026-11-20T09:30:00Z";
+  let calls = 0;
+  const upstream = await startServer((_request, response) => {
+    calls += 1;
+    if (calls > 1) {
+      sseResponse(response);
+      return;
+    }
+    response.writeHead(429, { "Content-Type": "application/json", "Retry-After": "45" });
+    response.end(JSON.stringify({ error: {
+      type: "rate_limit_exceeded",
+      code: "USER_PLATFORM_WEEKLY_QUOTA_EXHAUSTED",
+      message: "Weekly usage quota exhausted for this platform.",
+      metadata: { window_resets_at: resetAt, account_id: "drop" }
+    } }));
+  });
+  const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
+  t.after(async () => { await gateway.close(); await upstream.close(); });
+
+  const response = await post(gateway, validRequest());
+  assert.equal(response.status, 429);
+  assert.deepEqual(await response.json(), { error: { message: "模型额度已用尽" } });
+  assert.deepEqual(gateway.quota_error, {
+    type: "rate_limit_exceeded",
+    code: "USER_PLATFORM_WEEKLY_QUOTA_EXHAUSTED",
+    message: "Weekly usage quota exhausted for this platform.",
+    resetAt,
+    retryAfter: 45
+  });
+  const recovered = await post(gateway, validRequest());
+  assert.equal(recovered.status, 200);
+  await recovered.text();
+  assert.equal(gateway.quota_error, null);
+});
+
+test("回环网关兼容上游仅返回 rate_limit_exceeded 消息和 Retry-After", async (t) => {
+  const upstream = await startServer((_request, response) => {
+    response.writeHead(429, { "Content-Type": "application/json", "Retry-After": "45" });
+    response.end(JSON.stringify({ error: {
+      type: "rate_limit_exceeded", message: "Weekly usage quota exhausted for this platform."
+    } }));
+  });
+  const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
+  t.after(async () => { await gateway.close(); await upstream.close(); });
+
+  const response = await post(gateway, validRequest());
+  assert.equal(response.status, 429);
+  assert.deepEqual(gateway.quota_error, {
+    type: "rate_limit_exceeded",
+    message: "Weekly usage quota exhausted for this platform.",
+    retryAfter: 45
+  });
+  assert.match(quotaExhaustionMessage(gateway.quota_error, null, {
+    now: Date.parse("2026-11-19T12:00:00Z"), timeZone: "UTC"
+  }), /额度已用尽（周），将于 2026年11月19日 12:00:45 恢复/);
 });

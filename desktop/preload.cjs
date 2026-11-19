@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("officeDesktop", {
   signIn: () => ipcRenderer.invoke("qo:sign-in"),
   models: () => ipcRenderer.invoke("qo:models"),
+  usage: () => ipcRenderer.invoke("qo:usage"),
   runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
   onAgentEvent: (callback) => {
     if (typeof callback !== "function") throw new TypeError("callback must be a function");
@@ -18,7 +19,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (!form) return;
   const url = document.getElementById("server");
   const notice = document.getElementById("notice");
-  url.value = await ipcRenderer.invoke("qo:configured-url") || "";
+  const configuredUrl = await ipcRenderer.invoke("qo:configured-url");
+  if (configuredUrl) url.value = configuredUrl;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     notice.textContent = "正在连接…";
