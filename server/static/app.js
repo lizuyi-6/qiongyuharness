@@ -5,7 +5,7 @@ import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pa
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { attachFiles, chooseSources, loadEarlier, loadWorkspace, removeSource, saveWorkspaceInput,
-  scrollToLatest, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
+  scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -544,6 +544,10 @@ document.addEventListener("input",event=>{
   }
 });
 document.addEventListener("change",event=>{
+  if (event.target.matches("[data-chat-model]")) {
+    selectChatModel(event.target);
+    return;
+  }
   if (!event.target.matches("[data-upload]")) return;
   handleUpload([...event.target.files],event.target).catch(error=>toastMessage(error.message));
 });

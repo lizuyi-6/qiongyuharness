@@ -3,6 +3,32 @@ import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, p
 import { deckFiles, deckPanel, selectionChip } from "./slides.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
+const modelDraftKey = "chat/last-model";
+
+function clientExecutionRequired() {
+  return state.engine?.client_execution === true;
+}
+
+async function loadDesktopModelState() {
+  if (!clientExecutionRequired()) return {};
+  if (typeof window.officeDesktop?.runAgent !== "function") return {models:[], selectedModel:"", modelNotice:""};
+
+  const storedModel=readDraft(modelDraftKey)?.model || "";
+  try {
+    if (typeof window.officeDesktop.models !== "function") throw new Error("当前桌面客户端不支持模型列表");
+    const result=await window.officeDesktop.models();
+    const models=[...new Set((Array.isArray(result?.models)?result.models:[])
+      .filter(model=>typeof model==="string" && model.trim()).map(model=>model.trim()))];
+    const invalidated=Boolean(storedModel && !models.includes(storedModel));
+    const selectedModel=invalidated?"":storedModel;
+    if (invalidated) saveDraft(modelDraftKey,{model:""});
+    const modelNotice=invalidated?"上次选择的模型已不可用，已清空，请重新选择。":
+      result?.error || (models.length?"":"暂无可用模型，请联系管理员开通。");
+    return {models,selectedModel,modelNotice};
+  } catch (error) {
+    return {models:[],selectedModel:"",modelNotice:error.message || "模型列表获取失败，请重试。"};
+  }
+}
 
 function draftFor(workspace) {
   return readDraft(workspace.draftKey) || {};
@@ -16,17 +42,18 @@ function writeDraft(workspace, form, fields = {}) {
 
 export async function loadWorkspace(parts) {
   const [, scope, assignment] = parts;
-  const [session, conversations, today] = await Promise.all([
+  const [session, conversations, today, desktopModels] = await Promise.all([
     scope && !["task","project"].includes(scope) ? api("/conversations/" + encodeURIComponent(scope)) : null,
     api("/conversations"),
-    api("/me/today")
+    api("/me/today"),
+    loadDesktopModelState()
   ]);
   const bound = session?.assignment_id || (scope === "task" ? assignment : null);
   const group=session?.project_id || (scope==="project"?assignment:null);
   const [task,project]=await Promise.all([bound?api("/assignments/"+encodeURIComponent(bound)):null,
     group?api("/projects/"+encodeURIComponent(group)):null]);
   return {
-    session, conversations, task, project,
+    session, conversations, task, project, ...desktopModels,
     tasks:today.items.filter(task=>active(task.status)),
     draftKey:"chat/" + (session?.id || (task ? "task/" + task.id : project?"project/"+project.id:"new"))
   };
@@ -127,15 +154,22 @@ function selectedFiles(selected) {
 
 function composer(workspace) {
   const draft=draftFor(workspace);
+  const desktopRequired=clientExecutionRequired();
+  const desktopAvailable=typeof window.officeDesktop?.runAgent === "function";
+  const modelSelected=Boolean(workspace.selectedModel && workspace.models?.includes(workspace.selectedModel));
+  const blocked=desktopRequired && !desktopAvailable;
+  const modelRequired=desktopRequired && desktopAvailable;
   if (workspace.task && !active(workspace.task.status)) {
-    return '<div class="composer-wrap"><p class="notice">关联任务已完成或正在审核，可查看会话和文件。</p></div>';
+    return `<div class="composer-wrap">${blocked?'<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>':""}
+      <p class="notice">关联任务已完成或正在审核，可查看会话和文件。</p></div>`;
   }
   return `<div class="composer-wrap">
   <form class="chat-composer" data-form="conversation" aria-label="发送消息">
+    ${blocked?'<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>':""}
     <div class="attached-files" data-chat-selection>${selectionChip(draft.selection)}</div>
     <div class="attached-files" data-chat-selected>${selectedFiles(draft.selected || [])}</div>
     <textarea required name="message" rows="2" maxlength="6000" aria-label="办公请求"
-      placeholder="输入工作要求…">${e(draft.message || "")}</textarea>
+      placeholder="输入工作要求…" ${blocked?"disabled":""}>${e(draft.message || "")}</textarea>
     <div class="composer-actions">
       <div class="actions">
         ${uploadMarkup("添加附件")}
@@ -143,8 +177,14 @@ function composer(workspace) {
         <select name="mode" aria-label="输出方式">${Object.entries({auto:"自动选择",reply:"仅回复",docx:"Word",pptx:"PowerPoint"})
           .map(([mode,label])=>`<option value="${mode}" ${draft.mode===mode?"selected":""}>${label}</option>`).join("")}</select>
       </div>
-      <button class="button primary" type="submit">${icon("arrow")}发送</button>
+      ${modelRequired?`<label class="chat-model-picker"><span>模型</span><select data-chat-model aria-label="执行模型"
+        ${workspace.models?.length?"":"disabled"}>
+        <option value="">${workspace.models?.length?"请选择模型":"暂无可用模型"}</option>
+        ${(workspace.models || []).map(model=>`<option value="${e(model)}" ${workspace.selectedModel===model?"selected":""}>${e(model)}</option>`).join("")}
+      </select></label>`:""}
+      <button class="button primary" type="submit" ${blocked || (modelRequired && !modelSelected)?"disabled":""}>${icon("arrow")}发送</button>
     </div>
+    ${modelRequired && workspace.modelNotice?`<p class="chat-model-status ${workspace.models?.length?"":"error"}" data-chat-model-status role="status">${e(workspace.modelNotice)}</p>`:""}
   </form>
   </div>`;
 }
@@ -176,6 +216,16 @@ function chatForm() {
 
 export function saveWorkspaceInput(form) {
   writeDraft(state.chatWorkspace, form);
+}
+
+export function selectChatModel(select) {
+  const workspace=state.chatWorkspace;
+  if (!workspace?.models?.includes(select.value)) return;
+  workspace.selectedModel=select.value;
+  workspace.modelNotice="";
+  saveDraft(modelDraftKey,{model:select.value});
+  const status=document.querySelector("[data-chat-model-status]");
+  if (status) { status.hidden=true; status.textContent=""; }
 }
 
 export function useExample(value) {
@@ -304,6 +354,7 @@ function startProgress(form, message) {
     <div class="request-entry"><p>${e(message)}</p></div>
     <div class="response-entry">
       <p class="response-byline">${icon("mark")}<strong>办公助理</strong></p>
+      <details class="tool-trace" data-progress-trace hidden><summary>执行记录 · 0 步</summary><ul></ul></details>
       <p class="running-note" role="status">准备执行…</p>
     </div></section>`);
   form.elements.message.value="";
@@ -311,9 +362,73 @@ function startProgress(form, message) {
   return messages.lastElementChild;
 }
 
+function appendProgressStep(progress, label) {
+  if (!progress?.isConnected || typeof label!=="string" || !label) return;
+  const trace=progress.querySelector("[data-progress-trace]");
+  const list=trace?.querySelector("ul");
+  if (!trace || !list) return;
+  const item=document.createElement("li");
+  item.textContent=label;
+  list.append(item);
+  trace.hidden=false;
+  trace.querySelector("summary").textContent=`执行记录 · ${list.children.length} 步`;
+}
+
+async function executeDesktopTurn(workspace, threadId, requestId, payload, progress) {
+  const desktop=window.officeDesktop;
+  if (typeof desktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
+  const model=workspace.selectedModel;
+  if (!workspace.models?.includes(model)) throw new Error(workspace.models?.length?"请先选择可用模型":"暂无可用模型，请联系管理员开通。");
+
+  const base="/conversations/"+encodeURIComponent(threadId)+"/turns";
+  let prepared;
+  let phase="prepare";
+  let unsubscribe=()=>{};
+  try {
+    prepared=await post(base+"/prepare",{id:requestId,...payload});
+    if (!prepared?.run_id) throw new Error("服务端未返回本轮运行编号");
+    for (const step of prepared.steps || []) appendProgressStep(progress,step);
+    const note=progress?.querySelector(".running-note");
+    if (note) note.textContent="正在调用模型…";
+    try {
+      const stop=desktop.onAgentEvent?.(event=>{
+        if (event?.type!=="step") return;
+        appendProgressStep(progress,event.label);
+        if (progress?.isConnected && event.label) progress.querySelector(".running-note").textContent=event.label;
+      });
+      if (typeof stop==="function") unsubscribe=stop;
+    } catch {}
+    phase="agent";
+    const result=await desktop.runAgent({system:prepared.system,prompt:prepared.prompt,context:prepared.context,model});
+    if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
+    phase="complete";
+    return await post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+      text:result.text,usage:result.usage,model:result.model || model
+    });
+  } catch (error) {
+    if (prepared?.run_id) {
+      try {
+        await post(base+"/"+encodeURIComponent(prepared.run_id)+"/fail",{message:error.message || "桌面执行失败"});
+        error.retryAsNew=true;
+      } catch (failError) {
+        if (error.status && error.status<500 && error.status!==409) error.retryAsNew=true;
+        if (phase==="complete" && failError.status===409 && (!error.status || error.status>=500)) {
+          error.message="无法确认本轮是否已保存，请刷新会话查看最新结果。";
+        } else if (failError.status!==409) error.message+=`（失败状态同步未成功：${failError.message}）`;
+      }
+    }
+    throw error;
+  } finally {
+    try { unsubscribe(); } catch {}
+  }
+}
+
 export async function sendMessage(form, rerender) {
   const workspace=state.chatWorkspace;
   const user=state.me.id;
+  if (clientExecutionRequired() && typeof window.officeDesktop?.runAgent!=="function") {
+    throw new Error("请在桌面客户端中使用 AI 办理");
+  }
   const message=form.elements.message.value.trim();
   if (!message) throw new Error("请输入工作要求");
   const draft=draftFor(workspace);
@@ -321,6 +436,9 @@ export async function sendMessage(form, rerender) {
   const payload={message,mode:draft.selection?"auto":form.elements.mode.value,material_ids:selected.map(file=>file.id),
     ...(draft.selection?{selection:draft.selection}:{})};
   const signature=JSON.stringify(payload);
+  if (clientExecutionRequired() && !workspace.models?.includes(workspace.selectedModel)) {
+    throw new Error(workspace.models?.length?"请先选择可用模型":"暂无可用模型，请联系管理员开通。");
+  }
   const requestId=draft.pending?.signature===signature?draft.pending.id:uuid();
   const threadId=workspace.session?.id || draft.newId || uuid();
   writeDraft(workspace, form, {newId:threadId,pending:{id:requestId,signature}});
@@ -336,13 +454,18 @@ export async function sendMessage(form, rerender) {
       }
     }
     if (inView()) progress=startProgress(form,message);
-    const response=await fetch("/api/v1/conversations/"+encodeURIComponent(threadId)+"/turns", {
-      method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
-      body:JSON.stringify({id:requestId,...payload})
-    });
-    const completed=await readEvents(response,label=>{
-      if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
-    });
+    let completed;
+    if (clientExecutionRequired()) {
+      completed=await executeDesktopTurn(workspace,threadId,requestId,payload,progress);
+    } else {
+      const response=await fetch("/api/v1/conversations/"+encodeURIComponent(threadId)+"/turns", {
+        method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
+        body:JSON.stringify({id:requestId,...payload})
+      });
+      completed=await readEvents(response,label=>{
+        if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
+      });
+    }
     if (state.me?.id!==user) return;
     writeDraft(workspace,null,{message:"",newId:null,pending:null,selection:null});
     const deck=completed.file?.extension==="pptx"?{fileId:completed.file.id,page:draft.selection?.slide||1}:draft.deck;
