@@ -27,13 +27,19 @@ Windows 安装 Python 3.12 后运行 `Start-Demo.cmd`；Linux 或 macOS 运行 `
 
 部署时应填入登记应用获得的 client secret。当前启动校验并不强制 secret 非空；只有 secret 非空时，回调才按造场元数据选择 `client_secret_basic` 或 `client_secret_post` 发送。若留空，造场 token endpoint 必须允许无客户端密钥的请求。
 
-### 3. 按邮箱登记员工
+### 3. 配置名单与开放注册
 
-`QO_USERS_FILE` 指向 JSON 数组，每项格式为 `{ "email", "name", "department", "role" }`，可选 `sub` 用于预先绑定造场 subject。邮箱会去空格并转成小写；内部用户 ID 由邮箱的 SHA-256 派生，因此同一邮箱在重启后保持稳定。名单至少要有一名 `admin`。示例见 [`users.example.json`](users.example.json)。
+`QO_USERS_FILE` 指向 JSON 数组，每项格式为 `{ "email", "name", "department", "role" }`，可选 `sub` 用于预先绑定造场 subject，也可用布尔值 `enabled` 停用某个名单账号。邮箱会去空格并转成小写；内部用户 ID 由邮箱的 SHA-256 派生，因此同一邮箱在重启后保持稳定。企业模式名单仍至少要有一名 `admin`。示例见 [`users.example.json`](users.example.json)。
 
-登录时先按已绑定的 `sub` 查找启用账号；找不到时，只有造场声明 `email_verified: true` 且名单中存在未绑定的同邮箱账号，才会绑定 subject、写入 `auth.subject_bound` 审计记录并建立会话。邮箱未验证、邮箱不在名单、账号未启用或邮箱已绑定另一个 subject 时，不能通过邮箱路径开通。已经按 subject 命中的账号走优先路径，不会再次检查邮箱验证声明。
+`QO_OPEN_ENROLLMENT` 只接受 `0` 或 `1`，缺省为 `0`。值为 `0` 时维持仅名单登录；同步会停用不在名单里的用户并删除其会话及桌面授权码。生产开放注册时将它设为 `1`：造场会员即可登录；其 ID token 必须通过现有签名、issuer、audience、nonce 和有效期校验，并且新用户的 `email_verified` 必须严格为布尔值 `true`。名单外新用户会以 `employee` 角色创建，姓名取 ID token 的 `name`，缺失时使用邮箱前缀，部门为空；自动开户事件 `user.auto_enrolled` 只记录用户 ID 和邮箱 SHA-256，不记录 token。已绑定的邮箱仍不能换绑到另一个造场 subject。
 
-从名单删除账号后，**下次服务启动同步名单时**会禁用该账号并删除其会话及未领取桌面授权码。历史业务记录仍保留。
+开放注册模式下，名单仍决定名单内账号的角色、部门和姓名；未列入名单的自动注册账号不会被名单同步停用。将条目设为 `"enabled": false` 会拒绝该邮箱登录，并在下次服务启动同步名单时删除其现有会话和未领取桌面授权码，例如：
+
+```json
+{ "email": "former@example.com", "name": "停用账号", "department": "运营", "role": "employee", "enabled": false }
+```
+
+造场账号停用或取消会员资格后，造场会撤销其登录凭证；需要在穹驭办公立即封禁的账号，也应在名单中显式设为 `enabled: false`。开放注册不会自动发放模型额度：新用户开通后 sub2api 余额为 0，需管理员在 sub2api 分配余额、订阅或额度后才能对话。
 
 **改动已经绑定 subject 的员工邮箱时，需要管理员清理旧绑定。** 新邮箱会派生出新内部 ID；旧的禁用用户行会保留原 subject，该 subject 唯一索引仍占用它。先在 `users.json` 中更新邮箱并重启服务，再通过受控数据库维护清理旧绑定。先确认旧邮箱行已禁用并记录其内部 ID，再仅将该禁用行的 `subject` 设为 `NULL`；不要删除用户行，以保留历史关联。SQLite 和 PostgreSQL 都可用以下语句（替换旧邮箱）：
 
@@ -57,9 +63,9 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 
 只有 `employee`、`manager`、`admin` 角色能请求模型凭证；`reviewer` 可以登录工作台，但请求模型凭证会被拒绝。
 
-部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID 和密钥名填入 `.env`。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
+部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID 和密钥名填入 `.env`。部署前在同一 shell 加载这两个环境变量并运行 `python scripts/check_sub2api_key.py`；探测不通过时不要启动服务。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
 
-当前服务启动校验检查 sub2api URL 是无路径的 HTTPS origin、provision key 非空、分组 ID 为正整数、key name 符合格式；它不会检查密钥是否以 `adm_sc_` 开头或是否真的只有 `users.provision.write` 权限。密钥的前缀与权限需要在 sub2api 管理端正确设置。
+服务启动校验会检查 sub2api URL 是无路径的 HTTPS origin、provision key 去除首尾空白后以 `adm_sc_` 开头且带有后缀、分组 ID 为正整数、key name 符合格式。它不会向 sub2api 发请求；部署探测脚本会用无效邮箱验证开通接口返回 `400 invalid_email`，并验证读取用户列表返回 `403`。这些探测不替代在 sub2api 管理端确认密钥权限配置。
 
 ### 5. 启动与安装桌面端
 
@@ -78,7 +84,7 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 - 中国大陆 IP 直连 sub2api 会返回 451；桌面端通过 Electron `net.fetch` 请求模型服务并使用 Electron 系统代理配置。模型列表路径会把 451 显示为“当前网络无法访问模型服务(451)”；生成请求经本机回环网关转发，非 2xx 上游响应会被网关改成 502。工作台服务端访问 OIDC 和 sub2api 的请求使用 `httpx` 且设置 `trust_env=False`，不会继承环境代理。
 - 如果 sub2api 分组中的上游账号开启了“账号级破甲”，sub2api 会将 `max_tokens` 提高到 8192 并改写提示词，可能破坏穹驭办公要求的 JSON 输出格式。给穹驭办公使用的分组应选择未开启该选项的账号。
 - `runs.usage` 中保存的模型名和用量来自桌面客户端上报；计费与实际用量以 sub2api 为准。
-- 桌面本机回环网关将每轮 `max_tokens` 限制在 3500 以内，每轮最多转发 4 次模型调用，只放行本轮授权的 `office_context_read` 工具；未启用上下文工具的请求不放行工具调用。
+- 桌面本机回环网关将每轮 `max_tokens` 限制在 3500 以内：非正整数请求会拒绝，超过 3500 的请求会夹逼并在结果旁提示；上游 `finish_reason=length` 时也会提示回复被截断。每轮最多转发 4 次模型调用，只放行本轮授权的 `office_context_read` 工具；未启用上下文工具的请求不放行工具调用。
 
 ## 验证命令
 

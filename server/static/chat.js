@@ -1,12 +1,153 @@
-import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, post, readDraft, saveDraft,
+import { active, api, badge, button, deadline, e, fileMarkup, go, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, selectionChip } from "./slides.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
+let usageRequestId = 0;
 
 function clientExecutionRequired() {
   return state.engine?.client_execution === true;
+}
+
+function desktopUsageEnabled() {
+  return clientExecutionRequired() && typeof window.officeDesktop?.usage === "function";
+}
+
+function formatUsageAmount(value, unit = "USD") {
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: unit, maximumFractionDigits: 2 }).format(value);
+}
+
+function formatUsageTime(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "窗口未开始";
+  return date.toLocaleString();
+}
+
+function usageRows(usage) {
+  const rows = [];
+  if (usage.mode === "quota_limited") {
+    if (usage.quota && usage.quota.limit > 0) rows.push({
+      label: "总额度", used: usage.quota.used, limit: usage.quota.limit,
+      remaining: usage.quota.remaining, resetAt: "", resetFallback: "上游未提供重置时间"
+    });
+    const labels = { "5h": "5 小时", "1d": "日", "7d": "周" };
+    for (const item of usage.rate_limits || []) {
+      if (item.limit <= 0) continue;
+      rows.push({ label: `${labels[item.window]}额度`, used: item.used, limit: item.limit,
+        remaining: item.remaining, resetAt: item.reset_at || "", resetFallback: "窗口未开始" });
+    }
+  } else if (usage.subscription) {
+    const subscription = usage.subscription;
+    const plans = [
+      ["日额度", "daily_usage_usd", "daily_limit_usd", ""],
+      ["周额度", "weekly_usage_usd", "weekly_limit_usd", subscription.weekly_window_start ?
+        new Date(Date.parse(subscription.weekly_window_start) + 7 * 24 * 60 * 60 * 1000).toISOString() : ""],
+      ["月额度", "monthly_usage_usd", "monthly_limit_usd", ""]
+    ];
+    for (const [label, usedKey, limitKey, resetAt] of plans) {
+      const limit = subscription[limitKey];
+      const used = subscription[usedKey];
+      if (typeof limit === "number" && limit > 0 && typeof used === "number") {
+        rows.push({ label, used, limit, remaining: Math.max(0, limit - used), resetAt,
+          resetFallback: "上游未提供重置时间" });
+      }
+    }
+  }
+  return rows;
+}
+
+function renderUsageResult(target, result) {
+  target.replaceChildren();
+  if (result?.state !== "available" || !result.usage) {
+    const messages = {
+      unauthorized: "模型凭证无效，请重新登录后重试。",
+      unavailable: "暂时无法获取模型额度。",
+      invalid: "额度数据格式无效。"
+    };
+    const notice = document.createElement("p");
+    notice.className = "hint";
+    notice.setAttribute("role", "status");
+    notice.textContent = messages[result?.state] || messages.unavailable;
+    target.append(notice);
+    return;
+  }
+
+  const usage = result.usage;
+  if (usage.balance !== undefined || usage.planName === "钱包余额") {
+    const balance = document.createElement("p");
+    balance.className = "usage-balance";
+    balance.textContent = `钱包余额：${formatUsageAmount(usage.balance ?? usage.remaining, usage.unit || "USD")}`;
+    target.append(balance);
+    return;
+  }
+
+  const rows = usageRows(usage);
+  if (!rows.length) {
+    const unlimited = document.createElement("p");
+    unlimited.className = "usage-unlimited";
+    unlimited.textContent = "不限额";
+    target.append(unlimited);
+    return;
+  }
+
+  const list = document.createElement("div");
+  list.className = "usage-grid";
+  for (const row of rows) {
+    const card = document.createElement("article");
+    card.className = "usage-card";
+    const title = document.createElement("h3");
+    title.textContent = row.label;
+    const progress = document.createElement("progress");
+    progress.max = 100;
+    progress.value = Math.max(0, Math.min(100, row.used / row.limit * 100));
+    progress.setAttribute("aria-label", `${row.label}使用比例`);
+    const amounts = document.createElement("p");
+    amounts.className = "usage-amounts";
+    amounts.textContent = `已用 ${formatUsageAmount(row.used, usage.unit || "USD")} / ${formatUsageAmount(row.limit, usage.unit || "USD")}`;
+    const remaining = document.createElement("p");
+    remaining.className = "usage-remaining";
+    remaining.textContent = row.remaining <= 0 ?
+      `已用尽，${row.resetAt ? `${formatUsageTime(row.resetAt)}恢复` : row.resetFallback}` :
+      `剩余 ${formatUsageAmount(row.remaining, usage.unit || "USD")}`;
+    const reset = document.createElement("p");
+    reset.className = "usage-reset";
+    reset.textContent = row.resetAt ? `重置时间：${formatUsageTime(row.resetAt)}` : `重置时间：${row.resetFallback}`;
+    card.append(title, progress, amounts, remaining, reset);
+    list.append(card);
+  }
+  target.append(list);
+}
+
+export async function refreshDesktopUsage(workspace = state.chatWorkspace, panel = document.querySelector("[data-usage-panel]")) {
+  if (!desktopUsageEnabled()) return null;
+  const requestId = ++usageRequestId;
+  const content = panel?.querySelector("[data-usage-content]");
+  if (content) {
+    content.replaceChildren();
+    const loading = document.createElement("p");
+    loading.className = "hint";
+    loading.setAttribute("role", "status");
+    loading.textContent = "正在获取模型额度…";
+    content.append(loading);
+  }
+  let result;
+  try { result = await window.officeDesktop.usage(); }
+  catch { result = { state: "unavailable" }; }
+  if (requestId !== usageRequestId) return result;
+  if (workspace) workspace.usageState = result;
+  if (content?.isConnected) renderUsageResult(content, result);
+  return result;
+}
+
+export async function toggleDesktopUsage(button) {
+  const thread = button.closest(".agent-thread");
+  const panel = thread?.querySelector("[data-usage-panel]");
+  if (!panel) return;
+  const opening = panel.hidden;
+  panel.hidden = !opening;
+  button.setAttribute("aria-expanded", String(opening));
+  if (opening) await refreshDesktopUsage(state.chatWorkspace, panel);
 }
 
 export async function loadDesktopModelState() {
@@ -89,6 +230,7 @@ function turnView(turn) {
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行记录 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map(step=>`<li>${icon("check")}${e(step)}</li>`).join("")}</ul></details>` : ""}
       <p class="${turn.error?"error":"response-copy"}">${e(reply)}</p>
+      ${outputWarnings(turn.output_telemetry)}
       ${turn.file ? `<div class="session-file">${fileMarkup(turn.file,{edit:true})}</div>` : ""}
     </div>` : ""}
   </section>`;
@@ -193,13 +335,22 @@ export function workspaceView(workspace) {
   const {session,task,project}=workspace;
   const hasTurns=Boolean(session?.turns.length);
   const title=session?.title || (task ? task.title : project?project.name:"新会话");
+  const showUsage=desktopUsageEnabled();
   return `<div class="agent-workspace ${deckFiles(session).length?"has-deck":""}">
     <section class="agent-thread" aria-label="办公会话">
       <header class="thread-header">
         <span>${icon("message")}${e(title)}</span>
-        ${state.engine?.engine==="demo" ? '<span class="thread-engine">本地演示</span>' :
-          state.engine?.model ? `<span class="thread-engine">${e(state.engine.model)}</span>` : ""}
+        <div class="thread-header-actions">
+          ${state.engine?.engine==="demo" ? '<span class="thread-engine">本地演示</span>' :
+            state.engine?.model ? `<span class="thread-engine">${e(state.engine.model)}</span>` : ""}
+          ${showUsage?'<button class="button usage-toggle" type="button" data-act="usage-toggle" aria-expanded="false">模型额度</button>':""}
+        </div>
       </header>
+      ${showUsage?`<section class="usage-panel" data-usage-panel aria-label="模型额度" hidden>
+        <div class="usage-panel-heading"><h2>模型额度</h2>
+          <button class="button" type="button" data-act="usage-refresh">刷新</button></div>
+        <div data-usage-content><p class="hint" role="status">打开面板后获取额度。</p></div>
+      </section>`:""}
       <div class="thread-scroll">
         ${hasTurns?"":welcome(workspace)}
         <div class="thread-content" data-chat-turns>${historyView(workspace)}</div>
@@ -426,7 +577,8 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
       phase="complete";
       return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
-        text:result.text,usage:result.usage,model:result.model || model
+        text:result.text,usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
       });
     });
   } catch (error) {
@@ -505,6 +657,7 @@ export async function sendMessage(form, rerender) {
       await rerender(true);
       chatForm()?.elements.message.focus({preventScroll:true});
     }
+    void refreshDesktopUsage().catch(()=>{});
   } catch (error) {
     if (state.me?.id===user && inView()) {
       const current=progress?.querySelector(".running-note");

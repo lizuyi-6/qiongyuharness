@@ -1,5 +1,5 @@
 import { active, api, badge, button, dateLabel, deadline, e, eventLabels, fileIcon, fileMarkup,
-  icon, isManager, isReview, labels, priorities, readDraft, roles, state, uploadMarkup } from "./ui.js";
+  icon, isManager, isReview, labels, outputWarnings, priorities, readDraft, roles, state, uploadMarkup } from "./ui.js";
 import { conversationNav } from "./chat.js";
 
 export const views = {
@@ -229,6 +229,7 @@ export function agentSetup(session, task, files, desktopModels = {}) {
       </form>
     </section>
     ${plan?`<section id="plan" class="panel pad stack"><h2 class="section-title">预览并调整大纲</h2>
+      ${outputWarnings(session.outputTelemetry)}
       <p class="hint">每行是一条正文。PowerPoint 自动添加封面。</p><form class="stack" data-form="render">
        <div class="form-grid">
         <label class="field">标题<input required maxlength="110" name="plan_title" value="${e(plan.title)}"></label>

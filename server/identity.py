@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
-from .store import DEMO, audit, database, instant
+from .store import DEMO, audit, database, instant, open_enrollment_enabled
 
 router = APIRouter()
 COOKIE = "qo_session"
@@ -65,6 +65,7 @@ def user_for(request: Request):
 
 
 def validate_identity_config():
+    open_enrollment_enabled()
     if DEMO:
         return
     origin = urlsplit(ORIGIN)
@@ -176,25 +177,69 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
                 raise ValueError("authorized party mismatch")
     except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError, StopIteration):
         fail(401, "企业身份验证失败，请重新登录")
+    open_enrollment = open_enrollment_enabled()
     with database(write=True) as db:
         subject = claims["sub"]
         user = db.one("SELECT id,email,subject,role FROM users WHERE subject=? AND enabled=1", (subject,))
         if not user:
             email_value = claims.get("email")
             email = email_value.strip().lower() if isinstance(email_value, str) else ""
-            user = db.one("SELECT id,email,subject,role FROM users WHERE email=? AND enabled=1", (email,)) if email else None
-            if user and user["subject"] is not None and user["subject"] != subject:
+            email_user = db.one(
+                "SELECT id,email,subject,role,enabled,source,roster_blocked FROM users WHERE email=?", (email,)
+            ) if email else None
+            if email_user and email_user["roster_blocked"]:
+                fail(403, "此邮箱已被管理员停用")
+            if email_user and email_user["subject"] is not None and email_user["subject"] != subject:
                 fail(403, "此邮箱已绑定其他造场账号")
             if claims.get("email_verified") is not True or not email:
-                fail(403, "造场账号未提供已验证邮箱，无法开通工作台权限")
-            if user and user["subject"] is None:
+                message = ("造场账号未提供已验证邮箱，无法自动注册工作台账号" if open_enrollment
+                           else "造场账号未提供已验证邮箱，无法开通工作台权限")
+                fail(403, message)
+            if open_enrollment and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                fail(403, "造场账号未提供已验证邮箱，无法自动注册工作台账号")
+
+            if email_user and email_user["enabled"] and email_user["source"] == "roster":
+                if email_user["subject"] is not None:
+                    fail(403, "此账号尚未开通工作台权限")
                 if db.one("SELECT id FROM users WHERE subject=?", (subject,)):
                     fail(403, "此账号尚未开通工作台权限")
-                db.execute("UPDATE users SET subject=? WHERE id=? AND subject IS NULL", (subject, user["id"]))
-                user = db.one("SELECT id,email,subject,role FROM users WHERE id=? AND enabled=1", (user["id"],))
+                db.execute("UPDATE users SET subject=? WHERE id=? AND subject IS NULL", (subject, email_user["id"]))
+                user = db.one("SELECT id,email,subject,role FROM users WHERE id=? AND enabled=1", (email_user["id"],))
                 if not user or user["subject"] != subject:
                     fail(403, "此账号尚未开通工作台权限")
                 audit(db, "auth.subject_bound", user["id"], subject=subject)
+            elif open_enrollment:
+                subject_user = db.one("SELECT id FROM users WHERE subject=?", (subject,))
+                if subject_user and (not email_user or subject_user["id"] != email_user["id"]):
+                    fail(403, "此账号尚未开通工作台权限")
+                name_value = claims.get("name")
+                name = name_value.strip() if isinstance(name_value, str) else ""
+                if not name:
+                    name = email.split("@", 1)[0]
+                if email_user:
+                    db.execute(
+                        "UPDATE users SET subject=?,name=?,department='',role='employee',enabled=1,source='auto',roster_blocked=0 WHERE id=?",
+                        (subject, name, email_user["id"]),
+                    )
+                    user_id = email_user["id"]
+                    newly_enrolled = email_user["source"] != "auto" or not email_user["enabled"]
+                    subject_was_unbound = email_user["subject"] is None
+                else:
+                    user_id = "u_" + digest(email)[:24]
+                    db.execute(
+                        "INSERT INTO users(id,email,subject,name,department,role,enabled,source,roster_blocked) "
+                        "VALUES(?,?,?,?,?,'employee',1,'auto',0)",
+                        (user_id, email, subject, name, ""),
+                    )
+                    newly_enrolled = True
+                    subject_was_unbound = True
+                if newly_enrolled:
+                    audit(db, "user.auto_enrolled", user_id, user_id=user_id, email_sha256=digest(email))
+                if subject_was_unbound:
+                    audit(db, "auth.subject_bound", user_id, subject=subject)
+                user = db.one("SELECT id,email,subject,role FROM users WHERE id=? AND enabled=1", (user_id,))
+                if not user or user["subject"] != subject:
+                    fail(403, "此账号尚未开通工作台权限")
             else:
                 fail(403, "此账号尚未开通工作台权限")
         audit(db, "auth.login", user["id"], mode="oidc")

@@ -9,6 +9,7 @@ from .identity import user_for
 from .store import DEMO, audit, database
 
 router = APIRouter()
+USER_AGENT = "QiongyuOffice-Server/0.1.0"
 
 
 def settings():
@@ -35,8 +36,9 @@ def validate_config():
     if (not config["url"] or url.scheme != "https" or not url.hostname or url.path not in ("", "/")
             or url.query or url.fragment or url.username or url.password):
         raise RuntimeError("Enterprise mode requires QO_SUB2API_URL to be an HTTPS origin without credentials or a path.")
-    if not config["provision_key"]:
-        raise RuntimeError("Enterprise mode requires QO_SUB2API_PROVISION_KEY.")
+    provision_key = config["provision_key"]
+    if not provision_key.startswith("adm_sc_") or not provision_key[len("adm_sc_"):].strip():
+        raise RuntimeError("QO_SUB2API_PROVISION_KEY must use the adm_sc_ restricted-key prefix.")
     if group_id <= 0:
         raise RuntimeError("Enterprise mode requires a positive QO_SUB2API_DEFAULT_GROUP_ID.")
     if not re.fullmatch(r"[a-z0-9][a-z0-9:._-]{0,63}", config["key_name"]):
@@ -80,7 +82,7 @@ async def model_credential(request: Request):
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             response = await client.post(
                 f"{config['url']}/api/v1/admin/provision/user-key",
-                headers={"Authorization": f"Bearer {config['provision_key']}"},
+                headers={"x-api-key": config["provision_key"], "User-Agent": USER_AGENT},
                 json={
                     "email": user["email"],
                     "display_name": user["name"],

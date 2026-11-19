@@ -5,7 +5,7 @@ import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pa
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { attachFiles, chooseSources, loadDesktopModelState, loadEarlier, loadWorkspace, removeSource, runDesktopAgent,
-  saveWorkspaceInput, selectDesktopModel,
+  refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel, toggleDesktopUsage,
   scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
@@ -237,7 +237,9 @@ async function executeDesktopPlan(task, data, form) {
       updateAgentRunStatus(form,"正在保存大纲…");
       phase="complete";
       return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
-        run_id:prepared.run_id,text:result.text,usage:result.usage,model:result.model || model
+        run_id:prepared.run_id,text:result.text,
+        usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
       });
     });
     updateAgentRunStatus(form,"");
@@ -312,6 +314,8 @@ async function onClick(event) {
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
+    case "usage-toggle": await toggleDesktopUsage(target); break;
+    case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace, target.closest("[data-usage-panel]")); break;
     case "slides-clear": clearSelection(); break;
     case "project-create": projectDialog("create"); break;
     case "project-join": projectDialog("join"); break;
@@ -519,7 +523,7 @@ async function handleForm(event) {
       const result=desktopRequired?await executeDesktopPlan(task,data,form):
         await post(task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan",data);
       if (state.agent===agent && state.route[0]==="agent" && form.isConnected) {
-        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null});
+        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null,outputTelemetry:result.usage});
         saveAgent();
         localRefresh();
         document.querySelector("#plan")?.scrollIntoView({behavior:"smooth",block:"nearest"});

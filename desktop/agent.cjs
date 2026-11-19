@@ -8,6 +8,7 @@ const { runDsh } = require("./lib/dsh-bridge.cjs");
 const { listModelsWithRefresh, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
+const { quotaExhaustionMessage, requestUsage, USAGE_TIMEOUT_MS } = require("./lib/usage.cjs");
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -139,7 +140,8 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
     const url = `${credential.baseUrl.replace(/\/+$/, "")}/models`;
     const response = await net.fetch(url, {
       headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
-      redirect: "error"
+      redirect: "error",
+      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS)
     });
     if (!response.ok) {
       let payload = {};
@@ -164,6 +166,15 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
       return { models: await freshModels() };
     } catch (error) {
       return { models: [], error: error.message || "模型列表加载失败" };
+    }
+  }
+
+  async function usage() {
+    try {
+      const { credential } = await getCredential();
+      return await requestUsage(credential, (url, options) => net.fetch(url, options));
+    } catch {
+      return { state: "unavailable" };
     }
   }
 
@@ -240,8 +251,24 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
         }
       });
       emit({ type: "step", label: "处理完成" });
-      return { text, usage: gateway.usage, model: job.model };
+      return {
+        text,
+        usage: gateway.usage,
+        model: job.model,
+        max_tokens_clamped: gateway.max_tokens_clamped,
+        finish_reasons: gateway.finish_reasons,
+        truncated: gateway.truncated
+      };
     } catch (error) {
+      if (gateway?.quota_error) {
+        let usageSnapshot;
+        try {
+          const result = await requestUsage(credential, (url, options) => net.fetch(url, options));
+          if (result.state === "available") usageSnapshot = result.usage;
+        } catch {}
+        const message = quotaExhaustionMessage(gateway.quota_error, usageSnapshot);
+        if (message) error = new Error(message);
+      }
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;
     } finally {
@@ -254,6 +281,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {} }) {
     clearAllCredentials,
     clearCredentialsForOrigin,
     models,
+    usage,
     prefetchAfterLogin,
     runAgent
   };

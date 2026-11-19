@@ -1,5 +1,6 @@
 const http = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
+const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
 const RESPONSE_LIMIT = 3 * 1024 * 1024;
@@ -24,7 +25,7 @@ function allowedFunction(value, allowed) {
   return isObject(value) && typeof value.name === "string" && allowed.has(value.name);
 }
 
-function sanitizeRequest(value, model, allowedTools) {
+function sanitizeRequest(value, model, allowedTools, stats = null) {
   if (!isObject(value) || value.model !== model || !Array.isArray(value.messages)) {
     throw new Error("invalid request");
   }
@@ -52,11 +53,15 @@ function sanitizeRequest(value, model, allowedTools) {
   if (tools.length) params.tools = tools;
 
   let maxTokens = value.max_tokens;
-  if (maxTokens === undefined || maxTokens === null || maxTokens === 0) maxTokens = TOKEN_LIMIT;
+  if (maxTokens === undefined || maxTokens === null) maxTokens = TOKEN_LIMIT;
   if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || !Number.isInteger(maxTokens)) {
     throw new Error("invalid max_tokens");
   }
-  params.max_tokens = Math.min(Math.max(maxTokens, 1), TOKEN_LIMIT);
+  if (maxTokens <= 0) throw new Error("invalid max_tokens");
+  params.max_tokens = Math.min(maxTokens, TOKEN_LIMIT);
+  if (maxTokens > TOKEN_LIMIT && stats) {
+    stats.max_tokens_clamped.push({ requested: maxTokens, applied: TOKEN_LIMIT });
+  }
   return params;
 }
 
@@ -89,24 +94,33 @@ function usageFromPayload(payload) {
     Number.isSafeInteger(value) && value >= 0));
 }
 
-function usageFromResponse(contentType, body) {
+function responseDetails(contentType, body) {
+  const finishReasons = [];
+  let usage = {};
+  const collect = (payload) => {
+    const nextUsage = usageFromPayload(payload);
+    if (Object.keys(nextUsage).length) usage = nextUsage;
+    for (const choice of Array.isArray(payload?.choices) ? payload.choices : []) {
+      if (typeof choice?.finish_reason === "string") finishReasons.push(choice.finish_reason);
+    }
+  };
   if (contentType.includes("text/event-stream")) {
-    let latest = {};
     for (const line of body.toString("utf8").split(/\r?\n/)) {
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
       if (!data || data === "[DONE]") continue;
       try {
-        latest = usageFromPayload(JSON.parse(data)) || latest;
+        collect(JSON.parse(data));
       } catch {}
     }
-    return latest;
+    return { usage, finishReasons };
   }
   try {
-    return usageFromPayload(JSON.parse(body.toString("utf8")));
+    collect(JSON.parse(body.toString("utf8")));
   } catch {
-    return {};
+    return { usage: {}, finishReasons: [] };
   }
+  return { usage, finishReasons };
 }
 
 function addUsage(target, next) {
@@ -121,9 +135,61 @@ function replyError(response, status, message) {
   response.end(JSON.stringify({ error: { message } }));
 }
 
+async function readErrorBody(upstream, limit = 64 * 1024) {
+  if (!upstream.body) return "";
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel();
+        return "";
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } catch {
+    try { await reader.cancel(); } catch {}
+    return "";
+  }
+}
+
+function quotaErrorDetails(upstream, body) {
+  if (upstream.status !== 429) return null;
+  let payload;
+  try { payload = JSON.parse(body); } catch { return null; }
+  const error = payload?.error;
+  if (!isObject(error) || error.type !== "rate_limit_exceeded" && error.code !== "rate_limit_exceeded") return null;
+
+  const details = { type: "rate_limit_exceeded" };
+  if (typeof error.code === "string" && error.code.length <= 120) details.code = error.code;
+  if (typeof error.message === "string" && error.message.length <= 400) details.message = error.message;
+  const resetAt = error.metadata?.window_resets_at;
+  if (isIsoDateTime(resetAt)) details.resetAt = resetAt;
+  const retryAfter = Number(upstream.headers.get("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter > 0 && retryAfter <= 30 * 24 * 60 * 60) details.retryAfter = retryAfter;
+  return details;
+}
+
 async function pipeResponse(upstream, response, state) {
   const contentType = upstream.headers.get("content-type") || "application/json";
-  if (!upstream.ok || !upstream.body) {
+  if (upstream.ok) state.quota_error = null;
+  if (!upstream.ok) {
+    const body = await readErrorBody(upstream);
+    const quotaError = quotaErrorDetails(upstream, body);
+    if (quotaError) {
+      state.quota_error = quotaError;
+      replyError(response, 429, "模型额度已用尽");
+      return;
+    }
+    replyError(response, 502, "模型服务请求失败");
+    return;
+  }
+  if (!upstream.body) {
     replyError(response, 502, "模型服务请求失败");
     return;
   }
@@ -151,7 +217,12 @@ async function pipeResponse(upstream, response, state) {
       if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
     }
     response.end();
-    addUsage(state.usage, usageFromResponse(contentType, Buffer.concat(chunks, total)));
+    const details = responseDetails(contentType, Buffer.concat(chunks, total));
+    addUsage(state.usage, details.usage);
+    for (const reason of details.finishReasons) {
+      if (state.finish_reasons.length < MAX_CALLS) state.finish_reasons.push(reason);
+      if (reason === "length") state.truncated = true;
+    }
   } catch (error) {
     try { await reader.cancel(); } catch {}
     if (!response.destroyed) response.destroy(error);
@@ -167,7 +238,15 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
   }
 
   const key = randomBytes(35).toString("base64url");
-  const state = { calls: 0, usage: {}, allowedTools: new Set(allowedTools) };
+  const state = {
+    calls: 0,
+    usage: {},
+    allowedTools: new Set(allowedTools),
+    max_tokens_clamped: [],
+    finish_reasons: [],
+    truncated: false,
+    quota_error: null
+  };
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const server = http.createServer(async (request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions" ||
@@ -177,9 +256,10 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     }
 
     let params;
+    const clampEventsBefore = state.max_tokens_clamped.length;
     try {
       const raw = await readBody(request);
-      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools);
+      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools, state);
     } catch (error) {
       replyError(response, error.statusCode || 422, "请求格式或工具权限无效");
       return;
@@ -187,6 +267,7 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
 
     state.calls += 1;
     if (state.calls > MAX_CALLS) {
+      state.max_tokens_clamped.splice(clampEventsBefore);
       replyError(response, 429, "本轮模型调用次数已达上限");
       return;
     }
@@ -219,6 +300,10 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     key,
     url: `http://127.0.0.1:${address.port}/v1`,
     get usage() { return { ...state.usage }; },
+    get max_tokens_clamped() { return state.max_tokens_clamped.map((item) => ({ ...item })); },
+    get finish_reasons() { return [...state.finish_reasons]; },
+    get truncated() { return state.truncated; },
+    get quota_error() { return state.quota_error ? { ...state.quota_error } : null; },
     async close() {
       if (!server.listening) return;
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
