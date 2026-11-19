@@ -27,13 +27,19 @@ Windows 安装 Python 3.12 后运行 `Start-Demo.cmd`；Linux 或 macOS 运行 `
 
 部署时应填入登记应用获得的 client secret。当前启动校验并不强制 secret 非空；只有 secret 非空时，回调才按造场元数据选择 `client_secret_basic` 或 `client_secret_post` 发送。若留空，造场 token endpoint 必须允许无客户端密钥的请求。
 
-### 3. 按邮箱登记员工
+### 3. 配置名单与开放注册
 
-`QO_USERS_FILE` 指向 JSON 数组，每项格式为 `{ "email", "name", "department", "role" }`，可选 `sub` 用于预先绑定造场 subject。邮箱会去空格并转成小写；内部用户 ID 由邮箱的 SHA-256 派生，因此同一邮箱在重启后保持稳定。名单至少要有一名 `admin`。示例见 [`users.example.json`](users.example.json)。
+`QO_USERS_FILE` 指向 JSON 数组，每项格式为 `{ "email", "name", "department", "role" }`，可选 `sub` 用于预先绑定造场 subject，也可用布尔值 `enabled` 停用某个名单账号。邮箱会去空格并转成小写；内部用户 ID 由邮箱的 SHA-256 派生，因此同一邮箱在重启后保持稳定。企业模式名单仍至少要有一名 `admin`。示例见 [`users.example.json`](users.example.json)。
 
-登录时先按已绑定的 `sub` 查找启用账号；找不到时，只有造场声明 `email_verified: true` 且名单中存在未绑定的同邮箱账号，才会绑定 subject、写入 `auth.subject_bound` 审计记录并建立会话。邮箱未验证、邮箱不在名单、账号未启用或邮箱已绑定另一个 subject 时，不能通过邮箱路径开通。已经按 subject 命中的账号走优先路径，不会再次检查邮箱验证声明。
+`QO_OPEN_ENROLLMENT` 只接受 `0` 或 `1`，缺省为 `0`。值为 `0` 时维持仅名单登录；同步会停用不在名单里的用户并删除其会话及桌面授权码。生产开放注册时将它设为 `1`：造场会员即可登录；其 ID token 必须通过现有签名、issuer、audience、nonce 和有效期校验，并且新用户的 `email_verified` 必须严格为布尔值 `true`。名单外新用户会以 `employee` 角色创建，姓名取 ID token 的 `name`，缺失时使用邮箱前缀，部门为空；自动开户事件 `user.auto_enrolled` 只记录用户 ID 和邮箱 SHA-256，不记录 token。已绑定的邮箱仍不能换绑到另一个造场 subject。
 
-从名单删除账号后，**下次服务启动同步名单时**会禁用该账号并删除其会话及未领取桌面授权码。历史业务记录仍保留。
+开放注册模式下，名单仍决定名单内账号的角色、部门和姓名；未列入名单的自动注册账号不会被名单同步停用。将条目设为 `"enabled": false` 会拒绝该邮箱登录，并在下次服务启动同步名单时删除其现有会话和未领取桌面授权码，例如：
+
+```json
+{ "email": "former@example.com", "name": "停用账号", "department": "运营", "role": "employee", "enabled": false }
+```
+
+造场账号停用或取消会员资格后，造场会撤销其登录凭证；需要在穹驭办公立即封禁的账号，也应在名单中显式设为 `enabled: false`。开放注册不会自动发放模型额度：新用户开通后 sub2api 余额为 0，需管理员在 sub2api 分配余额、订阅或额度后才能对话。
 
 **改动已经绑定 subject 的员工邮箱时，需要管理员清理旧绑定。** 新邮箱会派生出新内部 ID；旧的禁用用户行会保留原 subject，该 subject 唯一索引仍占用它。先在 `users.json` 中更新邮箱并重启服务，再通过受控数据库维护清理旧绑定。先确认旧邮箱行已禁用并记录其内部 ID，再仅将该禁用行的 `subject` 设为 `NULL`；不要删除用户行，以保留历史关联。SQLite 和 PostgreSQL 都可用以下语句（替换旧邮箱）：
 

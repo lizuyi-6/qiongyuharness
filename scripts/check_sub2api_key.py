@@ -7,7 +7,11 @@ from urllib.request import Request, urlopen
 
 
 def _request(url, method, key, body=None):
-    headers = {"x-api-key": key, "Accept": "application/json"}
+    headers = {
+        "x-api-key": key,
+        "Accept": "application/json",
+        "User-Agent": "QiongyuOffice-DeployCheck/1",
+    }
     data = None
     if body is not None:
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -51,8 +55,9 @@ def run_checks(base_url, key, request=_request):
     try:
         response = request(f"{origin}/api/v1/admin/users?page=1&page_size=1", "GET", key)
         try:
-            if response.status != 403:
-                failures.append("users probe: expected HTTP 403")
+            payload = _body(response)
+            if response.status != 403 or not isinstance(payload, dict) or payload.get("code") != "FORBIDDEN":
+                failures.append("users probe: expected HTTP 403 with JSON code FORBIDDEN")
         finally:
             response.close()
     except (OSError, URLError, TimeoutError, ValueError):

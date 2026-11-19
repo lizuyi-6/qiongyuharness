@@ -9,6 +9,7 @@ from .identity import user_for
 from .store import DEMO, audit, database
 
 router = APIRouter()
+USER_AGENT = "QiongyuOffice-Server/0.1.0"
 
 
 def settings():
@@ -81,7 +82,7 @@ async def model_credential(request: Request):
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             response = await client.post(
                 f"{config['url']}/api/v1/admin/provision/user-key",
-                headers={"x-api-key": config["provision_key"]},
+                headers={"x-api-key": config["provision_key"], "User-Agent": USER_AGENT},
                 json={
                     "email": user["email"],
                     "display_name": user["name"],

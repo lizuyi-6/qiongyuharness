@@ -27,6 +27,7 @@ class ZaochangAuthTest(unittest.TestCase):
         cls.previous_data = store.DATA
         cls.previous_demo = store.DEMO
         cls.previous_roster = os.environ.get("QO_USERS_FILE")
+        cls.previous_open_enrollment = os.environ.get("QO_OPEN_ENROLLMENT")
         cls.data = Path(cls.temp.name) / "data"
         cls.data.mkdir()
         cls.roster_path = Path(cls.temp.name) / "users.json"
@@ -35,10 +36,13 @@ class ZaochangAuthTest(unittest.TestCase):
             {"email": "worker@example.com", "name": "经办员工", "department": "产品", "role": "employee"},
             {"email": "unverified@example.com", "name": "未验证用户", "department": "产品", "role": "employee"},
             {"email": "reviewer@example.com", "name": "审核员", "department": "运营", "role": "reviewer"},
+            {"email": "blocked@example.com", "name": "已停用用户", "department": "运营", "role": "employee", "enabled": False},
+            {"email": "manager@example.com", "name": "部门主管", "department": "研发", "role": "manager"},
         ]), encoding="utf-8")
         store.DATA = cls.data
         store.DEMO = False
         os.environ["QO_USERS_FILE"] = str(cls.roster_path)
+        os.environ["QO_OPEN_ENROLLMENT"] = "0"
         store.initialize()
         cls.issuer = "https://identity.test"
         cls.client_id = "office-test"
@@ -54,6 +58,10 @@ class ZaochangAuthTest(unittest.TestCase):
             os.environ.pop("QO_USERS_FILE", None)
         else:
             os.environ["QO_USERS_FILE"] = cls.previous_roster
+        if cls.previous_open_enrollment is None:
+            os.environ.pop("QO_OPEN_ENROLLMENT", None)
+        else:
+            os.environ["QO_OPEN_ENROLLMENT"] = cls.previous_open_enrollment
         cls.temp.cleanup()
 
     def setUp(self):
@@ -63,7 +71,7 @@ class ZaochangAuthTest(unittest.TestCase):
         import hashlib
         return "u_" + hashlib.sha256(email.lower().encode("utf-8")).hexdigest()[:24]
 
-    def oidc_login(self, subject, email=None, email_verified=None, *, code="login", desktop=False):
+    def oidc_login(self, subject, email=None, email_verified=None, *, code="login", desktop=False, name=None):
         action = {}
         real_client = httpx.AsyncClient
 
@@ -91,6 +99,8 @@ class ZaochangAuthTest(unittest.TestCase):
                     claims["email"] = email
                 if email_verified is not None:
                     claims["email_verified"] = email_verified
+                if name is not None:
+                    claims["name"] = name
                 token = jwt.encode(claims, self.signing_key, algorithm="RS256", headers={"kid": self.jwk["kid"]})
                 return httpx.Response(200, json={"id_token": token})
             return httpx.Response(404)
@@ -116,6 +126,9 @@ class ZaochangAuthTest(unittest.TestCase):
             admin = db.one("SELECT id,email FROM users WHERE email=?", ("admin@example.com",))
             self.assertEqual(admin["id"], self.user_id("admin@example.com"))
             self.assertEqual(admin["email"], "admin@example.com")
+            listed = db.one("SELECT name,department,role,enabled,source FROM users WHERE email=?", ("manager@example.com",))
+            self.assertEqual((listed["name"], listed["department"], listed["role"], listed["enabled"], listed["source"]),
+                             ("部门主管", "研发", "manager", 1, "roster"))
         first, _, action = self.oidc_login("subject-worker", "WORKER@example.com", True, code="first")
         self.assertEqual(first.status_code, 303, first.text)
         self.assertEqual(action["scope"], ["openid profile email"])
@@ -137,6 +150,100 @@ class ZaochangAuthTest(unittest.TestCase):
         self.assertEqual(missing.status_code, 403)
         with store.database() as db:
             self.assertIsNone(db.one("SELECT subject FROM users WHERE id=?", (self.user_id("unverified@example.com"),))["subject"])
+
+    def test_open_enrollment_creates_employee_and_keeps_subject_binding(self):
+        with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": "1"}, clear=False):
+            response, _, _ = self.oidc_login(
+                "auto-subject", " New.Hire@Example.com ", True, code="auto-enroll", name="新入职员工"
+            )
+            self.assertEqual(response.status_code, 303, response.text)
+            user_id = self.user_id("new.hire@example.com")
+            with store.database() as db:
+                user = db.one("SELECT id,email,subject,name,department,role,enabled,source FROM users WHERE id=?", (user_id,))
+                self.assertEqual(tuple(user), (
+                    user_id, "new.hire@example.com", "auto-subject", "新入职员工", "", "employee", 1, "auto"
+                ))
+                event = db.one("SELECT type,payload FROM events WHERE actor_id=? AND type='user.auto_enrolled'", (user_id,))
+                self.assertEqual(event["type"], "user.auto_enrolled")
+                payload = store.unpack(event["payload"])
+                self.assertEqual(payload["user_id"], user_id)
+                self.assertEqual(payload["email_sha256"], identity.digest("new.hire@example.com"))
+                self.assertNotIn("new.hire@example.com", event["payload"])
+            store.initialize()
+            with store.database() as db:
+                self.assertEqual(db.one("SELECT enabled FROM users WHERE id=?", (user_id,))["enabled"], 1)
+
+            fallback, _, _ = self.oidc_login("fallback-subject", "fallback@example.com", True, code="auto-name")
+            self.assertEqual(fallback.status_code, 303, fallback.text)
+            with store.database() as db:
+                fallback_user = db.one("SELECT name,role,department FROM users WHERE email=?", ("fallback@example.com",))
+                self.assertEqual(tuple(fallback_user), ("fallback", "employee", ""))
+
+            conflict, _, _ = self.oidc_login("changed-auto-subject", "new.hire@example.com", True, code="auto-conflict")
+            self.assertEqual(conflict.status_code, 403)
+            self.assertEqual(conflict.json()["detail"], "此邮箱已绑定其他造场账号")
+            with store.database() as db:
+                self.assertEqual(db.one("SELECT subject FROM users WHERE id=?", (user_id,))["subject"], "auto-subject")
+
+    def test_open_enrollment_requires_strictly_verified_email(self):
+        with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": "1"}, clear=False):
+            for index, verified in enumerate((False, None, "true", 1)):
+                email = f"unverified-{index}@example.com"
+                response, _, _ = self.oidc_login(
+                    f"unverified-subject-{index}", email, verified, code=f"unverified-auto-{index}"
+                )
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(response.json()["detail"], "造场账号未提供已验证邮箱，无法自动注册工作台账号")
+                with store.database() as db:
+                    self.assertIsNone(db.one("SELECT id FROM users WHERE email=?", (email,)))
+                    self.assertEqual(db.one("SELECT COUNT(*) AS count FROM events WHERE type='user.auto_enrolled' AND payload LIKE ?",
+                                            (f"%{identity.digest(email)}%",))["count"], 0)
+
+    def test_roster_enabled_false_blocks_open_enrollment_and_clears_credentials(self):
+        blocked_id = self.user_id("blocked@example.com")
+        with store.database(write=True) as db:
+            session = identity.make_session(db, blocked_id)
+            db.execute(
+                "INSERT INTO desktop_auth_codes(code_hash,challenge,user_id,expires) VALUES(?,?,?,?)",
+                (identity.digest("unused-code"), "challenge", blocked_id, store.instant(datetime.now(UTC) + timedelta(minutes=1))),
+            )
+        with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": "1"}, clear=False):
+            store.initialize()
+            with store.database() as db:
+                user = db.one("SELECT enabled,source,roster_blocked FROM users WHERE id=?", (blocked_id,))
+                self.assertEqual(tuple(user), (0, "roster", 1))
+                self.assertIsNone(db.one("SELECT token FROM sessions WHERE token=?", (identity.digest(session),)))
+                self.assertEqual(db.one("SELECT COUNT(*) AS count FROM desktop_auth_codes WHERE user_id=?", (blocked_id,))["count"], 0)
+            response, _, _ = self.oidc_login("blocked-subject", "blocked@example.com", True, code="blocked-member")
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["detail"], "此邮箱已被管理员停用")
+        with store.database() as db:
+            self.assertEqual(db.one("SELECT COUNT(*) AS count FROM users WHERE email=?", ("blocked@example.com",))["count"], 1)
+
+    def test_closed_enrollment_preserves_legacy_sync_disable_behavior(self):
+        with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": "1"}, clear=False):
+            enrolled, _, _ = self.oidc_login("closed-mode-subject", "closed-mode@example.com", True, code="closed-create")
+            self.assertEqual(enrolled.status_code, 303, enrolled.text)
+        user_id = self.user_id("closed-mode@example.com")
+        with store.database(write=True) as db:
+            session = identity.make_session(db, user_id)
+        with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": "0"}, clear=False):
+            store.initialize()
+            with store.database() as db:
+                disabled = db.one("SELECT enabled,source FROM users WHERE id=?", (user_id,))
+                self.assertEqual(tuple(disabled), (0, "auto"))
+                self.assertIsNone(db.one("SELECT token FROM sessions WHERE token=?", (identity.digest(session),)))
+            denied, _, _ = self.oidc_login("closed-mode-subject", "closed-mode@example.com", True, code="closed-deny")
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.json()["detail"], "此账号尚未开通工作台权限")
+
+    def test_open_enrollment_setting_rejects_values_other_than_zero_or_one(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIs(store.open_enrollment_enabled(), False)
+        for value in ("true", "", " 1", "2"):
+            with patch.dict(os.environ, {"QO_OPEN_ENROLLMENT": value}, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "QO_OPEN_ENROLLMENT must be exactly '0' or '1'"):
+                    identity.validate_identity_config()
 
     def make_session(self, email):
         with store.database(write=True) as db:
@@ -164,6 +271,7 @@ class ZaochangAuthTest(unittest.TestCase):
         def endpoint(request):
             self.assertEqual(request.url, "https://aethernettech.dev/api/v1/admin/provision/user-key")
             self.assertEqual(request.headers["x-api-key"], "adm_sc_test_restricted-provision-key")
+            self.assertEqual(request.headers["user-agent"], sub2api.USER_AGENT)
             self.assertNotIn("authorization", request.headers)
             self.assertEqual(json.loads(request.content), {
                 "email": "worker@example.com",
@@ -264,7 +372,7 @@ class ZaochangAuthTest(unittest.TestCase):
             with store.database() as db:
                 user_columns = {row["name"] for row in db.all("PRAGMA table_info(users)")}
                 flow_columns = {row["name"] for row in db.all("PRAGMA table_info(auth_flows)")}
-                self.assertTrue({"email", "subject"} <= user_columns)
+                self.assertTrue({"email", "subject", "source", "roster_blocked"} <= user_columns)
                 self.assertIn("port", flow_columns)
                 self.assertEqual(db.one("SELECT name FROM users WHERE id='legacy'")["name"], "Legacy")
         finally:
