@@ -1,0 +1,48 @@
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true
+- id: mcp-resources
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: sandbox-policy
+  config:
+    mode: read-only
+    workspaceRoot: !!js process.cwd()
+- id: llm-deepseek
+  disabled: true
+- id: deepseek-llm-api-extensions
+  disabled: true
+- insert:
+    - id: llm-company
+      name: '@deepseek-ai/dsh-llm-pi-ai'
+      config:
+        providers:
+          company:
+            api: openai-completions
+            apiKeyEnv: QO_RUNTIME_KEY
+            baseURL: !!js process.env.QO_RUNTIME_URL
+            models:
+              - id: !!js process.env.QO_RUNTIME_MODEL
+                contextWindow: 128000
+                maxTokens: 3500
+                reasoningEfforts: false
+            compat:
+              maxTokensField: max_tokens
+              supportsStore: false
+              supportsDeveloperRole: false
+              supportsUsageInStreaming: true
+            retryPolicy:
+              mode: normal
+              maxRetries: 1

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<title>连接穹驭办公</title>
+<style>
+*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#eef2f9;color:#182849;font:15px "Microsoft YaHei",sans-serif}main{width:min(500px,90vw);padding:42px;background:#fff;border:1px solid #dce4f2;border-radius:20px;box-shadow:0 14px 40px #172a5010}h1{margin:12px 0 8px}p{color:#586987;line-height:1.65}label{display:block;font-weight:700;margin:26px 0 8px}input,button{width:100%;padding:13px;border-radius:8px;font:inherit}input{border:1px solid #aab9d7}button{margin-top:14px;border:0;background:#3154d4;color:white;font-weight:700;cursor:pointer}.brand{color:#3154d4;font-weight:bold;letter-spacing:2px}.notice{min-height:24px;margin-bottom:0}
+</style>
+</head>
+<body><main>
+<div class="brand">穹驭办公</div><h1>连接企业工作台</h1>
+<p>输入公司提供的服务地址，连接后可以登录并处理每日任务。</p>
+<form id="connection">
+<label for="server">工作台服务地址</label><input id="server" type="url" placeholder="https://office.example.com" required>
+<button type="submit">连接工作台</button>
+<p id="notice" class="notice" role="status"></p>
+</form>
+</main></body></html>

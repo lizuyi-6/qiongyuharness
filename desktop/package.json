@@ -1,0 +1,40 @@
+{
+  "name": "qiongyu-office-desktop",
+  "version": "0.1.0",
+  "description": "Qiongyu Office employee desktop",
+  "author": "Qiongyu Technology",
+  "main": "main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win --x64",
+    "build:linux": "electron-builder --linux dir --x64"
+  },
+  "devDependencies": {
+    "electron": "45.3.4",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.qiongyutech.office",
+    "productName": "穹驭办公",
+    "artifactName": "QiongyuOffice-${version}-${arch}.${ext}",
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "package.json",
+      "connect.html"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "signAndEditExecutable": false,
+      "icon": "office.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

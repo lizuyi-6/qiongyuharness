@@ -1,0 +1,6 @@
+[
+  { "sub": "replace-with-idp-subject-for-admin", "name": "公司管理员", "department": "企业运营", "role": "admin" },
+  { "sub": "replace-with-idp-subject-for-manager", "name": "部门主管", "department": "产品与运营", "role": "manager" },
+  { "sub": "replace-with-idp-subject-for-employee", "name": "经办员工", "department": "产品与运营", "role": "employee" },
+  { "sub": "replace-with-idp-subject-for-reviewer", "name": "专职审核人", "department": "产品与运营", "role": "reviewer" }
+]

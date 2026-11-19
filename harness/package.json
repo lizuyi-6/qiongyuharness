@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.2.2-rc.1"
+  },
+  "name": "qiongyu-office-harness",
+  "private": true,
+  "version": "0.1.0"
+}

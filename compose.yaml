@@ -1,0 +1,31 @@
+services:
+  office:
+    build: .
+    env_file: .env
+    environment:
+      QO_DATABASE_URL: postgresql://office:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/office
+      QO_USERS_FILE: /config/users.json
+    volumes:
+      - ./users.json:/config/users.json:ro
+    ports:
+      - "127.0.0.1:8765:8765"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: office
+      POSTGRES_DB: office
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - office_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U office -d office"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+volumes:
+  office_db:

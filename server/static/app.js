@@ -1,0 +1,591 @@
+import { active, api, button, clearDrafts, dialog, e, errorIn, fileMarkup, go, icon, isManager, isReview, modal,
+  post, readDraft, roles, root, saveDraft, state, toastMessage, uploadSelected, uuid } from "./ui.js";
+import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pageHead, planSection, settingsView,
+  shell, taskDetail, views } from "./views.js";
+import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
+  taskAdmin } from "./admin.js";
+import { attachFiles, chooseSources, loadEarlier, loadWorkspace, removeSource, saveWorkspaceInput,
+  scrollToLatest, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
+import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
+import { clearSelection, mountDeck } from "./slides.js";
+
+let historyOffset = 0;
+let agentTask = null;
+let agentFiles = [];
+let navigation = 0;
+let currentMode = "";
+let timerBusy = false;
+const historySize = 20;
+
+function homeRoute() {
+  const role=state.me.role;
+  return role==="admin"?"admin":role==="reviewer"?"review":"chat";
+}
+
+function routeParts() {
+  return location.hash.slice(1).split("/").map(part => {
+    try { return decodeURIComponent(part); } catch { return ""; }
+  });
+}
+
+function adminReset() {
+  state.admin = {offset:0,department:"",status:"",date:""};
+}
+
+async function login(user) {
+  await post("/auth/demo", {user_id:user});
+  clearDrafts();
+  sessionStorage.removeItem("qo-signed-out");
+  clearAdmin();
+  state.agent=null;
+  state.chatWorkspace=null;
+  state.filter="all";
+  state.today=[];
+  adminReset();
+  historyOffset=0;
+  dialog.close();
+  [state.me,state.engine] = await Promise.all([api("/me"),api("/engine")]);
+  go(homeRoute());
+}
+
+async function logout() {
+  await post("/auth/logout",{});
+  clearDrafts();
+  clearAdmin();
+  sessionStorage.setItem("qo-signed-out","1");
+  state.me=null;
+  state.agent=null;
+  state.chatWorkspace=null;
+  state.today=[];
+  agentFiles=[];
+  agentTask=null;
+  dialog.close();
+  history.replaceState(null,"",location.pathname);
+  root.innerHTML=loginView();
+}
+
+async function startup() {
+  try {
+    state.config=await api("/config");
+    try { state.me=await api("/me"); }
+    catch (error) {
+      if (error.status!==401) throw error;
+      if (state.config.demo && !sessionStorage.getItem("qo-signed-out") &&
+          new URLSearchParams(location.search).get("login")!=="1") {
+        await login("lin");
+        return;
+      }
+    }
+    if (!state.me) { root.innerHTML=loginView(); return; }
+    state.engine=await api("/engine");
+    if (!location.hash) go(homeRoute());
+    else await render();
+  } catch (error) {
+    root.innerHTML=`<section class="splash"><div class="brand-mark">${icon("mark")}</div><h1>连接工作台</h1><p class="error">${e(error.message)}</p>${button("重试","boot")}</section>`;
+  }
+}
+
+async function loadToday() {
+  const data=await api("/me/today");
+  state.me.today=data.today;
+  state.today=data.items;
+}
+
+function viewSignature() {
+  return JSON.stringify([state.me.today,state.today.map(t=>[t.id,t.version,t.overdue])]);
+}
+
+function display(content, ticket, keepScroll = false) {
+  if (ticket!==navigation) return;
+  const y=window.scrollY;
+  root.innerHTML=shell(content);
+  window.scrollTo(0, keepScroll ? y : 0);
+  if (state.route[0]==="chat") {
+    scrollToLatest();
+    mountDeck();
+  }
+}
+
+async function fetchAgent(parts, force = false) {
+  const [, id, kind] = parts;
+  const taskID=id && id!=="new" ? id : "";
+  const well=taskID+"|"+(kind || "");
+  if (state.agent?.well!==well || force || !agentFiles.length) {
+    const [task,files] = await Promise.all([taskID?api("/assignments/"+encodeURIComponent(taskID)):null,api("/files")]);
+    if (task && (task.assignee_id!==state.me.id || !active(task.status))) throw new Error("该任务当前无法启动文稿协助");
+    agentTask=task;
+    agentFiles=files;
+    if (state.agent?.well!==well) {
+      state.agent=readDraft("agent/"+well) || {
+        well, kind:kind==="pptx"||task?.kind==="pptx"?"pptx":"docx",
+        title:(task?.title || "").slice(0,110), instructions:"", pages:8, material_ids:[]
+      };
+    }
+  }
+  return agentSetup(state.agent,agentTask,agentFiles);
+}
+
+async function render(keepScroll = false) {
+  if (!state.me) return;
+  const ticket=++navigation;
+  const parts=routeParts();
+  const mode=views[parts[0]]?parts[0]:homeRoute();
+  const previous=currentMode;
+  currentMode=mode;
+  state.route=[mode,...parts.slice(1)];
+  if (["admin","review"].includes(mode) && previous!==mode) adminReset();
+  try {
+    let content;
+    switch (mode) {
+      case "chat": {
+        const workspace=await loadWorkspace(parts);
+        if (ticket!==navigation) return;
+        state.chatWorkspace=workspace;
+        content=workspaceView(workspace);
+        break;
+      }
+      case "today": await loadToday(); content=dashboard(); break;
+      case "projects": content=await projectsView(parts[1]); break;
+      case "task":
+        state.focused=await api("/assignments/"+encodeURIComponent(parts[1] || ""));
+        content=taskDetail(state.focused); break;
+      case "history": {
+        const list=await api("/me/tasks?offset="+historyOffset+"&limit="+historySize);
+        content=historyView(list.items,historyOffset,historySize);
+        break;
+      }
+      case "agent": content=await fetchAgent(state.route,true); break;
+      case "files": content=filesView(await api("/files")); break;
+      case "settings": content=settingsView(); break;
+      case "admin":
+        if (!isManager()) { go("today"); return; }
+        content=await taskAdmin(); break;
+      case "review":
+        if (!isReview()) { go("today"); return; }
+        content=await taskAdmin(true); break;
+      case "audit":
+        if (state.me.role!=="admin") { go("today"); return; }
+        content=await auditPage(); break;
+    }
+    display(content,ticket,keepScroll);
+  } catch (error) {
+    if (ticket!==navigation) return;
+    if (error.status===401) {
+      clearDrafts();
+      state.me=null;
+      root.innerHTML=loginView("登录已过期，请重新登录。");
+    } else if (keepScroll && !navigator.onLine && root.querySelector(".layout")) {
+      if (root.querySelector(".connection-state")) root.querySelector(".connection-state").textContent="离线";
+    } else {
+      display(pageHead("工作台请求失败")+`<div class="panel pad stack"><p class="error">${e(error.message)}</p><div class="actions">${button("重试","refresh")}${button("返回今日任务","route",{id:"today"})}</div></div>`,ticket,keepScroll);
+    }
+  }
+}
+
+function localRefresh() {
+  if (state.route[0]==="agent") root.querySelector("#workplace").innerHTML=agentSetup(state.agent,agentTask,agentFiles);
+  else if (state.route[0]==="today") root.querySelector("#workplace").innerHTML=dashboard();
+}
+
+function saveAgent() {
+  if (state.agent) saveDraft("agent/"+state.agent.well,state.agent);
+}
+
+function agentInput(form) {
+  const data=new FormData(form);
+  return {kind:data.get("kind"),title:data.get("title"),instructions:data.get("instructions"),
+    pages:Number(data.get("pages") || 8),material_ids:data.getAll("material_ids")};
+}
+
+function planInput(form) {
+  return {title:form.elements.plan_title.value,subtitle:form.elements.plan_subtitle.value,
+    sections:[...form.querySelectorAll("[data-section]")].map(section=>{
+      const fields=section.querySelectorAll("input,textarea");
+      return {heading:fields[0].value,points:fields[1].value.split("\n").map(x=>x.trim()).filter(Boolean)};
+    })};
+}
+
+function submissionInput(form, save = false) {
+  const data = new FormData(form);
+  const fields = {note:data.get("note"),link:data.get("link"),artifact_ids:data.getAll("artifact_ids")};
+  if (!form.dataset.key || save) form.dataset.key=uuid();
+  saveDraft("submit/"+state.focused.id,{...fields,key:form.dataset.key});
+  return fields;
+}
+
+async function handleUpload(list, element) {
+  if (!list.length) return;
+  if (element?.closest("[data-form=conversation]")) return attachFiles(list, element);
+  if (list.length>12) throw new Error("请每次选择最多 12 个文件");
+  const key=state.route[0]==="task"?state.focused?.id:agentTask?.id && state.route[0]==="agent"?agentTask.id:"";
+  const mode=state.route[0];
+  const label=element?.closest("[data-upload-zone]");
+  label?.classList.add("drag");
+  try {
+    const created=await uploadSelected(list,key);
+    if (mode==="agent" && state.route[0]===mode) {
+      agentFiles=await api("/files");
+      state.agent.material_ids=[...new Set([...state.agent.material_ids,...created.filter(f=>f.extension!=="xlsx").map(f=>f.id)])].slice(0,8);
+      saveAgent();
+      localRefresh();
+    } else if (mode==="task" && key===state.focused?.id) {
+      const draft=readDraft("submit/"+key) || {};
+      saveDraft("submit/"+key,{...draft,artifact_ids:[...new Set([...(draft.artifact_ids || []),...created.map(x=>x.id)])],key:uuid()});
+      await render(true);
+    } else if (state.route[0]===mode) await render(true);
+    toastMessage("文件已添加");
+  } finally {
+    label?.classList.remove("drag");
+    if (element?.matches("input")) element.value="";
+  }
+}
+
+const actionCopy = {extension:"申请延期",comment:"留言",revoke:"撤销任务",close:"关闭任务"};
+
+async function onClick(event) {
+  const target=event.target.closest("[data-act]");
+  if (!target || target.disabled) return;
+  const {act,id}=target.dataset;
+  switch (act) {
+    case "route": go(id); break;
+    case "boot": await startup(); break;
+    case "open-task": dialog.close(); go("task/"+encodeURIComponent(id)); break;
+    case "agent-task": go("chat/task/"+encodeURIComponent(id)); break;
+    case "chat-example": useExample(id); break;
+    case "chat-remove-source": removeSource(id); break;
+    case "chat-sources": await showSources(); break;
+    case "chat-history": showConversationHistory(); break;
+    case "chat-earlier": await loadEarlier(); break;
+    case "slides-clear": clearSelection(); break;
+    case "project-create": projectDialog("create"); break;
+    case "project-join": projectDialog("join"); break;
+    case "project-rotate": await updateInvite(id,render); break;
+    case "profile":
+      modal("账户与身份",`<div class="stack"><p class="prose">${e(state.me.name)} · ${e(roles[state.me.role])}</p>
+        ${state.config.demo?'<p class="hint">切换演示身份以验收员工和管理流程。</p>':""}
+        ${state.config.demo?demoUsers.filter(u=>u[0]!==state.me.id).map(([person,name,role])=>button(name+" · "+role,"demo-login",{id:person})).join(""):""}
+        ${button("退出登录","logout",{icon:"logout"})}</div>`);
+      break;
+    case "demo-login": await login(id); break;
+    case "logout": await logout(); break;
+    case "sso":
+      if (!window.officeDesktop) { location.assign("/auth/start"); return; }
+      target.disabled=true;
+      target.textContent="等待系统浏览器登录…";
+      try {
+        if (await window.officeDesktop.signIn()) await startup();
+      } finally {
+        target.disabled=false;
+        target.textContent="使用公司账号登录";
+      }
+      break;
+    case "refresh": await render(true); break;
+    case "filter-today": state.filter=id; localRefresh(); break;
+    case "close-dialog": dialog.close(); break;
+    case "history-prev": historyOffset=Math.max(0,historyOffset-historySize); await render(); break;
+    case "history-next": historyOffset+=historySize; await render(); break;
+    case "audit-prev": state.auditOffset=Math.max(0,state.auditOffset-20); await render(); break;
+    case "audit-next": state.auditOffset+=20; await render(); break;
+    case "admin-prev": state.admin.offset=Math.max(0,state.admin.offset-20); await render(); break;
+    case "admin-next": state.admin.offset+=20; await render(); break;
+    case "admin-reset": adminReset(); await render(); break;
+    case "new-task": await showTaskForm(); break;
+    case "edit-plan": await showTaskForm(id); break;
+    case "publish-plan": showPublish(id); break;
+    case "change-task": await changeAssignment(state.focused); break;
+    case "task-action": {
+      state.focused=await post("/assignments/"+encodeURIComponent(state.focused.id)+"/action/"+id,{version:state.focused.version});
+      await render(true);
+      toastMessage(id==="start"?"任务已开始":"任务已暂停");
+      break;
+    }
+    case "task-note": {
+      const message = id==="revoke"?"撤销后员工停止办理，已提交文件和审阅记录仍可查看。":id==="close"?"关闭后停止办理，并保留历史交付。":"";
+      modal(actionCopy[id],`<form data-form="task-note" data-id="${id}" class="stack">
+      ${message?`<p class="notice warn">${message}</p>`:""}
+      <label class="field">说明<textarea name="note" rows="4" maxlength="3000" ${["extension","comment"].includes(id)?"required":""}></textarea></label>
+      <div class="actions"><button class="button primary" type="submit">确认${actionCopy[id]}</button></div></form>`);
+      break;
+    }
+    case "review-task":
+    case "return-task": {
+      const returned=act==="return-task";
+      modal(returned?"退回修改":"验收成果",`<form class="stack" data-form="review" data-id="${e(id)}"
+      data-decision="${returned?"return":"approve"}" data-key="${uuid()}">
+      <label class="field">审核意见<textarea name="note" rows="4" maxlength="3000" ${returned?"required":""} placeholder="${returned?"说明需要调整的内容":"填写通过说明（选填）"}"></textarea></label>
+      <div class="actions"><button class="button ${returned?"danger":"primary"}" type="submit">${returned?"确认退回":"确认通过"}</button></div></form>`);
+      break;
+    }
+    case "preview": {
+      const file=await api("/files/"+encodeURIComponent(id)+"/preview");
+      modal(file.name,`<div class="stack"><pre class="preview">${e(file.text || "此文件可下载后在相应应用中查看。")}</pre>
+       <div class="actions"><a class="button" href="/api/v1/files/${encodeURIComponent(id)}/download">${icon("download")}下载文件</a>
+       ${file.parent_id?button("查看历史版本","preview",{id:file.parent_id}):""}</div></div>`);
+      break;
+    }
+    case "edit-file": {
+      const file=await api("/files/"+encodeURIComponent(id)+"/preview");
+      modal("修改办公文件",`<form class="stack" data-form="edit-file" data-id="${e(id)}">
+       <p class="hint">在当前文件中替换同一段落内的连续文字。保存后生成新版本。</p>
+       <pre class="preview">${e(file.text)}</pre>
+       <label class="field">原文字<input required name="old" maxlength="300"></label>
+       <label class="field">替换为<textarea name="new" rows="3" maxlength="500"></textarea></label>
+       <div class="actions"><button class="button primary" type="submit">保存修改版</button></div></form>`);
+      break;
+    }
+    case "choose-file": {
+      const files=await api("/files");
+      modal("关联已有办公文件",`<div class="file-list">${files.filter(f=>!f.assignment_id).map(f=>fileMarkup(f,{copy:true})).join("")||'<p class="hint">没有可关联的独立文稿。</p>'}</div>`);
+      break;
+    }
+    case "copy-file": {
+      const task=state.focused.id;
+      const file=await post("/files/"+encodeURIComponent(id)+"/copy",{assignment_id:task});
+      const draft=readDraft("submit/"+task) || {};
+      saveDraft("submit/"+task,{...draft,artifact_ids:[...new Set([...(draft.artifact_ids || []),file.id])],key:uuid()});
+      dialog.close();
+      await render(true);
+      toastMessage("文件已关联到任务");
+      break;
+    }
+    case "manual-plan":
+      if (!state.agent.plan) {
+        state.agent.plan={title:state.agent.title || "",subtitle:"",sections:[{heading:"",points:[""]}]};
+        state.agent.run_id=null;
+        saveAgent();
+        localRefresh();
+      }
+      document.querySelector("#plan input")?.focus();
+      break;
+    case "add-section": {
+      const list=document.querySelector("#plan-sections");
+      if (list.children.length>=19) throw new Error("最多添加 19 节");
+      list.insertAdjacentHTML("beforeend",planSection({heading:"",points:[""]},list.children.length));
+      list.lastElementChild.querySelector("input").focus();
+      state.agent.plan=planInput(list.closest("form"));
+      saveAgent();
+      break;
+    }
+    case "remove-section": {
+      const section=target.closest("[data-section]");
+      if (section.parentElement.children.length===1) throw new Error("大纲至少保留一节");
+      const form=section.closest("form");
+      section.remove();
+      state.agent.plan=planInput(form);
+      saveAgent();
+      break;
+    }
+    case "check-engine":
+      state.engine=await api("/engine");
+      toastMessage(state.engine.configured?"配置已加载，生成大纲时会调用已配置引擎":"尚未配置模型连接");
+      break;
+    case "search":
+      modal("搜索任务",'<form class="stack" data-form="search"><label class="field">任务标题关键词<input name="query" maxlength="130" required autofocus></label><div class="actions"><button class="button primary" type="submit">搜索</button></div><div data-results class="stack"></div></form>');
+      break;
+  }
+}
+
+async function handleForm(event) {
+  const form=event.target;
+  if (!form.matches("form[data-form]")) return;
+  event.preventDefault();
+  if (form.dataset.busy) return;
+  form.dataset.busy="1";
+  const controls=[...form.querySelectorAll("button[type=submit]")];
+  controls.forEach(node=>{node.disabled=true;});
+  try {
+    const id=form.dataset.id;
+    const type=form.dataset.form;
+    const values=Object.fromEntries(new FormData(form));
+    let message="";
+    if (type==="admin-filter") {
+      state.admin={status:values.status || "",department:values.department || "",date:values.date || "",offset:0};
+      await render();
+    } else if (type==="task-template") {
+      const intent=event.submitter?.value || "draft";
+      await saveTaskForm(form,intent);
+      dialog.close();
+      await render(true);
+      message=intent==="publish"?"任务已安排发布":"任务已保存";
+    } else if (type==="publish-plan") {
+      await post("/tasks/"+encodeURIComponent(id)+"/publish",{version:Number(form.dataset.version)},form.dataset.key);
+      dialog.close();
+      await render(true);
+      message="任务已安排发布";
+    } else if (type==="change-task") {
+      await api("/assignments/"+encodeURIComponent(state.focused.id),{method:"PATCH",body:assignmentValues(form,state.focused.version)});
+      dialog.close();
+      await render(true);
+      message="任务已更新";
+    } else if (type==="task-note") {
+      await post("/assignments/"+encodeURIComponent(state.focused.id)+"/action/"+id,{version:state.focused.version,note:values.note});
+      dialog.close();
+      await render(true);
+      message=actionCopy[id]+"已记录";
+    } else if (type==="submission") {
+      const task=state.focused;
+      const fields=submissionInput(form);
+      await post("/assignments/"+encodeURIComponent(task.id)+"/submissions",{...fields,version:task.version},form.dataset.key);
+      saveDraft("submit/"+task.id,null);
+      await render(true);
+      message="成果已提交审核";
+    } else if (type==="review") {
+      await post("/submissions/"+encodeURIComponent(id)+"/review",{version:state.focused.version,decision:form.dataset.decision,note:values.note},form.dataset.key);
+      dialog.close();
+      await render(true);
+      message=form.dataset.decision==="approve"?"成果已验收":"已退回，员工可继续修改";
+    } else if (type.startsWith("project-")) {
+      const key=await submitProject(type,id,values);
+      if (dialog.open) dialog.close();
+      if (type==="project-context") await render(true);
+      else go("projects/"+encodeURIComponent(key));
+    } else if (type==="conversation") {
+      await sendMessage(form,render);
+    } else if (type==="chat-sources") {
+      chooseSources(form);
+      dialog.close();
+    } else if (type==="generate") {
+      const data=agentInput(form);
+      if (data.material_ids.length>8) throw new Error("每次最多选择 8 份资料");
+      const task=agentTask;
+      const agent=state.agent;
+      const submit=controls[0];
+      if (submit) submit.textContent="正在起草…";
+      Object.assign(agent,data);
+      saveAgent();
+      const result=await post(task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan",data);
+      if (state.agent===agent && state.route[0]==="agent" && form.isConnected) {
+        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null});
+        saveAgent();
+        localRefresh();
+        document.querySelector("#plan")?.scrollIntoView({behavior:"smooth",block:"nearest"});
+      }
+      message="大纲已生成，可调整后保存文件";
+    } else if (type==="render") {
+      const plan=planInput(form);
+      if (plan.sections.some(part=>part.points.length<1 || part.points.length>8)) throw new Error("每节正文请填写 1 至 8 行");
+      const agent=state.agent;
+      const task=agentTask;
+      const file=await post("/agent/render",{kind:agent.kind,plan,assignment_id:task?.id || null,run_id:agent.run_id || null});
+      if (state.agent===agent && state.route[0]==="agent" && form.isConnected) {
+        Object.assign(agent,{plan,result:file});
+        agentFiles=[file,...agentFiles];
+        saveAgent();
+        if (task) {
+          const draft=readDraft("submit/"+task.id) || {};
+          saveDraft("submit/"+task.id,{...draft,artifact_ids:[...new Set([...(draft.artifact_ids || []),file.id])],key:uuid()});
+        }
+        localRefresh();
+      }
+      message="可编辑文件已保存";
+    } else if (type==="edit-file") {
+      const changed=await post("/files/"+encodeURIComponent(id)+"/edit",{old:values.old,new:values.new});
+      if (state.route[0]==="agent" && state.agent) {
+        state.agent.result=changed;
+        saveAgent();
+      }
+      if (state.route[0]==="task" && state.focused) {
+        const task=state.focused.id;
+        const draft=readDraft("submit/"+task) || {};
+        const ids=(draft.artifact_ids || []).filter(f=>f!==id);
+        saveDraft("submit/"+task,{...draft,artifact_ids:[...new Set([...ids,changed.id])],key:uuid()});
+      }
+      dialog.close();
+      await render(true);
+      message=`已替换 ${changed.matches} 处并保存修改版`;
+    } else if (type==="search") {
+      const q=String(values.query).trim().toLocaleLowerCase();
+      if (!q) throw new Error("请输入关键词");
+      const mode=isReview()?"/admin/tasks?limit=200":"/me/tasks?limit=200";
+      const list=await api(mode);
+      form.querySelector("[data-results]").innerHTML=(list.items || list).filter(t=>t.title.toLocaleLowerCase().includes(q))
+        .slice(0,30).map(t=>button(t.title,"open-task",{id:t.id,icon:"docx"})).join("")||'<p class="hint">在最近的任务中没有找到匹配项。</p>';
+    }
+    if (message) toastMessage(message);
+  } catch (error) {
+    errorIn(form,error);
+  } finally {
+    delete form.dataset.busy;
+    controls.forEach(node=>{
+      node.disabled=false;
+      if (form.dataset.form==="generate") node.textContent="AI 起草大纲";
+    });
+  }
+}
+
+document.addEventListener("click",event=>{
+  onClick(event).catch(error=>dialog.open?errorIn(dialog.querySelector(".dialog-body"),error):toastMessage(error.message));
+});
+document.addEventListener("submit",event=>{void handleForm(event);});
+document.addEventListener("input",event=>{
+  const element=event.target;
+  if (element.matches("[data-form=conversation] textarea, [data-form=conversation] select")) saveWorkspaceInput(element.form);
+  if (element.closest("form[data-form=submission]")) submissionInput(element.form,true);
+  if (element.closest("form[data-form=generate]")) {
+    const agent=state.agent;
+    const data=agentInput(element.form);
+    if (data.kind!==agent.kind) {
+      agent.plan=null;
+      agent.run_id=null;
+      agent.result=null;
+      root.querySelector("#plan")?.remove();
+    }
+    Object.assign(agent,data);
+    const pages=element.form.querySelector("[data-pages]");
+    if (pages) pages.hidden=agent.kind!=="pptx";
+    saveAgent();
+  }
+  if (element.closest("form[data-form=render]")) {
+    state.agent.plan=planInput(element.form);
+    saveAgent();
+  }
+  if (element.name==="repeat" && element.closest("form[data-form=task-template]")) {
+    for (const field of element.form.querySelectorAll("[data-repeat]")) field.hidden=element.value!=="weekdays";
+  }
+});
+document.addEventListener("change",event=>{
+  if (!event.target.matches("[data-upload]")) return;
+  handleUpload([...event.target.files],event.target).catch(error=>toastMessage(error.message));
+});
+document.addEventListener("dragover",event=>{
+  const zone=event.target.closest("[data-upload-zone]");
+  if (zone) { event.preventDefault(); zone.classList.add("drag"); }
+});
+document.addEventListener("dragleave",event=>event.target.closest("[data-upload-zone]")?.classList.remove("drag"));
+document.addEventListener("drop",event=>{
+  const zone=event.target.closest("[data-upload-zone]");
+  if (!zone) return;
+  event.preventDefault();
+  handleUpload([...event.dataTransfer.files],zone.querySelector("input")).catch(error=>toastMessage(error.message));
+});
+document.addEventListener("keydown",event=>{
+  if (event.key==="Enter" && (event.ctrlKey || event.metaKey) && event.target.matches?.("[data-form=conversation] textarea")) {
+    event.preventDefault();
+    event.target.form.requestSubmit();
+  }
+  if (state.me && (event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="k") {
+    event.preventDefault();
+    document.querySelector("[data-act=search]")?.click();
+  }
+});
+window.addEventListener("hashchange",()=>{if (dialog.open) dialog.close(); void render();});
+for (const event of ["online","offline"]) window.addEventListener(event,()=>{
+  const indicator=root.querySelector(".connection-state");
+  if (indicator) {
+    indicator.classList.toggle("offline",!navigator.onLine);
+    indicator.innerHTML=`<i class="dot"></i>${navigator.onLine?"已连接":"离线"}`;
+  }
+  if (state.route[0]==="today" && navigator.onLine) void render(true);
+});
+setInterval(async ()=>{
+  if (!state.me || document.hidden || dialog.open || state.route[0]!=="today" || !navigator.onLine || timerBusy) return;
+  timerBusy=true;
+  const me=state.me;
+  try {
+    const previous=viewSignature();
+    await loadToday();
+    if (state.me===me && state.route[0]==="today" && viewSignature()!==previous) root.innerHTML=shell(dashboard());
+  } catch { /* The last displayed task list is retained during connection interruptions. */ }
+  finally { timerBusy=false; }
+},4000);
+void startup();
