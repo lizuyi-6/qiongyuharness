@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import conversations, files, gateway, identity, presentation, projects, tasks
+from . import conversations, files, gateway, identity, presentation, projects, sub2api, tasks
 from .store import DEMO, ZONE, initialize
 
 STATIC = Path(__file__).parent / "static"
@@ -73,6 +73,7 @@ async def scheduler():
 @asynccontextmanager
 async def lifespan(_):
     identity.validate_identity_config()
+    sub2api.validate_config()
     gateway.validate()
     initialize()
     periodic = asyncio.create_task(scheduler())
@@ -98,6 +99,7 @@ app.include_router(files.router)
 app.include_router(conversations.router)
 app.include_router(projects.router)
 app.include_router(presentation.router)
+app.include_router(sub2api.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
