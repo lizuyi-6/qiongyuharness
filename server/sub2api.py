@@ -52,8 +52,11 @@ ERROR_MESSAGES = {
 
 
 def error_for(response):
+    # sub2api errors are {"code": <http status int>, "message": str, "reason": "<error id>"};
+    # a string "code" is also accepted.
     try:
-        code = response.json().get("code")
+        body = response.json()
+        code = next((value for value in (body.get("reason"), body.get("code")) if isinstance(value, str)), None)
     except (ValueError, AttributeError):
         code = None
     if code in ERROR_MESSAGES:

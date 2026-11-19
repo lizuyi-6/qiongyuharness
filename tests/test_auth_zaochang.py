@@ -194,13 +194,21 @@ class ZaochangAuthTest(unittest.TestCase):
                     self.assertNotIn(key_value, repr(tuple(row)), f"credential persisted in {table}")
 
     def test_model_credential_maps_sub2api_errors_and_denies_reviewer(self):
-        for code, upstream_status in (("group_not_allowed", 409), ("user_disabled", 403)):
-            response = self.call_model_credential(
-                "worker@example.com",
-                lambda request, value=code, status=upstream_status: httpx.Response(status, json={"code": value}),
-            )
-            self.assertEqual(response.status_code, 403, response.text)
-            self.assertTrue(response.json()["detail"])
+        cases = (
+            ("group_not_allowed", 409, 403, "默认模型分组尚未授权给此账号，请联系管理员"),
+            ("user_disabled", 403, 403, "模型服务账号已停用，请联系管理员"),
+            ("admin_user_not_provisionable", 403, 403, "管理员账号不能开通员工模型服务"),
+            ("group_unavailable", 422, 502, "默认模型分组暂不可用，请联系管理员"),
+        )
+        for reason, upstream_status, expected_status, expected_detail in cases:
+            # sub2api's real error body: numeric code + string reason
+            for body in ({"code": upstream_status, "message": "x", "reason": reason}, {"code": reason}):
+                response = self.call_model_credential(
+                    "worker@example.com",
+                    lambda request, value=body, status=upstream_status: httpx.Response(status, json=value),
+                )
+                self.assertEqual(response.status_code, expected_status, response.text)
+                self.assertEqual(response.json()["detail"], expected_detail)
         response = self.call_model_credential(
             "reviewer@example.com",
             lambda request: self.fail("reviewer must be rejected before sub2api is called"),
