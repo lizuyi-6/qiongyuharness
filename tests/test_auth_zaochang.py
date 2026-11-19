@@ -197,6 +197,7 @@ class ZaochangAuthTest(unittest.TestCase):
         cases = (
             ("group_not_allowed", 409, 403, "默认模型分组尚未授权给此账号，请联系管理员"),
             ("user_disabled", 403, 403, "模型服务账号已停用，请联系管理员"),
+            ("key_disabled", 403, 403, "模型服务密钥已被停用，请联系管理员"),
             ("admin_user_not_provisionable", 403, 403, "管理员账号不能开通员工模型服务"),
             ("group_unavailable", 422, 502, "默认模型分组暂不可用，请联系管理员"),
         )
