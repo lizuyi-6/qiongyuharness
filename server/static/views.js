@@ -32,7 +32,7 @@ export function shell(content) {
   return `<div class="layout ${state.route[0]==="chat"?"workspace-route":""}">
   <aside class="sidebar" aria-label="应用导航">
     <div class="brand">${brand()}</div>
-    <nav>${conversationNav(state.chatWorkspace || {conversations:[]})}
+    <nav>${conversationNav({conversations: state.chatWorkspace?.conversations || state.conversations || []})}
       <div class="nav-group"><p class="nav-label">办公</p>${["today","projects","history","files","agent"].map(navItem).join("")}</div>
       ${isReview()?`<div class="nav-group"><p class="nav-label">管理</p>${isManager()?navItem("admin"):""}${navItem("review")}${person.role==="admin"?navItem("audit"):""}</div>`:""}
     </nav>
@@ -259,14 +259,24 @@ export function filesView(items) {
 }
 
 export function settingsView() {
+  const isDesktopApp = typeof window.officeDesktop?.runAgent === "function";
+  const engine = state.engine?.engine;
+  const engineLabel = engine === "demo"
+    ? "本地演示模板"
+    : engine === "desktop"
+      ? (isDesktopApp ? "桌面客户端本地执行（员工专属密钥直连模型服务）" : "桌面客户端本地执行（当前为浏览器访问，AI 办理请使用桌面客户端）")
+      : engine === "dsh"
+        ? "DeepSeek Harness · 公司模型网关"
+        : "公司模型网关";
   return `${pageHead("设置","查看登录身份和当前模型连接。")}
    <div class="columns"><div class="stack"><section class="panel pad stack"><h2 class="section-title">登录账号</h2>
-     <div class="summary"><div><span class="hint">姓名</span><strong>${e(state.me.name)}</strong></div><div><span class="hint">部门</span><strong>${e(state.me.department)}</strong></div>
+     <div class="summary"><div><span class="hint">姓名</span><strong>${e(state.me.name)}</strong></div><div><span class="hint">部门</span><strong>${e(state.me.department || "未分配")}</strong></div>
      <div><span class="hint">权限</span><strong>${e(roles[state.me.role])}</strong></div></div>
      <p class="hint">组织时区：${e(state.me.timezone)}</p>
-     <div class="actions">${button("退出登录","logout",{icon:"logout"})}${state.config.demo?button("切换演示身份","profile"):""}</div>
+     <div class="actions">${button("退出登录","logout",{icon:"logout"})}${state.config.demo?button("切换演示身份","profile"):""}
+       ${typeof window.officeDesktop?.openConnect==="function"?button("切换工作台地址","desktop-connect",{icon:"link"}):""}</div>
    </section><section class="panel pad stack"><h2 class="section-title">模型连接</h2>
-     <p class="hint">${state.engine?.engine==="demo"?"本地演示模板":state.engine?.engine==="dsh"?"DeepSeek Harness · 公司模型网关":"公司模型网关"}</p>
+     <p class="hint">${e(engineLabel)}</p>
      ${state.engine?.model?`<p class="hint">模型：${e(state.engine.model)}</p>`:""}
-     ${button("检查连接","check-engine",{icon:"refresh"})}</section></div></div>`;
+     <div class="actions">${button("检查连接","check-engine",{icon:"refresh"})}</div></section></div></div>`;
 }

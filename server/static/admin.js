@@ -33,7 +33,7 @@ export async function taskAdmin(reviewOnly = false) {
   ]);
   roster = users;
   plans = fetchedPlans;
-  const departments = Object.fromEntries([...new Set(users.map((v)=>v.department))].map((v)=>[v,v]));
+  const departments = Object.fromEntries([...new Set(users.map((v)=>v.department).filter(Boolean))].map((v)=>[v,v]));
   const planList = fetchedPlans.map((row)=>`<article><div class="between"><strong>${e(row.data.title)}</strong>${badge(row.state)}</div>
      <p class="hint">${e(row.data.work_date)}${row.data.end_date?" 至 "+e(row.data.end_date):""}
       · ${row.data.assignee_ids.length} 人${row.data.repeat==="weekdays"?" · 按工作日":""}</p>

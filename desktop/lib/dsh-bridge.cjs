@@ -11,6 +11,10 @@ function textFromMessage(event) {
     .map((part) => part.text).join("");
 }
 
+function abortError() {
+  return Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+}
+
 function runDsh({
   executable,
   dshBin,
@@ -22,10 +26,14 @@ function runDsh({
   prompt,
   onEvent = () => {},
   timeoutMs = 95_000,
+  signal,
   spawnImpl = spawn
 }) {
   if (!executable || !model || typeof prompt !== "string" || !cwd || !env) {
     return Promise.reject(new Error("桌面运行参数无效"));
+  }
+  if (signal?.aborted) {
+    return Promise.reject(abortError());
   }
 
   const args = buildDshArgs({ dshBin, patchPath, contextPatchPath });
@@ -138,10 +146,14 @@ function runDsh({
     fail(new Error("无法向桌面 Harness 发送初始化请求"));
   }
 
+  const onAbort = () => fail(abortError());
+  signal?.addEventListener?.("abort", onAbort, { once: true });
+
   const timer = setTimeout(() => fail(new Error("桌面 Harness 调用超时，请重试")), timeoutMs);
   timer.unref?.();
   return result.then((text) => text).finally(async () => {
     clearTimeout(timer);
+    signal?.removeEventListener?.("abort", onAbort);
     if (!processClosed) {
       try { child.kill(); } catch {}
       const killTimer = new Promise((resolve) => setTimeout(resolve, 2_000));

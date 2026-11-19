@@ -87,6 +87,18 @@ function unavailableRole(config, models, role) {
 function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, dependencies = {} }) {
   const credentialRoot = path.join(app.getPath("userData"), "qo-model-credentials");
   const runtimePaths = resolveRuntimePaths(app.isPackaged ? process.resourcesPath : undefined, __dirname);
+  const activeRuns = new Set();
+
+  function cancelAgent() {
+    let cancelled = false;
+    for (const controller of activeRuns) {
+      if (!controller.signal.aborted) {
+        controller.abort();
+        cancelled = true;
+      }
+    }
+    return cancelled;
+  }
 
   function currentSession() {
     const window = getWindow();
@@ -272,12 +284,20 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" || typeof job.model !== "string") {
       throw new Error("桌面执行请求无效");
     }
+    const controller = new AbortController();
+    const { signal } = controller;
+    activeRuns.add(controller);
+    const ensureNotAborted = () => {
+      if (signal.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+    };
     const startedAt = clockNow();
     const pipelineRequested = job.model === "qo:pipeline";
     const origin = getOrigin();
     const hasContext = job.context !== undefined && job.context !== null;
+    try {
     emit({ type: "step", label: hasContext ? "载入项目资料" : "准备执行环境" });
     const available = await readFreshModels();
+    ensureNotAborted();
     let config;
     if (pipelineRequested) {
       try {
@@ -293,9 +313,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     } else if (!available.includes(job.model)) {
       throw new Error("该模型已不再对你开放，请重新选择");
     }
+    ensureNotAborted();
     const { credential } = await getCredentialImpl(origin);
+    ensureNotAborted();
 
     async function runStage(stage) {
+      ensureNotAborted();
       const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
       let gateway;
       try {
@@ -342,6 +365,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           model: stage.model,
           prompt: stage.prompt,
           timeoutMs: stage.timeoutMs,
+          signal,
           onEvent: (event) => {
             if (event?.type === "step" && typeof event.label === "string") emit(event);
           }
@@ -361,6 +385,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           }
         };
       } catch (error) {
+        if (error?.code === "ABORTED" || signal.aborted) {
+          throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+        }
         if (gateway?.quota_error) {
           let usageSnapshot;
           try {
@@ -389,7 +416,8 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           runStage,
           emit,
           now: clockNow,
-          startedAt
+          startedAt,
+          signal
         });
       }
       const result = await runStage({
@@ -413,9 +441,13 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;
     }
+    } finally {
+      activeRuns.delete(controller);
+    }
   }
 
   return {
+    cancelAgent,
     clearAllCredentials,
     clearCredentialsForOrigin,
     models,

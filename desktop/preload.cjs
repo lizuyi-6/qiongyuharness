@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld("officeDesktop", {
   models: () => ipcRenderer.invoke("qo:models"),
   usage: () => ipcRenderer.invoke("qo:usage"),
   runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
+  cancelAgent: () => ipcRenderer.invoke("qo:cancel-agent"),
+  openConnect: () => ipcRenderer.invoke("qo:open-connect"),
   onAgentEvent: (callback) => {
     if (typeof callback !== "function") throw new TypeError("callback must be a function");
     const listener = (_event, value) => callback(value);
@@ -23,10 +25,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   if (configuredUrl) url.value = configuredUrl;
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    notice.className = "notice";
     notice.textContent = "正在连接…";
     try {
       await ipcRenderer.invoke("qo:connect", url.value);
     } catch (error) {
+      notice.className = "notice error";
       notice.textContent = error.message.replace(/^.*?Error: /, "") || "无法连接";
     }
   });
