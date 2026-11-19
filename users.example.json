@@ -1,6 +1,26 @@
 [
-  { "email": "admin@example.com", "name": "公司管理员", "department": "企业运营", "role": "admin" },
-  { "email": "manager@example.com", "name": "部门主管", "department": "产品与运营", "role": "manager" },
-  { "email": "employee@example.com", "name": "经办员工", "department": "产品与运营", "role": "employee" },
-  { "email": "reviewer@example.com", "name": "专职审核人", "department": "产品与运营", "role": "reviewer" }
+  {
+    "email": "admin@example.com",
+    "name": "公司管理员",
+    "department": "企业运营",
+    "role": "admin"
+  },
+  {
+    "email": "manager@example.com",
+    "name": "部门主管",
+    "department": "产品与运营",
+    "role": "manager"
+  },
+  {
+    "email": "employee@example.com",
+    "name": "经办员工",
+    "department": "产品与运营",
+    "role": "employee"
+  },
+  {
+    "email": "reviewer@example.com",
+    "name": "专职审核人",
+    "department": "产品与运营",
+    "role": "reviewer"
+  }
 ]
