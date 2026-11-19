@@ -9,7 +9,7 @@ function clientExecutionRequired() {
   return state.engine?.client_execution === true;
 }
 
-async function loadDesktopModelState() {
+export async function loadDesktopModelState() {
   if (!clientExecutionRequired()) return {};
   if (typeof window.officeDesktop?.runAgent !== "function") return {models:[], selectedModel:"", modelNotice:""};
 
@@ -218,20 +218,24 @@ export function saveWorkspaceInput(form) {
   writeDraft(state.chatWorkspace, form);
 }
 
-export function selectChatModel(select) {
-  const workspace=state.chatWorkspace;
+export function selectDesktopModel(select, workspace, statusSelector="[data-chat-model-status]") {
   const submit=select.form?.querySelector('button[type="submit"]');
   if (!workspace?.models?.includes(select.value)) {
     if (workspace) workspace.selectedModel="";
     if (submit) submit.disabled=true;
-    return;
+    return false;
   }
   workspace.selectedModel=select.value;
   if (submit) submit.disabled=false;
   workspace.modelNotice="";
   saveDraft(modelDraftKey,{model:select.value});
-  const status=document.querySelector("[data-chat-model-status]");
+  const status=document.querySelector(statusSelector);
   if (status) { status.hidden=true; status.textContent=""; }
+  return true;
+}
+
+export function selectChatModel(select) {
+  return selectDesktopModel(select,state.chatWorkspace);
 }
 
 export function useExample(value) {
@@ -380,6 +384,24 @@ function appendProgressStep(progress, label) {
   trace.querySelector("summary").textContent=`执行记录 · ${list.children.length} 步`;
 }
 
+export async function runDesktopAgent(job, onStep=()=>{}, afterRun=result=>result) {
+  const desktop=window.officeDesktop;
+  if (typeof desktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
+  let unsubscribe=()=>{};
+  try {
+    try {
+      const stop=desktop.onAgentEvent?.(event=>{
+        if (event?.type==="step") onStep(event.label);
+      });
+      if (typeof stop==="function") unsubscribe=stop;
+    } catch {}
+    const result=await desktop.runAgent(job);
+    return await afterRun(result);
+  } finally {
+    try { unsubscribe(); } catch {}
+  }
+}
+
 async function executeDesktopTurn(workspace, threadId, requestId, payload, progress) {
   const desktop=window.officeDesktop;
   if (typeof desktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
@@ -389,27 +411,23 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
   const base="/conversations/"+encodeURIComponent(threadId)+"/turns";
   let prepared;
   let phase="prepare";
-  let unsubscribe=()=>{};
   try {
     prepared=await post(base+"/prepare",{id:requestId,...payload});
     if (!prepared?.run_id) throw new Error("服务端未返回本轮运行编号");
     for (const step of prepared.steps || []) appendProgressStep(progress,step);
     const note=progress?.querySelector(".running-note");
     if (note) note.textContent="正在调用模型…";
-    try {
-      const stop=desktop.onAgentEvent?.(event=>{
-        if (event?.type!=="step") return;
-        appendProgressStep(progress,event.label);
-        if (progress?.isConnected && event.label) progress.querySelector(".running-note").textContent=event.label;
-      });
-      if (typeof stop==="function") unsubscribe=stop;
-    } catch {}
     phase="agent";
-    const result=await desktop.runAgent({system:prepared.system,prompt:prepared.prompt,context:prepared.context,model});
-    if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
-    phase="complete";
-    return await post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
-      text:result.text,usage:result.usage,model:result.model || model
+    return await runDesktopAgent({system:prepared.system,prompt:prepared.prompt,context:prepared.context,model},label=>{
+      if (typeof label!=="string" || !label) return;
+      appendProgressStep(progress,label);
+      if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
+    },result=>{
+      if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
+      phase="complete";
+      return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+        text:result.text,usage:result.usage,model:result.model || model
+      });
     });
   } catch (error) {
     // turns/prepare never replays a request id (any existing turn with that id is a 409),
@@ -425,8 +443,6 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       }
     }
     throw error;
-  } finally {
-    try { unsubscribe(); } catch {}
   }
 }
 

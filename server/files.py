@@ -189,6 +189,10 @@ class AgentCompletion(BaseModel):
     model: str = Field(min_length=1, max_length=200)
 
 
+class AgentFailure(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+
+
 def collect_sources(db, user, task, material_ids):
     data = []
     assignment_id = task["id"] if task else None
@@ -268,10 +272,11 @@ def save_agent_plan(run, user, assignment_id, kind, plan, usage, model, engine):
 
 def fail_agent_plan(run, user, engine, assignment_id, message):
     with database(write=True) as db:
-        changed = db.execute("UPDATE runs SET status='failed' WHERE id=? AND user_id=? AND engine=? AND status='running'",
-                             (run, user["id"], engine)).rowcount
+        changed = db.execute("UPDATE runs SET status='failed' WHERE id=? AND user_id=? AND engine=? AND status='running' AND assignment_id IS ?",
+                             (run, user["id"], engine, assignment_id)).rowcount
         if changed:
             audit(db, "agent.failed", user["id"], assignment_id, run_id=run, engine=engine, message=message[:300])
+    return bool(changed)
 
 
 async def agent_work(user, payload, assignment_id=None):
@@ -356,6 +361,34 @@ async def new_plan_complete(payload: AgentCompletion, user: User):
 @router.post("/assignments/{key}/sessions/complete")
 async def task_plan_complete(key: str, payload: AgentCompletion, user: User):
     return await complete_agent_plan(payload, user, key)
+
+
+def fail_agent_plan_run(run_id, user, message, expected_assignment=None, require_unassigned=False):
+    message = clean_text(message, 1000)
+    with database() as db:
+        run = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run_id, user["id"]))
+        if not run or run["engine"] != "desktop":
+            fail(404, "生成任务不存在")
+        assignment_id = run["assignment_id"]
+        if require_unassigned and assignment_id is not None:
+            fail(404, "生成任务不存在")
+        if expected_assignment is not None and expected_assignment != assignment_id:
+            fail(404, "生成任务不存在")
+        if run["status"] != "running":
+            fail(409, "生成任务已结束")
+    if not fail_agent_plan(run_id, user, "desktop", assignment_id, message):
+        fail(409, "生成任务已结束")
+    return {"ok": True}
+
+
+@router.post("/agent/plan/{run_id}/fail")
+def new_plan_fail(run_id: str, payload: AgentFailure, user: User):
+    return fail_agent_plan_run(run_id, user, payload.message, require_unassigned=True)
+
+
+@router.post("/assignments/{key}/sessions/{run_id}/fail")
+def task_plan_fail(key: str, run_id: str, payload: AgentFailure, user: User):
+    return fail_agent_plan_run(run_id, user, payload.message, expected_assignment=key)
 
 
 @router.post("/agent/render")

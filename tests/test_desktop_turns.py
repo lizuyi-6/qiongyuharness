@@ -208,6 +208,92 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertEqual(completed.status_code, 200, completed.text)
         self.assertEqual(completed.json()["engine"], "desktop")
 
+    def create_assignment(self):
+        from server.store import local_today
+        created = self.clients["admin"].post("/api/v1/tasks", json={
+            "title": "文稿失败路径验证", "assignee_ids": ["lin"],
+            "work_date": local_today().isoformat(), "publish_mode": "immediate",
+        }, headers={"Idempotency-Key": str(uuid4())})
+        self.assertEqual(created.status_code, 200, created.text)
+        return created.json()["assignment_ids"][0]
+
+    def prepare_agent_plan(self, assignment=None):
+        path = f"/api/v1/assignments/{assignment}/sessions/prepare" if assignment else "/api/v1/agent/plan/prepare"
+        response = self.clients["lin"].post(path, json={
+            "kind": "docx", "title": "失败状态验证", "instructions": "验证桌面执行失败记录",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_agent_plan_fail_marks_run_failed_and_blocks_complete(self):
+        prepared = self.prepare_agent_plan()
+        base = "/api/v1/agent/plan/" + prepared["run_id"]
+        failed = self.clients["lin"].post(base + "/fail", json={"message": "桌面执行失败"})
+        self.assertEqual(failed.status_code, 200, failed.text)
+        self.assertEqual(failed.json(), {"ok": True})
+        from server.store import database
+        with database() as db:
+            status = db.one("SELECT status FROM runs WHERE id=?", (prepared["run_id"],))["status"]
+        self.assertEqual(status, "failed")
+        completed = self.clients["lin"].post("/api/v1/agent/plan/complete", json={
+            "run_id": prepared["run_id"], "text": "{}", "usage": {}, "model": "plan-test-model",
+        })
+        self.assertEqual(completed.status_code, 409, completed.text)
+
+    def test_other_user_cannot_fail_agent_plan(self):
+        prepared = self.prepare_agent_plan()
+        response = self.clients["chen"].post(
+            f"/api/v1/agent/plan/{prepared['run_id']}/fail", json={"message": "不属于当前用户"}
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+        completed = self.clients["lin"].post("/api/v1/agent/plan/complete", json={
+            "run_id": prepared["run_id"], "text": json.dumps({"title": "归属校验", "subtitle": "", "sections": [
+                {"heading": "结果", "points": ["仍可由所有者完成"]},
+            ]}, ensure_ascii=False), "usage": {}, "model": "plan-test-model",
+        })
+        self.assertEqual(completed.status_code, 200, completed.text)
+
+    def test_repeated_agent_plan_fail_returns_conflict(self):
+        prepared = self.prepare_agent_plan()
+        path = f"/api/v1/agent/plan/{prepared['run_id']}/fail"
+        first = self.clients["lin"].post(path, json={"message": "第一次失败"})
+        second = self.clients["lin"].post(path, json={"message": "重复失败"})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 409, second.text)
+
+    def test_agent_plan_fail_rejects_wrong_assignment_paths(self):
+        assignment = self.create_assignment()
+        prepared = self.prepare_agent_plan(assignment)
+        run_id = prepared["run_id"]
+        unassigned_path = f"/api/v1/agent/plan/{run_id}/fail"
+        wrong_assignment_path = f"/api/v1/assignments/wrong-key/sessions/{run_id}/fail"
+        self.assertEqual(self.clients["lin"].post(unassigned_path, json={"message": "路径不符"}).status_code, 404)
+        self.assertEqual(self.clients["lin"].post(wrong_assignment_path, json={"message": "路径不符"}).status_code, 404)
+        matched = self.clients["lin"].post(
+            f"/api/v1/assignments/{assignment}/sessions/{run_id}/fail", json={"message": "路径匹配"}
+        )
+        self.assertEqual(matched.status_code, 200, matched.text)
+
+        unassigned = self.prepare_agent_plan()
+        mismatch = self.clients["lin"].post(
+            f"/api/v1/assignments/{assignment}/sessions/{unassigned['run_id']}/fail", json={"message": "没有任务"}
+        )
+        self.assertEqual(mismatch.status_code, 404, mismatch.text)
+
+    def test_agent_plan_fail_hides_missing_or_non_desktop_runs(self):
+        missing = self.clients["lin"].post(
+            "/api/v1/agent/plan/not-a-run/fail", json={"message": "不存在"}
+        )
+        self.assertEqual(missing.status_code, 404, missing.text)
+        prepared = self.prepare_agent_plan()
+        from server.store import database
+        with database(write=True) as db:
+            db.execute("UPDATE runs SET engine='demo' WHERE id=?", (prepared["run_id"],))
+        response = self.clients["lin"].post(
+            f"/api/v1/agent/plan/{prepared['run_id']}/fail", json={"message": "engine 不匹配"}
+        )
+        self.assertEqual(response.status_code, 404, response.text)
+
     def test_engine_advertises_client_execution(self):
         response = self.clients["lin"].get("/api/v1/engine")
         self.assertEqual(response.status_code, 200, response.text)

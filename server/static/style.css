@@ -400,6 +400,8 @@ fieldset legend { font-size: 13px; font-weight: 620; padding: 0 4px; }
 .error { color: var(--alert); font-size: 13px; line-height: 1.5; }
 .notice { padding: 8px 10px; border-left: 2px solid var(--accent); background: var(--wash); font-size: 13px; line-height: 1.55; }
 .notice.warn { border-color: var(--amber); color: var(--amber); }
+.agent-model-status { font-size: 12px; color: var(--muted); }
+.agent-model-status.error { color: var(--alert); }
 .review-box { display: grid; gap: 8px; border-top: 1px solid var(--line); padding: 10px 0 0; }
 .between { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
 .preview {

@@ -189,8 +189,13 @@ export function taskDetail(t) {
   </div><section class="panel pad stack"><h2 class="section-title">办理记录</h2><div class="timeline">${timeline(t)}</div></section></div>`;
 }
 
-export function agentSetup(session, task, files) {
+export function agentSetup(session, task, files, desktopModels = {}) {
   const plan = session.plan;
+  const desktopRequired=state.engine?.client_execution===true;
+  const desktopAvailable=typeof window.officeDesktop?.runAgent==="function";
+  const modelSelected=Boolean(desktopModels.selectedModel && desktopModels.models?.includes(desktopModels.selectedModel));
+  const blocked=desktopRequired && !desktopAvailable;
+  const modelRequired=desktopRequired && desktopAvailable;
   const saved = [...(task?.materials || []), ...files.filter((f)=>!f.assignment_id || f.assignment_id===task?.id)]
     .filter((f)=>["docx","pptx","pdf","txt","md"].includes(f.extension)).slice(0,20);
   return `${pageHead("文稿",task?"关联任务 · "+task.title:"",
@@ -202,6 +207,11 @@ export function agentSetup(session, task, files) {
           <label class="field span">标题<input required name="title" maxlength="110" value="${e(session.title)}" placeholder="例如：产品方案汇报"></label>
           <label class="field">输出格式<select name="kind"><option value="docx" ${session.kind==="docx"?"selected":""}>Word（DOCX）</option><option value="pptx" ${session.kind==="pptx"?"selected":""}>PowerPoint（PPTX）</option></select></label>
           <label class="field" data-pages ${session.kind!=="pptx"?"hidden":""}>页数（含封面）<input name="pages" type="number" min="3" max="20" value="${e(session.pages || 8)}"></label>
+          ${modelRequired?`<label class="field span agent-model-picker">模型<select data-agent-model aria-label="执行模型"
+            ${desktopModels.models?.length?"":"disabled"}>
+            <option value="">${desktopModels.models?.length?"请选择模型":"暂无可用模型"}</option>
+            ${(desktopModels.models || []).map(model=>`<option value="${e(model)}" ${desktopModels.selectedModel===model?"selected":""}>${e(model)}</option>`).join("")}
+          </select></label>`:""}
           <label class="field span">写作要求<textarea name="instructions" rows="3" maxlength="6000" placeholder="受众、重点和格式要求">${e(session.instructions || "")}</textarea></label>
         </div>
         <div class="draft-sources">
@@ -209,9 +219,13 @@ export function agentSetup(session, task, files) {
             <div class="file-list">${saved.map(f=>fileMarkup(f,{check:"material_ids",checked:session.material_ids.includes(f.id)})).join("")}</div></details>`:""}
           ${uploadMarkup("上传参考资料")}
         </div>
+        ${blocked?'<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>':""}
+        ${modelRequired && desktopModels.modelNotice?`<p class="agent-model-status ${desktopModels.models?.length?"":"error"}" data-agent-model-status role="status">${e(desktopModels.modelNotice)}</p>`:""}
+        ${modelRequired?'<p class="agent-model-status" data-agent-run-status role="status" hidden></p>':""}
         <div class="actions">${button(plan?"编辑大纲":"编写大纲","manual-plan",{icon:"edit",cls:"primary"})}
-          <button class="button" type="submit">AI 起草大纲</button></div>
-        <p class="hint">${state.engine?.engine==="demo"?"演示起草使用本地模板。":"使用 AI 起草时，写作要求与所选资料的文本将发送至公司模型网关。"}</p>
+          <button class="button" type="submit" ${blocked || (modelRequired && !modelSelected)?"disabled":""}>AI 起草大纲</button></div>
+        <p class="hint">${desktopRequired?(desktopAvailable?"AI 将在桌面客户端中执行，写作要求与所选资料的文本将用于生成大纲。":""):
+          state.engine?.engine==="demo"?"演示起草使用本地模板。":"使用 AI 起草时，写作要求与所选资料的文本将发送至公司模型网关。"}</p>
       </form>
     </section>
     ${plan?`<section id="plan" class="panel pad stack"><h2 class="section-title">预览并调整大纲</h2>
