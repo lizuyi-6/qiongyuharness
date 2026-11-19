@@ -412,12 +412,13 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       text:result.text,usage:result.usage,model:result.model || model
     });
   } catch (error) {
+    // turns/prepare never replays a request id (any existing turn with that id is a 409),
+    // so reusing the pending id would block every retry of this message.
+    error.retryAsNew=true;
     if (prepared?.run_id) {
       try {
         await post(base+"/"+encodeURIComponent(prepared.run_id)+"/fail",{message:error.message || "桌面执行失败"});
-        error.retryAsNew=true;
       } catch (failError) {
-        if (error.status && error.status<500 && error.status!==409) error.retryAsNew=true;
         if (phase==="complete" && failError.status===409 && (!error.status || error.status>=500)) {
           error.message="无法确认本轮是否已保存，请刷新会话查看最新结果。";
         } else if (failError.status!==409) error.message+=`（失败状态同步未成功：${failError.message}）`;
