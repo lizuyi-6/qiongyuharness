@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import conversations, files, gateway, identity, presentation, projects, sub2api, tasks
+from . import conversations, files, gateway, identity, pipeline, presentation, projects, sub2api, tasks
 from .store import DEMO, ZONE, initialize
 
 STATIC = Path(__file__).parent / "static"
@@ -73,6 +73,7 @@ async def scheduler():
 @asynccontextmanager
 async def lifespan(_):
     identity.validate_identity_config()
+    pipeline.validate_config()
     sub2api.validate_config()
     gateway.validate()
     initialize()
@@ -94,6 +95,7 @@ if not DEMO:
     from urllib.parse import urlsplit
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[urlsplit(identity.ORIGIN).hostname or "invalid"])
 app.include_router(identity.router)
+app.include_router(pipeline.router)
 app.include_router(tasks.router)
 app.include_router(files.router)
 app.include_router(conversations.router)
