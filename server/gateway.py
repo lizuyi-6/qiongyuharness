@@ -39,13 +39,15 @@ MAX_RESPONSE = 3 * 1024 * 1024
 
 
 def info():
-    return {"engine": MODE, "model": MODEL if MODE != "demo" else None, "configured": MODE == "demo" or bool(URL and KEY)}
+    return {"engine": MODE, "model": MODEL if MODE not in {"demo", "desktop"} else None,
+            "configured": MODE in {"demo", "desktop"} or bool(URL and KEY),
+            "client_execution": MODE == "desktop"}
 
 
 def validate():
     origin = urlsplit(URL)
-    if (MODE not in {"demo", "gateway", "dsh"} or MODE == "demo" and not DEMO
-        or MODE != "demo" and (not URL or not KEY or not MODEL or not origin.hostname
+    if (MODE not in {"demo", "gateway", "dsh", "desktop"} or MODE == "demo" and not DEMO
+        or MODE in {"gateway", "dsh"} and (not URL or not KEY or not MODEL or not origin.hostname
                                 or origin.username or origin.password or origin.query or origin.fragment
                                 or origin.scheme != "https" and not (DEMO and origin.scheme == "http" and origin.hostname in {"127.0.0.1", "localhost"}))):
         raise RuntimeError("Configure a supported QO_ENGINE and the company HTTPS gateway.")
@@ -128,14 +130,18 @@ def response_plan(text, kind, count):
     return plan
 
 
-async def plan_for(kind, title, instructions, task, materials, count, user, run):
-    if MODE == "demo":
-        return demo_plan(kind, title, instructions, task, materials, count), {}
+def plan_prompt(kind, title, instructions, task, materials, count):
     agenda = {"format": kind, "title": title, "employee_request": instructions,
               "task": {k: task[k] for k in ("title", "description", "deliverable")} if task else None,
               "sources": materials,
               "presentation_rule": f"封面单独生成，sections 必须恰好 {count-1} 项；每项最多四条，每条不超过70字，不换行。" if kind == "pptx" else ""}
-    content = "请按要求制作结构化办公文稿。\n" + json.dumps(agenda, ensure_ascii=False)
+    return "请按要求制作结构化办公文稿。\n" + json.dumps(agenda, ensure_ascii=False)
+
+
+async def plan_for(kind, title, instructions, task, materials, count, user, run):
+    if MODE == "demo":
+        return demo_plan(kind, title, instructions, task, materials, count), {}
+    content = plan_prompt(kind, title, instructions, task, materials, count)
     text, usage = await request_model(content, run, headers_for(user, task["id"] if task else None, run), PERSONA)
     return response_plan(text, kind, count), usage
 
