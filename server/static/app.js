@@ -4,8 +4,9 @@ import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pa
   shell, taskDetail, views } from "./views.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
-import { attachFiles, chooseSources, loadEarlier, loadWorkspace, removeSource, saveWorkspaceInput,
-  scrollToLatest, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
+import { attachFiles, chooseSources, loadDesktopModelState, loadEarlier, loadWorkspace, removeSource, runDesktopAgent,
+  refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel, toggleDesktopUsage,
+  scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -15,6 +16,7 @@ let agentFiles = [];
 let navigation = 0;
 let currentMode = "";
 let timerBusy = false;
+let agentDesktopModels = {};
 const historySize = 20;
 
 function homeRoute() {
@@ -38,6 +40,7 @@ async function login(user) {
   sessionStorage.removeItem("qo-signed-out");
   clearAdmin();
   state.agent=null;
+  agentDesktopModels={};
   state.chatWorkspace=null;
   state.filter="all";
   state.today=[];
@@ -55,6 +58,7 @@ async function logout() {
   sessionStorage.setItem("qo-signed-out","1");
   state.me=null;
   state.agent=null;
+  agentDesktopModels={};
   state.chatWorkspace=null;
   state.today=[];
   agentFiles=[];
@@ -122,7 +126,8 @@ async function fetchAgent(parts, force = false) {
       };
     }
   }
-  return agentSetup(state.agent,agentTask,agentFiles);
+  agentDesktopModels=await loadDesktopModelState();
+  return agentSetup(state.agent,agentTask,agentFiles,agentDesktopModels);
 }
 
 async function render(keepScroll = false) {
@@ -183,7 +188,7 @@ async function render(keepScroll = false) {
 }
 
 function localRefresh() {
-  if (state.route[0]==="agent") root.querySelector("#workplace").innerHTML=agentSetup(state.agent,agentTask,agentFiles);
+  if (state.route[0]==="agent") root.querySelector("#workplace").innerHTML=agentSetup(state.agent,agentTask,agentFiles,agentDesktopModels);
   else if (state.route[0]==="today") root.querySelector("#workplace").innerHTML=dashboard();
 }
 
@@ -203,6 +208,59 @@ function planInput(form) {
       const fields=section.querySelectorAll("input,textarea");
       return {heading:fields[0].value,points:fields[1].value.split("\n").map(x=>x.trim()).filter(Boolean)};
     })};
+}
+
+function updateAgentRunStatus(form, message) {
+  const status=form.querySelector("[data-agent-run-status]");
+  if (!status) return;
+  status.textContent=message;
+  status.hidden=!message;
+}
+
+async function executeDesktopPlan(task, data, form) {
+  if (typeof window.officeDesktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
+  const model=agentDesktopModels.selectedModel;
+  if (!agentDesktopModels.models?.includes(model)) {
+    throw new Error(agentDesktopModels.models?.length?"请先选择可用模型":agentDesktopModels.modelNotice || "暂无可用模型，请联系管理员开通。");
+  }
+  const base=task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan";
+  let prepared;
+  let phase="prepare";
+  try {
+    prepared=await post(base+"/prepare",data);
+    if (!prepared?.run_id) throw new Error("服务端未返回本轮运行编号");
+    updateAgentRunStatus(form,"正在整理文稿…");
+    phase="agent";
+    const completed=await runDesktopAgent({system:prepared.system,prompt:prepared.prompt,context:prepared.context,model},label=>{
+      if (typeof label==="string" && label) updateAgentRunStatus(form,label);
+    },result=>{
+      updateAgentRunStatus(form,"正在保存大纲…");
+      phase="complete";
+      return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+        run_id:prepared.run_id,text:result.text,
+        usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
+          finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
+      });
+    });
+    updateAgentRunStatus(form,"");
+    return completed;
+  } catch (error) {
+    updateAgentRunStatus(form,"");
+    if (prepared?.run_id) {
+      try {
+        await post(base+"/"+encodeURIComponent(prepared.run_id)+"/fail",{
+          message:String(error.message || "桌面执行失败").slice(0,1000)
+        });
+      } catch (failError) {
+        if (phase==="complete" && failError.status===409 && (!error.status || error.status>=500)) {
+          error.message="无法确认本轮是否已保存，请刷新文稿页查看最新结果。";
+        } else if (failError.status!==409) {
+          error.message+=`（失败状态同步未成功：${failError.message}）`;
+        }
+      }
+    }
+    throw error;
+  }
 }
 
 function submissionInput(form, save = false) {
@@ -256,6 +314,8 @@ async function onClick(event) {
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
+    case "usage-toggle": await toggleDesktopUsage(target); break;
+    case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace, target.closest("[data-usage-panel]")); break;
     case "slides-clear": clearSelection(); break;
     case "project-create": projectDialog("create"); break;
     case "project-join": projectDialog("join"); break;
@@ -447,15 +507,23 @@ async function handleForm(event) {
     } else if (type==="generate") {
       const data=agentInput(form);
       if (data.material_ids.length>8) throw new Error("每次最多选择 8 份资料");
+      const desktopRequired=state.engine?.client_execution===true;
+      if (desktopRequired && typeof window.officeDesktop?.runAgent!=="function") {
+        throw new Error("请在桌面客户端中使用 AI 办理");
+      }
+      if (desktopRequired && !agentDesktopModels.models?.includes(agentDesktopModels.selectedModel)) {
+        throw new Error(agentDesktopModels.models?.length?"请先选择可用模型":agentDesktopModels.modelNotice || "暂无可用模型，请联系管理员开通。");
+      }
       const task=agentTask;
       const agent=state.agent;
       const submit=controls[0];
       if (submit) submit.textContent="正在起草…";
       Object.assign(agent,data);
       saveAgent();
-      const result=await post(task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan",data);
+      const result=desktopRequired?await executeDesktopPlan(task,data,form):
+        await post(task?"/assignments/"+encodeURIComponent(task.id)+"/sessions":"/agent/plan",data);
       if (state.agent===agent && state.route[0]==="agent" && form.isConnected) {
-        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null});
+        Object.assign(agent,{plan:result.plan,run_id:result.run_id,result:null,outputTelemetry:result.usage});
         saveAgent();
         localRefresh();
         document.querySelector("#plan")?.scrollIntoView({behavior:"smooth",block:"nearest"});
@@ -507,8 +575,11 @@ async function handleForm(event) {
   } finally {
     delete form.dataset.busy;
     controls.forEach(node=>{
-      node.disabled=false;
-      if (form.dataset.form==="generate") node.textContent="AI 起草大纲";
+      if (form.dataset.form==="generate") {
+        node.textContent="AI 起草大纲";
+        node.disabled=state.engine?.client_execution===true && (typeof window.officeDesktop?.runAgent!=="function" ||
+          !agentDesktopModels.models?.includes(agentDesktopModels.selectedModel));
+      } else node.disabled=false;
     });
   }
 }
@@ -544,6 +615,14 @@ document.addEventListener("input",event=>{
   }
 });
 document.addEventListener("change",event=>{
+  if (event.target.matches("[data-chat-model]")) {
+    selectChatModel(event.target);
+    return;
+  }
+  if (event.target.matches("[data-agent-model]")) {
+    selectDesktopModel(event.target,agentDesktopModels,"[data-agent-model-status]");
+    return;
+  }
   if (!event.target.matches("[data-upload]")) return;
   handleUpload([...event.target.files],event.target).catch(error=>toastMessage(error.message));
 });

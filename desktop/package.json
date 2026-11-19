@@ -7,7 +7,7 @@
   "private": true,
   "scripts": {
     "start": "electron .",
-    "build:win": "electron-builder --win --x64",
+    "build:win": "node scripts/prepare-runtime.mjs && electron-builder --win --x64 && node scripts/check-no-dsh-conflict.mjs",
     "build:linux": "electron-builder --linux dir --x64"
   },
   "devDependencies": {
@@ -20,9 +20,18 @@
     "artifactName": "QiongyuOffice-${version}-${arch}.${ext}",
     "files": [
       "main.cjs",
+      "agent.cjs",
+      "lib/**",
       "preload.cjs",
       "package.json",
       "connect.html"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime-stage/qo-runtime",
+        "to": "qo-runtime",
+        "filter": ["**/*"]
+      }
     ],
     "win": {
       "target": [
@@ -34,7 +43,9 @@
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": true,
+      "include": "uninstaller.nsh"
     }
   }
 }

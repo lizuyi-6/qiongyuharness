@@ -42,6 +42,20 @@ export function e(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 }
 
+export function outputWarnings(telemetry) {
+  if (!telemetry || typeof telemetry !== "object") return "";
+  const messages = [];
+  if (telemetry.truncated === true) messages.push("回复达到单次输出上限(3500 tokens)被截断");
+  if (Array.isArray(telemetry.max_tokens_clamped)) {
+    for (const item of telemetry.max_tokens_clamped) {
+      if (Number.isInteger(item?.requested) && item?.applied === 3500) {
+        messages.push(`请求的输出上限 ${item.requested} 已被压到 3500`);
+      }
+    }
+  }
+  return messages.length ? `<div class="output-warnings" role="status">${messages.map(e).join("<br>")}</div>` : "";
+}
+
 export function uuid() {
   if (crypto.randomUUID) return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));

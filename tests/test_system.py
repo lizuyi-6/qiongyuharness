@@ -173,12 +173,13 @@ class PlatformTest(unittest.TestCase):
 
     def test_oidc_desktop_challenge_and_single_use(self):
         import json
+        import secrets
         from unittest.mock import patch
         from urllib.parse import parse_qs, urlsplit
         import httpx
         import jwt
         from cryptography.hazmat.primitives.asymmetric import rsa
-        from server import identity
+        from server import identity, store
 
         issuer="https://identity.test"
         application="office-test"
@@ -187,6 +188,7 @@ class PlatformTest(unittest.TestCase):
         jwk.update({"kid":"mock-key","use":"sig","alg":"RS256"})
         action={}
         attempts=[]
+        claims_by_code={}
         real_client=httpx.AsyncClient
 
         def endpoint(request):
@@ -200,34 +202,62 @@ class PlatformTest(unittest.TestCase):
                 attempts.append(form["code_verifier"][0])
                 self.assertEqual(identity.challenge(form["code_verifier"][0]), action["code_challenge"][0])
                 now=datetime.now(UTC)
-                claims={"iss":issuer,"sub":"lin","aud":application,"iat":now,
-                        "exp":now+timedelta(minutes=4),"nonce":action["nonce"][0]}
+                claims={"iss":issuer,"sub":"lin-subject","aud":application,"iat":now,
+                        "exp":now+timedelta(minutes=4),"nonce":action["nonce"][0],
+                        **claims_by_code[form["code"][0]]}
                 return httpx.Response(200,json={"id_token":jwt.encode(claims,signing_key,algorithm="RS256",headers={"kid":"mock-key"})})
             return httpx.Response(404)
 
         verifier="b"*64
         challenge=identity.challenge(verifier)
+        with store.database(write=True) as db:
+            db.execute("UPDATE users SET email=?,subject=NULL WHERE id=?",("lin@example.com","lin"))
         with (patch.object(identity,"ISSUER",issuer),patch.object(identity,"CLIENT",application),
               patch.object(identity,"CLIENT_SECRET",""),
               patch.object(identity.httpx,"AsyncClient",side_effect=lambda **kw:real_client(transport=httpx.MockTransport(endpoint),**kw))):
             browser=TestClient(app,follow_redirects=False)
             frontend=TestClient(app)
-            response=browser.get("/auth/start",params={"desktop":challenge})
+            for invalid_port in ("abc", "1023", "70000"):
+                self.assertEqual(browser.get("/auth/start",params={"desktop":challenge,"port":invalid_port}).status_code,400)
+            self.assertEqual(browser.get("/auth/start",params={"desktop":challenge}).status_code,400)
+            response=browser.get("/auth/start",params={"desktop":challenge,"port":"43127"})
             self.assertEqual(response.status_code,303,response.text)
             action.update(parse_qs(urlsplit(response.headers["location"]).query))
             self.assertEqual(action["code_challenge_method"],["S256"])
+            self.assertEqual(action["scope"],["openid profile email"])
+            claims_by_code["mock-code"]={"email":"lin@example.com","email_verified":True}
             params={"state":action["state"][0],"code":"mock-code"}
             self.assertEqual(frontend.get("/auth/callback",params=params).status_code,400)
-            self.assertEqual(browser.get("/auth/callback",params=params).status_code,200)
+            callback=browser.get("/auth/callback",params=params)
+            self.assertEqual(callback.status_code,303)
+            self.assertEqual(urlsplit(callback.headers["location"]).netloc,"127.0.0.1:43127")
+            self.assertEqual(urlsplit(callback.headers["location"]).path,"/callback")
+            auth_code=parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
+            self.assertGreaterEqual(len(auth_code),43)
             self.assertEqual(browser.get("/auth/callback",params=params).status_code,400)
-            self.assertEqual(frontend.post(PREFIX+"/auth/desktop/claim",json={"verifier":"a"*64}).status_code,404)
-            claim=frontend.post(PREFIX+"/auth/desktop/claim",json={"verifier":verifier})
+            self.assertEqual(frontend.post(PREFIX+"/auth/desktop/claim",json={"code":auth_code,"verifier":"a"*64}).status_code,400)
+            claim=frontend.post(PREFIX+"/auth/desktop/claim",json={"code":auth_code,"verifier":verifier})
             self.assertEqual(claim.status_code,200,claim.text)
-            self.assertEqual(frontend.post(PREFIX+"/auth/desktop/claim",json={"verifier":verifier}).status_code,404)
+            self.assertEqual(frontend.post(PREFIX+"/auth/desktop/claim",json={"code":auth_code,"verifier":verifier}).status_code,404)
+            with store.database() as db:
+                self.assertEqual(db.one("SELECT subject FROM users WHERE id=?",("lin",))["subject"],"lin-subject")
+            expired_code=secrets.token_urlsafe(32)
+            with store.database(write=True) as db:
+                db.execute("INSERT INTO desktop_auth_codes(code_hash,challenge,user_id,expires) VALUES(?,?,?,?)",
+                           (identity.digest(expired_code),challenge,"lin",store.instant(datetime.now(UTC)-timedelta(minutes=1))))
+            self.assertEqual(frontend.post(PREFIX+"/auth/desktop/claim",json={"code":expired_code,"verifier":verifier}).status_code,404)
             frontend.cookies.set(identity.COOKIE,claim.json()["session"])
             self.assertEqual(frontend.get(PREFIX+"/me").json()["id"],"lin")
-            self.assertEqual(len(attempts),1)
+            claims_by_code["subject-login"]={"email_verified":False}
+            response=browser.get("/auth/start")
+            action.update(parse_qs(urlsplit(response.headers["location"]).query))
+            response=browser.get("/auth/callback",params={"state":action["state"][0],"code":"subject-login"})
+            self.assertEqual(response.status_code,303,response.text)
+            self.assertEqual(response.headers["location"],"/")
+            self.assertEqual(len(attempts),2)
             frontend.close(); browser.close()
+        with store.database(write=True) as db:
+            db.execute("UPDATE users SET email=NULL,subject=NULL WHERE id=?",("lin",))
 
     def test_conversation_with_task_sources_and_revised_output(self):
         assignment = self.create("试点汇报","lin",kind="pptx")["assignment_ids"][0]

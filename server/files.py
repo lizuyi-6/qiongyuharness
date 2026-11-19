@@ -1,6 +1,6 @@
 import asyncio
 import os
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, UploadFile
@@ -12,7 +12,7 @@ from .identity import fail
 from .office import (MAX_FILE, MIMES, Plan, add_file, clean_text, edit_copy, extract, powerpoint,
                      safe_name, verify, word)
 from .projects import shared_file_access
-from .store import audit, database, instant, pack, uid
+from .store import audit, database, instant, pack, uid, unpack
 from .tasks import ACTIVE, FILE_COLUMNS, User, sees, task_for, template_for
 
 router = APIRouter(prefix="/api/v1")
@@ -182,6 +182,17 @@ class RenderRequest(BaseModel):
     run_id: str | None = None
 
 
+class AgentCompletion(BaseModel):
+    run_id: str = Field(min_length=1, max_length=100)
+    text: str
+    usage: dict[str, Any]
+    model: str = Field(min_length=1, max_length=200)
+
+
+class AgentFailure(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+
+
 def collect_sources(db, user, task, material_ids):
     data = []
     assignment_id = task["id"] if task else None
@@ -208,31 +219,84 @@ async def read_sources(data):
     return sources
 
 
-async def agent_work(user, payload, assignment_id=None):
+async def prepare_agent(user, payload, assignment_id=None, *, engine="desktop"):
     title = clean_text(payload.title, 110)
     with database() as db:
         task = writable_task(db, assignment_id, user)
         data = collect_sources(db, user, task, payload.material_ids)
+    sources = await read_sources(data)
     run = uid()
+    prompt = gateway.plan_prompt(payload.kind, title, payload.instructions.strip(), task, sources, payload.pages)
+    steps = (["载入任务要求"] if task else [])
+    if sources:
+        read = sum(bool(source["text"]) for source in sources)
+        steps.append(f"读取 {read} 份资料" + (f" · {len(sources)-read} 份没有可提取的正文" if read < len(sources) else ""))
+    steps.append("正在整理文稿")
     with database(write=True) as db:
-        writable_task(db, assignment_id, user)
+        task = writable_task(db, assignment_id, user)
+        collect_sources(db, user, task, payload.material_ids)
         db.execute("INSERT INTO runs(id,assignment_id,user_id,kind,engine,status,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                   (run, assignment_id, user["id"], payload.kind, gateway.MODE, "running", "{}", instant()))
-        audit(db, "agent.started", user["id"], assignment_id, run_id=run, engine=gateway.MODE)
-    try:
-        sources = await read_sources(data)
-        async with PLAN_SLOTS:
-            plan, usage = await gateway.plan_for(payload.kind, title, payload.instructions.strip(), task, sources,
-                                                 payload.pages, user["id"], run)
-        with database(write=True) as db:
+                   (run, assignment_id, user["id"], payload.kind, engine, "running",
+                    pack({"model": None, "prepare": {"pages": payload.pages}}), instant()))
+        audit(db, "agent.started", user["id"], assignment_id, run_id=run, engine=engine)
+    return {"run_id": run, "system": gateway.PERSONA, "prompt": prompt,
+            "context": None, "steps": steps, "task": task, "sources": sources,
+            "assignment_id": assignment_id, "kind": payload.kind, "pages": payload.pages,
+            "engine": engine}
+
+
+def save_agent_plan(run, user, assignment_id, kind, plan, usage, model, engine):
+    if assignment_id:
+        with database() as db:
             writable_task(db, assignment_id, user)
-            db.execute("UPDATE runs SET status='completed',usage=? WHERE id=?", (pack(usage), run))
-            audit(db, "agent.completed", user["id"], assignment_id, run_id=run, engine=gateway.MODE, usage=usage)
-        return {"run_id": run, "plan": plan, "engine": gateway.MODE, "usage": usage}
+    clean_usage = gateway.usage_from(usage)
+    recorded = {"model": model, **clean_usage}
+    with database(write=True) as db:
+        row = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
+        if not row:
+            fail(404, "生成任务不存在")
+        if row["engine"] != engine:
+            fail(404, "生成任务不存在")
+        if row["status"] != "running":
+            fail(409, "生成任务已结束")
+        if row["assignment_id"] != assignment_id or row["kind"] != kind:
+            fail(404, "生成任务不存在")
+        writable_task(db, assignment_id, user)
+        changed = db.execute("UPDATE runs SET status='completed',usage=? WHERE id=? AND status='running'",
+                             (pack(recorded), run)).rowcount
+        if not changed:
+            fail(409, "生成任务已结束")
+        audit(db, "agent.completed", user["id"], assignment_id, run_id=run, engine=engine, usage=recorded)
+    return {"run_id": run, "plan": plan.model_dump(), "engine": engine, "usage": clean_usage}
+
+
+def fail_agent_plan(run, user, engine, assignment_id, message):
+    with database(write=True) as db:
+        changed = db.execute("UPDATE runs SET status='failed' WHERE id=? AND user_id=? AND engine=? AND status='running' AND assignment_id IS ?",
+                             (run, user["id"], engine, assignment_id)).rowcount
+        if changed:
+            audit(db, "agent.failed", user["id"], assignment_id, run_id=run, engine=engine, message=message[:300])
+    return bool(changed)
+
+
+async def agent_work(user, payload, assignment_id=None):
+    if gateway.MODE == "desktop":
+        fail(409, "请在穹驭办公桌面客户端中使用 AI 办理")
+    prepared = await prepare_agent(user, payload, assignment_id, engine=gateway.MODE)
+    run = prepared["run_id"]
+    try:
+        async with PLAN_SLOTS:
+            if gateway.MODE == "demo":
+                plan, usage = await gateway.plan_for(payload.kind, clean_text(payload.title, 110),
+                    payload.instructions.strip(), prepared["task"], prepared["sources"], payload.pages, user["id"], run)
+            else:
+                text, usage = await gateway.request_model(prepared["prompt"], run,
+                    gateway.headers_for(user["id"], assignment_id, run), prepared["system"])
+                plan = gateway.response_plan(text, payload.kind, payload.pages)
+        return save_agent_plan(run, user, assignment_id, payload.kind, plan, usage,
+                               gateway.MODEL if gateway.MODE != "demo" else None, gateway.MODE)
     except BaseException:
-        with database(write=True) as db:
-            db.execute("UPDATE runs SET status='failed' WHERE id=?", (run,))
-            audit(db, "agent.failed", user["id"], assignment_id, run_id=run, engine=gateway.MODE)
+        fail_agent_plan(run, user, gateway.MODE, assignment_id, "模型执行失败")
         raise
 
 
@@ -244,6 +308,87 @@ async def new_plan(payload: AgentRequest, user: User):
 @router.post("/assignments/{key}/sessions")
 async def task_plan(key: str, payload: AgentRequest, user: User):
     return await agent_work(user, payload, key)
+
+
+@router.post("/agent/plan/prepare")
+async def new_plan_prepare(payload: AgentRequest, user: User):
+    if gateway.MODE != "desktop":
+        fail(409, "桌面执行模式未启用")
+    prepared = await prepare_agent(user, payload)
+    return {name: prepared[name] for name in ("run_id", "system", "prompt", "context", "steps")}
+
+
+@router.post("/assignments/{key}/sessions/prepare")
+async def task_plan_prepare(key: str, payload: AgentRequest, user: User):
+    if gateway.MODE != "desktop":
+        fail(409, "桌面执行模式未启用")
+    prepared = await prepare_agent(user, payload, key)
+    return {name: prepared[name] for name in ("run_id", "system", "prompt", "context", "steps")}
+
+
+async def complete_agent_plan(payload: AgentCompletion, user: User, expected_assignment=None, require_unassigned=False):
+    with database() as db:
+        run = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (payload.run_id, user["id"]))
+        if not run or run["engine"] != "desktop":
+            fail(404, "生成任务不存在")
+        assignment_id = run["assignment_id"]
+        if require_unassigned and assignment_id is not None:
+            fail(404, "生成任务不存在")
+        if expected_assignment is not None and expected_assignment != assignment_id:
+            fail(404, "生成任务不存在")
+        if run["status"] != "running":
+            fail(409, "生成任务已结束")
+        writable_task(db, assignment_id, user)
+        options = (unpack(run["usage"]) or {}).get("prepare") or {}
+        pages = options.get("pages", 8)
+    if len(payload.text.encode("utf-8")) > 256 * 1024:
+        fail_agent_plan(payload.run_id, user, "desktop", assignment_id, "模型响应超过 256 KB")
+        fail(413, "模型响应超过 256 KB")
+    try:
+        plan = gateway.response_plan(payload.text, run["kind"], pages)
+        return save_agent_plan(payload.run_id, user, assignment_id, run["kind"], plan,
+                               payload.usage, payload.model, "desktop")
+    except Exception as error:
+        fail_agent_plan(payload.run_id, user, "desktop", assignment_id, str(getattr(error, "detail", error)))
+        raise
+
+
+@router.post("/agent/plan/complete")
+async def new_plan_complete(payload: AgentCompletion, user: User):
+    return await complete_agent_plan(payload, user, require_unassigned=True)
+
+
+@router.post("/assignments/{key}/sessions/complete")
+async def task_plan_complete(key: str, payload: AgentCompletion, user: User):
+    return await complete_agent_plan(payload, user, key)
+
+
+def fail_agent_plan_run(run_id, user, message, expected_assignment=None, require_unassigned=False):
+    message = clean_text(message, 1000)
+    with database() as db:
+        run = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run_id, user["id"]))
+        if not run or run["engine"] != "desktop":
+            fail(404, "生成任务不存在")
+        assignment_id = run["assignment_id"]
+        if require_unassigned and assignment_id is not None:
+            fail(404, "生成任务不存在")
+        if expected_assignment is not None and expected_assignment != assignment_id:
+            fail(404, "生成任务不存在")
+        if run["status"] != "running":
+            fail(409, "生成任务已结束")
+    if not fail_agent_plan(run_id, user, "desktop", assignment_id, message):
+        fail(409, "生成任务已结束")
+    return {"ok": True}
+
+
+@router.post("/agent/plan/{run_id}/fail")
+def new_plan_fail(run_id: str, payload: AgentFailure, user: User):
+    return fail_agent_plan_run(run_id, user, payload.message, require_unassigned=True)
+
+
+@router.post("/assignments/{key}/sessions/{run_id}/fail")
+def task_plan_fail(key: str, run_id: str, payload: AgentFailure, user: User):
+    return fail_agent_plan_run(run_id, user, payload.message, expected_assignment=key)
 
 
 @router.post("/agent/render")
