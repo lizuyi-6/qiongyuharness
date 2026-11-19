@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld("officeDesktop", {
   models: () => ipcRenderer.invoke("qo:models"),
   usage: () => ipcRenderer.invoke("qo:usage"),
   runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
+  generateImage: (request) => ipcRenderer.invoke("qo:generate-image", request),
   onAgentEvent: (callback) => {
     if (typeof callback !== "function") throw new TypeError("callback must be a function");
     const listener = (_event, value) => callback(value);

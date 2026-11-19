@@ -5,7 +5,21 @@ import { deckFiles, deckPanel, selectionChip } from "./slides.js";
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
 const PIPELINE_MODEL = "qo:pipeline";
+const imageAutoPreferenceKey = "qo/chat/allow-ai-images";
 let usageRequestId = 0;
+
+function imageAutoPreference() {
+  try {
+    const stored = localStorage.getItem(imageAutoPreferenceKey);
+    return stored === null ? true : stored === "true";
+  } catch {
+    return true;
+  }
+}
+
+export function saveImageAutoPreference(value) {
+  try { localStorage.setItem(imageAutoPreferenceKey, value ? "true" : "false"); } catch {}
+}
 
 function clientExecutionRequired() {
   return state.engine?.client_execution === true;
@@ -153,7 +167,7 @@ export async function toggleDesktopUsage(button) {
 
 export async function loadDesktopModelState() {
   if (!clientExecutionRequired()) return {};
-  if (typeof window.officeDesktop?.runAgent !== "function") return {models:[], selectedModel:"", modelNotice:""};
+  if (typeof window.officeDesktop?.runAgent !== "function") return {models:[], image_models:[], selectedModel:"", modelNotice:""};
 
   const storedModel=readDraft(modelDraftKey)?.model || "";
   try {
@@ -161,6 +175,8 @@ export async function loadDesktopModelState() {
     const result=await window.officeDesktop.models();
     const models=[...new Set((Array.isArray(result?.models)?result.models:[])
       .filter(model=>typeof model==="string" && model.trim()).map(model=>model.trim()))];
+    const image_models=[...new Set((Array.isArray(result?.image_models)?result.image_models:[])
+      .filter(model=>typeof model==="string" && /^gpt-image-/.test(model.trim())).map(model=>model.trim()))].sort();
     const pipelineAvailable=result?.pipeline?.available===true;
     const pipelineReason=typeof result?.pipeline?.reason==="string"?result.pipeline.reason:"";
     const storedModelAvailable=storedModel===PIPELINE_MODEL?pipelineAvailable:models.includes(storedModel);
@@ -169,9 +185,9 @@ export async function loadDesktopModelState() {
     if (invalidated) saveDraft(modelDraftKey,{model:""});
     const modelNotice=invalidated?"上次选择的模型已不可用，已清空，请重新选择。":
       result?.error || (models.length || pipelineAvailable?"":"暂无可用模型，请联系管理员开通。");
-    return {models,selectedModel,modelNotice,pipelineAvailable,pipelineReason};
+    return {models,image_models,selectedModel,modelNotice,pipelineAvailable,pipelineReason};
   } catch (error) {
-    return {models:[],selectedModel:"",modelNotice:error.message || "模型列表获取失败，请重试。"};
+    return {models:[],image_models:[],selectedModel:"",modelNotice:error.message || "模型列表获取失败，请重试。"};
   }
 }
 
@@ -232,13 +248,14 @@ export function showConversationHistory() {
 
 function turnView(turn) {
   const reply=turn.reply || turn.error || (turn.status === "running" ? "正在执行…" : "");
+  const images=Array.isArray(turn.images)?turn.images:[];
   const pipeline=turn.pipeline;
   const pipelineLabel=pipeline?.verdict==="pass"?"验收通过":pipeline?.verdict==="fail"?"验收未通过":
     pipeline?.verdict==="skipped" && pipeline?.tier==="light"?"轻量任务·未验收":"";
   const reviewLabels={pass:"复核：通过",fail:"复核：未通过",not_needed:"复核：无需复核",unavailable:"复核：不可用"};
   return `<section class="conversation-turn">
     <div class="request-entry"><p>${turn.selection?`<small class="request-scope">第 ${turn.selection.slide} 页${turn.selection.shape_id?" · 文本框":""}</small>`:""}${e(turn.message)}</p></div>
-    ${reply ? `<div class="response-entry">
+    ${reply || images.length ? `<div class="response-entry">
       <p class="response-byline">${icon("mark")}<strong>办公助理</strong></p>
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行记录 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map(step=>`<li>${icon("check")}${e(step)}</li>`).join("")}</ul></details>` : ""}
@@ -251,6 +268,17 @@ function turnView(turn) {
       </div>`:""}
       ${outputWarnings(turn.output_telemetry)}
       ${turn.file ? `<div class="session-file">${fileMarkup(turn.file,{edit:true})}</div>` : ""}
+      ${images.length?`<div class="turn-images">${images.map(image=>{
+        const file=image.file || {};
+        const id=typeof file.id==="string"?file.id:"";
+        const alt=typeof image.prompt==="string"?image.prompt:"生成的图片";
+        const quality=image.quality==="low"?"草稿":image.quality==="high"?"精细":"标准";
+        return `<figure class="turn-image">
+          <img src="/api/v1/files/${encodeURIComponent(id)}/image" alt="${e(alt)}" loading="lazy">
+          <figcaption><span>${e(image.width)}×${e(image.height)} · ${quality}质量 · ${e(image.model)}</span>
+            <a href="/api/v1/files/${encodeURIComponent(id)}/download">下载</a></figcaption>
+        </figure>`;
+      }).join("")}</div>`:""}
     </div>` : ""}
   </section>`;
 }
@@ -320,6 +348,9 @@ function composer(workspace) {
   const modelSelected=selectedModelAvailable(workspace);
   const blocked=desktopRequired && !desktopAvailable;
   const modelRequired=desktopRequired && desktopAvailable;
+  const imageModels=workspace.image_models || [];
+  const showImageControls=desktopRequired && desktopAvailable && imageModels.length>0;
+  const showImageAuto=showImageControls && workspace.selectedModel!==PIPELINE_MODEL;
   if (workspace.task && !active(workspace.task.status)) {
     return `<div class="composer-wrap">${blocked?'<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>':""}
       <p class="notice">关联任务已完成或正在审核，可查看会话和文件。</p></div>`;
@@ -344,6 +375,18 @@ function composer(workspace) {
         <option value="" ${workspace.selectedModel?"":"selected"}>${workspace.models?.length?"请选择模型":"暂无可用模型"}</option>
         ${(workspace.models || []).map(model=>`<option value="${e(model)}" ${workspace.selectedModel===model?"selected":""}>${e(model)}</option>`).join("")}
       </select></label>`:""}
+      ${showImageControls?`<div class="image-controls" aria-label="图片生成设置">
+        <label><span>尺寸</span><select name="image_size" aria-label="生图尺寸">
+          <option value="1024x1024">方形 1024×1024</option><option value="1536x1024">横版 1536×1024</option>
+          <option value="1024x1536">竖版 1024×1536</option><option value="1536x864">16:9 1536×864</option>
+        </select></label>
+        <label><span>质量</span><select name="image_quality" aria-label="生图质量">
+          <option value="low">草稿</option><option value="medium" selected>标准</option><option value="high">精细</option>
+        </select></label>
+        ${button("生成图片","chat-generate-image",{disabled:blocked})}
+      </div>`:""}
+      ${showImageAuto?`<label class="image-auto-option"><input type="checkbox" name="allow_ai_images" ${imageAutoPreference()?"checked":""}>
+        <span>允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>`:""}
       <button class="button primary" type="submit" ${blocked || (modelRequired && !modelSelected)?"disabled":""}>${icon("arrow")}发送</button>
     </div>
     ${modelRequired && (workspace.modelNotice || workspace.pipelineReason)?`<p class="chat-model-status ${workspace.models?.length?"":"error"}" data-chat-model-status role="status">${e([workspace.modelNotice,workspace.pipelineReason].filter(Boolean).join(" "))}</p>`:""}
@@ -577,7 +620,7 @@ export async function runDesktopAgent(job, onStep=()=>{}, afterRun=result=>resul
   }
 }
 
-async function executeDesktopTurn(workspace, threadId, requestId, payload, progress) {
+async function executeDesktopTurn(workspace, threadId, requestId, payload, progress, allowImageTool) {
   const desktop=window.officeDesktop;
   if (typeof desktop?.runAgent!=="function") throw new Error("请在桌面客户端中使用 AI 办理");
   const model=workspace.selectedModel;
@@ -593,18 +636,31 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
     const note=progress?.querySelector(".running-note");
     if (note) note.textContent="正在调用模型…";
     phase="agent";
-    return await runDesktopAgent({system:prepared.system,prompt:prepared.prompt,context:prepared.context,model},label=>{
+    const job={system:prepared.system,prompt:prepared.prompt,context:prepared.context,model,
+      ...(allowImageTool===true && workspace.image_models?.length && model!==PIPELINE_MODEL?{image_tool:true}:{})};
+    return await runDesktopAgent(job,label=>{
       if (typeof label!=="string" || !label) return;
       appendProgressStep(progress,label);
       if (progress?.isConnected) progress.querySelector(".running-note").textContent=label;
-    },result=>{
+    },async result=>{
       if (progress?.isConnected) progress.querySelector(".running-note").textContent="正在保存结果…";
+      const images=Array.isArray(result.images)?result.images:[];
+      let imageSaveFailures=0;
+      for (const image of images) {
+        try {
+          await post(base+"/"+encodeURIComponent(prepared.run_id)+"/images",image);
+        } catch {
+          imageSaveFailures+=1;
+        }
+      }
       phase="complete";
-      return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+      const completed=await post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
         text:result.text,usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
           finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model,
         ...(result.pipeline?{pipeline:result.pipeline}:{})
       });
+      if (imageSaveFailures) completed.image_save_failures=imageSaveFailures;
+      return completed;
     });
   } catch (error) {
     // turns/prepare never replays a request id (any existing turn with that id is a 409),
@@ -620,6 +676,102 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       }
     }
     throw error;
+  }
+}
+
+function setImageProgress(node, value, error = false) {
+  if (!node?.isConnected) return;
+  const note=node.querySelector("[data-image-progress]");
+  if (note) {
+    note.textContent=value;
+    note.classList.toggle("error",error);
+  }
+}
+
+export async function generateImageFromComposer(button, rerender) {
+  const workspace=state.chatWorkspace;
+  const form=chatForm();
+  if (!workspace || !form) throw new Error("当前会话不可用");
+  if (form.dataset.busy) throw new Error("请等待当前请求执行结束");
+  if (typeof window.officeDesktop?.generateImage!=="function") throw new Error("请在桌面客户端中生成图片");
+  const prompt=form.elements.message.value.trim();
+  if (!prompt) throw new Error("请先输入图片说明或提示词");
+  const imageModels=workspace.image_models || [];
+  const model=imageModels.includes("gpt-image-2.6-flare")?"gpt-image-2.6-flare":imageModels[0];
+  if (!model) throw new Error("暂无可用的生图模型");
+  const size=form.elements.image_size.value;
+  const quality=form.elements.image_quality.value;
+  const owner=state.me?.id;
+  const threadId=workspace.session?.id || draftFor(workspace).newId || uuid();
+  const turns=document.querySelector("[data-chat-turns]");
+  const pending=document.createElement("section");
+  pending.className="conversation-turn pending-turn";
+  const request=document.createElement("div");
+  request.className="request-entry";
+  const requestText=document.createElement("p");
+  requestText.textContent=prompt;
+  request.append(requestText);
+  const response=document.createElement("div");
+  response.className="response-entry";
+  const note=document.createElement("p");
+  note.className="running-note";
+  note.dataset.imageProgress="";
+  note.setAttribute("role","status");
+  note.textContent="正在生成图片…";
+  response.append(note);
+  pending.append(request,response);
+  turns?.append(pending);
+  scrollToLatest();
+  form.dataset.busy="1";
+  button.disabled=true;
+  const originalLabel=button.textContent;
+  button.textContent="正在生成图片…";
+  let prepared;
+  let generated;
+  let saved=false;
+  let phase="prepare";
+  try {
+    if (!workspace.session) {
+      workspace.session=await post("/conversations",{id:threadId,assignment_id:workspace.task?.id || null,
+        project_id:workspace.project?.id || null});
+      if (state.chatWorkspace===workspace) {
+        history.replaceState(null,"","#chat/"+encodeURIComponent(threadId));
+        state.route=["chat",threadId];
+      }
+    }
+    const base="/conversations/"+encodeURIComponent(threadId)+"/images";
+    prepared=await post(base+"/prepare",{prompt,model,size,quality});
+    if (!prepared?.run_id) throw new Error("服务端未返回生图运行编号");
+    phase="generate";
+    setImageProgress(pending,"正在生成图片…");
+    generated=await window.officeDesktop.generateImage({prompt,model,size,quality});
+    phase="complete";
+    setImageProgress(pending,"正在保存图片…");
+    const completed=await post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+      png_base64:generated.png_base64,width:generated.width,height:generated.height,
+      model:generated.model,size:generated.size,quality:generated.quality,usage:generated.usage || {}
+    });
+    saved=true;
+    if (state.chatWorkspace===workspace && state.me?.id===owner) await rerender(true);
+    return completed;
+  } catch (error) {
+    if (prepared?.run_id && !saved) {
+      const message=generated && phase==="complete" ? `图片已生成并计费，但保存失败：${error.message}` : error.message || "生图失败";
+      try {
+        await post("/conversations/"+encodeURIComponent(threadId)+"/images/"+encodeURIComponent(prepared.run_id)+"/fail",
+          {message:message.slice(0,300)});
+      } catch {}
+      setImageProgress(pending,message,true);
+    } else {
+      setImageProgress(pending,error.message || "生图失败",true);
+    }
+    throw error;
+  } finally {
+    delete form.dataset.busy;
+    if (button.isConnected) {
+      button.disabled=false;
+      button.textContent=originalLabel;
+    }
   }
 }
 
@@ -656,7 +808,8 @@ export async function sendMessage(form, rerender) {
     if (inView()) progress=startProgress(form,message);
     let completed;
     if (clientExecutionRequired()) {
-      completed=await executeDesktopTurn(workspace,threadId,requestId,payload,progress);
+      completed=await executeDesktopTurn(workspace,threadId,requestId,payload,progress,
+        form.elements.allow_ai_images?.checked===true);
     } else {
       const response=await fetch("/api/v1/conversations/"+encodeURIComponent(threadId)+"/turns", {
         method:"POST",headers:{"Content-Type":"application/json"},credentials:"same-origin",
@@ -680,6 +833,15 @@ export async function sendMessage(form, rerender) {
     }
     if (inView()) {
       await rerender(true);
+      if (completed.image_save_failures>0) {
+        const latest=document.querySelector("[data-chat-turns] .conversation-turn:last-child .response-entry");
+        if (latest) {
+          const warning=document.createElement("p");
+          warning.className="output-warnings";
+          warning.textContent=`有 ${completed.image_save_failures} 张图片保存失败（已计费）`;
+          latest.append(warning);
+        }
+      }
       chatForm()?.elements.message.focus({preventScroll:true});
     }
     void refreshDesktopUsage().catch(()=>{});

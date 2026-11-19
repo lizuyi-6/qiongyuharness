@@ -1,8 +1,11 @@
 import asyncio
+import base64
+import binascii
 import datetime
 import json
 import logging
 import re
+import struct
 from typing import Any, Literal
 from uuid import UUID
 
@@ -117,6 +120,124 @@ class TurnFailure(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
 
 
+IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "1536x864"}
+IMAGE_QUALITIES = {"low", "medium", "high"}
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_BASE64 = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
+IMAGE_SIZE_DIMENSIONS = {"1024x1024": (1024, 1024), "1536x1024": (1536, 1024),
+                         "1024x1536": (1024, 1536), "1536x864": (1536, 864)}
+IMAGE_USAGE_FIELDS = ("input_tokens", "output_tokens", "total_tokens")
+IMAGE_USAGE_DETAIL_FIELDS = ("image_tokens", "text_tokens")
+
+
+class ImagePrepare(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    prompt: str = Field(min_length=1, max_length=4000)
+    model: str = Field(min_length=1, max_length=200)
+    size: Literal["1024x1024", "1536x1024", "1024x1536", "1536x864"]
+    quality: Literal["low", "medium", "high"]
+
+    @field_validator("prompt")
+    @classmethod
+    def trim_prompt(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt must not be empty")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def validate_image_model(cls, value):
+        if not value.startswith("gpt-image-"):
+            raise ValueError("model must be an image model")
+        return value
+
+
+class ImageCompletion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    png_base64: str = Field(min_length=1, max_length=MAX_IMAGE_BASE64)
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    model: str = Field(min_length=1, max_length=200)
+    size: Literal["1024x1024", "1536x1024", "1024x1536", "1536x864"]
+    quality: Literal["low", "medium", "high"]
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("model")
+    @classmethod
+    def validate_image_model(cls, value):
+        if not value.startswith("gpt-image-"):
+            raise ValueError("model must be an image model")
+        return value
+
+
+class ImageFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    message: str = Field(min_length=1, max_length=300)
+
+
+class TurnImage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    png_base64: str = Field(min_length=1, max_length=MAX_IMAGE_BASE64)
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    model: str = Field(min_length=1, max_length=200)
+    size: Literal["1024x1024", "1536x1024", "1024x1536", "1536x864"]
+    quality: Literal["low", "medium", "high"]
+    prompt: str = Field(min_length=1, max_length=4000)
+    usage: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("model")
+    @classmethod
+    def validate_image_model(cls, value):
+        if not value.startswith("gpt-image-"):
+            raise ValueError("model must be an image model")
+        return value
+
+    @field_validator("prompt")
+    @classmethod
+    def trim_prompt(cls, value):
+        value = value.strip()
+        if not value:
+            raise ValueError("prompt must not be empty")
+        return value
+
+
+def decode_image(payload):
+    try:
+        data = base64.b64decode(payload.png_base64, validate=True)
+    except (binascii.Error, ValueError):
+        fail(422, "生图返回内容无效")
+    if (not data or len(data) > MAX_IMAGE_BYTES or base64.b64encode(data).decode("ascii") != payload.png_base64 or
+            len(data) < 24 or data[:8] != PNG_SIGNATURE or struct.unpack(">I", data[8:12])[0] != 13 or
+            data[12:16] != b"IHDR"):
+        fail(422, "生图返回内容无效")
+    width, height = struct.unpack(">II", data[16:24])
+    expected_width, expected_height = IMAGE_SIZE_DIMENSIONS[payload.size]
+    if (width, height) != (payload.width, payload.height) or (width, height) != (expected_width, expected_height):
+        fail(422, "生图返回内容无效")
+    return data
+
+
+def image_usage(value):
+    if not isinstance(value, dict):
+        return {}
+    valid = lambda number: isinstance(number, int) and not isinstance(number, bool) and 0 <= number <= 2**53 - 1
+    result = {name: value[name] for name in IMAGE_USAGE_FIELDS if valid(value.get(name))}
+    for name in ("input_tokens_details", "output_tokens_details"):
+        details = value.get(name)
+        if isinstance(details, dict):
+            cleaned = {field: details[field] for field in IMAGE_USAGE_DETAIL_FIELDS if valid(details.get(field))}
+            if cleaned:
+                result[name] = cleaned
+    return result
+
+
 def owned_thread(db, key, user):
     row = db.one("SELECT * FROM office_conversations WHERE id=? AND owner_id=?", (key, user["id"]))
     if not row:
@@ -132,7 +253,8 @@ def public_turn(row):
     result = unpack(row["result"])
     body=unpack(row["input"])
     return {"id": row["id"], "message": body["message"], "selection":body.get("selection"), "status": row["status"],
-            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry", "pipeline") if name in result}}
+            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry", "pipeline",
+                "kind", "prompt", "model", "size", "quality", "width", "height", "images") if name in result}}
 
 
 def conversation_summary(row):
@@ -344,9 +466,11 @@ def history_for(db, key):
     recent, latest = [], None
     for index, row in enumerate(history):
         result = unpack(row["result"])
-        if index < 8:
+        if index < 8 and isinstance(result.get("reply"), str):
             recent.append({"request": unpack(row["input"])["message"][:1500], "reply": result["reply"][:1500]})
-        if result.get("plan") and latest is None:
+        file = result.get("file")
+        if (result.get("plan") and isinstance(file, dict) and file.get("extension") in {"docx", "pptx"}
+                and latest is None):
             latest = {name: result[name] for name in ("plan", "kind", "file")}
     recent.reverse()
     return recent, latest
@@ -571,6 +695,132 @@ async def server_turn(prepared):
         message = "本轮未能完成，请重试。此前的会话和已保存文件仍可查阅。"
         fail_turn(run, user, assignment, message)
         yield event("error", message=message)
+@router.post("/{key}/images/prepare")
+def prepare_image_route(key: str, body: ImagePrepare, user: User):
+    if gateway.MODE != "desktop":
+        fail(409, "桌面执行模式未启用")
+    run, now, stale = uid(), instant(), stale_before()
+    with database(write=True) as db:
+        session = owned_thread(db, key, user)
+        assignment = session["assignment_id"]
+        writable_task(db, assignment, user)
+        for prior in db.all("SELECT id,result FROM office_turns WHERE conversation_id=? AND status='running' AND created_at<?",
+                            (key, stale)):
+            result = unpack(prior["result"] or "{}")
+            result["error"] = "上次执行已中断，请重新发送"
+            db.execute("UPDATE office_turns SET status='failed',result=? WHERE id=? AND status='running'",
+                       (pack(result), prior["id"]))
+            db.execute("UPDATE runs SET status='failed' WHERE id=? AND status='running'", (prior["id"],))
+        if db.one("SELECT id FROM office_turns WHERE conversation_id=? AND status='running'", (key,)):
+            fail(409, "当前会话有一轮任务正在执行")
+        image_request = {"prompt": body.prompt, "model": body.model, "size": body.size, "quality": body.quality}
+        request = pack({"message": "生成图片：" + body.prompt, "kind": "image", "image": image_request})
+        result = {"kind": "image", "prompt": body.prompt, "model": body.model, "size": body.size,
+                  "quality": body.quality, "images": []}
+        db.execute("INSERT INTO runs(id,assignment_id,user_id,kind,engine,status,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                   (run, assignment, user["id"], "image", "desktop", "running", pack({"model": body.model}), now))
+        db.execute("INSERT INTO office_turns(id,conversation_id,request_id,input,result,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                   (run, key, run, request, pack(result), "running", now))
+        db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (now, key))
+        audit(db, "image.started", user["id"], assignment, run_id=run, model=body.model,
+              size=body.size, quality=body.quality)
+    return {"run_id": run}
+
+
+@router.post("/{key}/images/{run}/complete")
+def complete_image_route(key: str, run: str, payload: ImageCompletion, user: User):
+    if gateway.MODE != "desktop":
+        fail(409, "桌面执行模式未启用")
+    data = decode_image(payload)
+    usage = image_usage(payload.usage)
+    with database(write=True) as db:
+        session = owned_thread(db, key, user)
+        assignment = session["assignment_id"]
+        writable_task(db, assignment, user)
+        turn = db.one("SELECT * FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
+        run_row = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
+        if not turn or not run_row or run_row["engine"] != "desktop" or run_row["kind"] != "image":
+            fail(404, "生图执行不存在")
+        if turn["status"] != "running" or run_row["status"] != "running":
+            fail(409, "本轮生图已结束")
+        original = unpack(turn["input"]).get("image", {})
+        if any(payload_value != original.get(name) for name, payload_value in
+               (("model", payload.model), ("size", payload.size), ("quality", payload.quality))):
+            fail(422, "生图参数与准备请求不一致")
+        result = unpack(turn["result"] or "{}")
+        index = len(result.get("images", [])) + 1
+        name = safe_name(f"生成图片-{index}") + ".png"
+        file_id = add_file(db, user["id"], name, data, "png", "image", assignment=assignment, run=run)
+        image = {"file": public_file(db, file_id), "prompt": original["prompt"], "model": payload.model,
+                 "size": payload.size, "quality": payload.quality, "width": payload.width,
+                 "height": payload.height, "source": "user", "usage": usage}
+        result.setdefault("images", []).append(image)
+        result.update(kind="image", prompt=original["prompt"], model=payload.model, size=payload.size,
+                      quality=payload.quality, width=payload.width, height=payload.height)
+        changed = db.execute("UPDATE office_turns SET result=?,status='completed' WHERE id=? AND status='running'",
+                             (pack(result), run)).rowcount
+        if not changed:
+            fail(409, "本轮生图已结束")
+        db.execute("UPDATE runs SET status='completed',usage=? WHERE id=? AND status='running'",
+                   (pack({"model": payload.model, **usage}), run))
+        db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), key))
+        audit(db, "image.generated", user["id"], assignment, run_id=run, artifact_id=file_id,
+              model=payload.model, size=payload.size, quality=payload.quality, usage=usage)
+        return public_turn(db.one("SELECT * FROM office_turns WHERE id=?", (run,)))
+
+
+@router.post("/{key}/images/{run}/fail")
+def fail_image_route(key: str, run: str, payload: ImageFailure, user: User):
+    with database() as db:
+        assignment = owned_thread(db, key, user)["assignment_id"]
+        turn = db.one("SELECT status FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
+        run_row = db.one("SELECT status,engine,kind FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
+        if not turn or not run_row or run_row["engine"] != "desktop" or run_row["kind"] != "image":
+            fail(404, "生图执行不存在")
+        if turn["status"] != "running" or run_row["status"] != "running":
+            fail(409, "本轮生图已结束")
+    if not fail_turn(run, user, assignment, clean_text(payload.message, 300)):
+        fail(409, "本轮生图已结束")
+    return {"ok": True}
+
+
+@router.post("/{key}/turns/{run}/images")
+def store_turn_image_route(key: str, run: str, payload: TurnImage, user: User):
+    if gateway.MODE != "desktop":
+        fail(409, "桌面执行模式未启用")
+    data = decode_image(payload)
+    usage = image_usage(payload.usage)
+    with database(write=True) as db:
+        session = owned_thread(db, key, user)
+        assignment = session["assignment_id"]
+        writable_task(db, assignment, user)
+        turn = db.one("SELECT * FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
+        run_row = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
+        if (not turn or not run_row or run_row["engine"] != "desktop" or run_row["kind"] != "conversation"):
+            fail(404, "本轮执行不存在")
+        if turn["status"] != "running" or run_row["status"] != "running":
+            fail(409, "本轮执行已结束")
+        result = unpack(turn["result"] or "{}")
+        images = result.setdefault("images", [])
+        if len(images) >= 2:
+            fail(409, "本轮生图次数已达上限（2 张）")
+        index = len(images) + 1
+        file_id = add_file(db, user["id"], safe_name(f"AI配图-{index}") + ".png", data, "png", "image",
+                           assignment=assignment, run=run)
+        image = {"file": public_file(db, file_id), "prompt": payload.prompt, "model": payload.model,
+                 "size": payload.size, "quality": payload.quality, "width": payload.width,
+                 "height": payload.height, "source": "ai", "usage": usage}
+        images.append(image)
+        changed = db.execute("UPDATE office_turns SET result=? WHERE id=? AND status='running'",
+                             (pack(result), run)).rowcount
+        if not changed:
+            fail(409, "本轮执行已结束")
+        db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), key))
+        audit(db, "image.ai_generated", user["id"], assignment, run_id=run, artifact_id=file_id,
+              model=payload.model, size=payload.size, quality=payload.quality, usage=usage)
+        return image
+
+
 @router.post("/{key}/turns/prepare")
 async def prepare_turn_route(key: str, body: TurnRequest, user: User):
     if gateway.MODE != "desktop":

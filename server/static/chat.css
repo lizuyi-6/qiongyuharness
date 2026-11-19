@@ -195,6 +195,16 @@
 .attached-file button { padding: 1px; border: 0; color: var(--muted); background: transparent; }
 .attached-file svg { width: 13px; height: 13px; }
 .chat-composer .error { padding: 4px; }
+.image-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.image-controls label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; }
+.image-controls select { max-width: 150px; }
+.image-auto-option { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.image-auto-option input { accent-color: var(--accent); }
+.turn-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr)); gap: 10px; }
+.turn-image { display: grid; gap: 6px; min-width: 0; margin: 0; }
+.turn-image img { display: block; max-width: min(100%, 640px); max-height: 540px; border: 1px solid var(--line); border-radius: var(--radius); object-fit: contain; background: var(--wash); }
+.turn-image figcaption { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.turn-image figcaption a { color: var(--accent); white-space: nowrap; }
 
 .workspace-context {
   min-width: 0;

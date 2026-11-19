@@ -16,6 +16,7 @@ function runDsh({
   dshBin,
   patchPath,
   contextPatchPath,
+  extraPatchPaths = [],
   cwd,
   env,
   model,
@@ -28,7 +29,7 @@ function runDsh({
     return Promise.reject(new Error("桌面运行参数无效"));
   }
 
-  const args = buildDshArgs({ dshBin, patchPath, contextPatchPath });
+  const args = buildDshArgs({ dshBin, patchPath, contextPatchPath, extraPatchPaths });
   const runId = randomUUID();
   let child;
   try {

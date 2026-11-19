@@ -6,7 +6,8 @@ import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm
   taskAdmin } from "./admin.js";
 import { attachFiles, chooseSources, loadDesktopModelState, loadEarlier, loadWorkspace, removeSource, runDesktopAgent,
   refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel, toggleDesktopUsage,
-  scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
+  scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView,
+  generateImageFromComposer, saveImageAutoPreference } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -310,6 +311,7 @@ async function onClick(event) {
     case "open-task": dialog.close(); go("task/"+encodeURIComponent(id)); break;
     case "agent-task": go("chat/task/"+encodeURIComponent(id)); break;
     case "chat-example": useExample(id); break;
+    case "chat-generate-image": await generateImageFromComposer(target,render); break;
     case "chat-remove-source": removeSource(id); break;
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
@@ -615,6 +617,10 @@ document.addEventListener("input",event=>{
   }
 });
 document.addEventListener("change",event=>{
+  if (event.target.matches("[name=allow_ai_images]")) {
+    saveImageAutoPreference(event.target.checked);
+    return;
+  }
   if (event.target.matches("[data-chat-model]")) {
     selectChatModel(event.target);
     return;

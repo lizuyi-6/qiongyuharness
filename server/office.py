@@ -27,7 +27,9 @@ MIMES = {
     "pdf": "application/pdf",
     "txt": "text/plain; charset=utf-8",
     "md": "text/markdown; charset=utf-8",
+    "png": "image/png",
 }
+UPLOAD_EXTENSIONS = frozenset({"docx", "pptx", "xlsx", "pdf", "txt", "md"})
 INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 WP = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 DRAW = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -131,7 +133,7 @@ def scan(data, target):
 def verify(name, data, scanner=""):
     name = safe_name(name)
     ext = name.rsplit(".", 1)[-1].lower()
-    if ext not in MIMES or not data or len(data) > MAX_FILE:
+    if ext not in UPLOAD_EXTENSIONS or not data or len(data) > MAX_FILE:
         fail(422, "请选择支持的文档格式，单个文件最多 12 MB")
     if ext in {"docx", "pptx", "xlsx"}:
         check_zip(data, ext)

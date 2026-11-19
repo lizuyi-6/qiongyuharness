@@ -80,7 +80,8 @@ export const eventLabels = {
   "file.material":"添加任务资料", "file.generated":"生成文件", "file.edited":"编辑文件", "file.copied":"关联成果",
   "file.preview":"预览附件", "file.download":"下载附件", "agent.started":"启动文稿协助",
   "agent.completed":"完成文稿协助", "agent.failed":"文稿协助失败", "schedule.created":"启动重复计划",
-  "schedule.updated":"更新重复计划", "auth.login":"企业身份登录"
+  "schedule.updated":"更新重复计划", "auth.login":"企业身份登录", "image.started":"启动图片生成",
+  "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片"
 };
 
 export function badge(value) {

@@ -3,3 +3,7 @@ require("./dsh-e2e.test.cjs");
 require("./loopback-gateway.test.cjs");
 require("./models-runtime.test.cjs");
 require("./pipeline.test.cjs");
+require("./image-gen.test.cjs");
+require("./image-broker.test.cjs");
+require("./runtime-env-image.test.cjs");
+require("./agent-image.test.cjs");

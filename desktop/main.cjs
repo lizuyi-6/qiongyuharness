@@ -132,6 +132,11 @@ ipcMain.handle("qo:run-agent", async (event, job) => {
   return desktopAgent.runAgent(job);
 });
 
+ipcMain.handle("qo:generate-image", async (event, request) => {
+  if (!trusted(event)) throw new Error("页面无权生成图片");
+  return desktopAgent.generateImage(request);
+});
+
 app.whenReady().then(() => {
   try { origin = config(); } catch { origin = undefined; }
   window = new BrowserWindow({

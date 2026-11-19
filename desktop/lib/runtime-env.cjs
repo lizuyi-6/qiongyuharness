@@ -2,7 +2,8 @@ const path = require("node:path");
 
 const PASSTHROUGH_ENV = ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG"];
 
-function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, model, system, contextPath, dshBin }) {
+function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, model, system, contextPath,
+  imageBrokerUrl, imageBrokerKey, dshBin }) {
   if (!home || !gatewayUrl || !gatewayKey || !model) throw new Error("桌面运行环境参数无效");
   const env = {};
   for (const name of PASSTHROUGH_ENV) {
@@ -17,18 +18,31 @@ function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, 
   env.QO_RUNTIME_KEY = gatewayKey;
   env.QO_RUNTIME_MODEL = model;
   env.DSH_SYSTEM_PROMPT = typeof system === "string" ? system : "";
-  if (contextPath) {
+  if (contextPath || imageBrokerUrl || imageBrokerKey) {
     if (!dshBin) throw new Error("缺少 DSH 执行路径");
+  }
+  if (contextPath) {
     env.QO_DSH_PLUGIN_CONTEXT = contextPath;
+  }
+  if (contextPath || imageBrokerUrl || imageBrokerKey) {
     env.QO_DSH_EXECUTABLE = dshBin;
+  }
+  if (imageBrokerUrl || imageBrokerKey) {
+    if (!imageBrokerUrl || !imageBrokerKey) throw new Error("图片服务凭证无效");
+    env.QO_IMAGE_BROKER_URL = imageBrokerUrl;
+    env.QO_IMAGE_BROKER_KEY = imageBrokerKey;
   }
   return env;
 }
 
-function buildDshArgs({ dshBin, patchPath, contextPatchPath }) {
+function buildDshArgs({ dshBin, patchPath, contextPatchPath, extraPatchPaths = [] }) {
   if (!dshBin || !patchPath) throw new Error("缺少 Harness 运行文件");
+  if (!Array.isArray(extraPatchPaths) || extraPatchPaths.some((patch) => typeof patch !== "string" || !patch)) {
+    throw new Error("Harness 扩展 patch 参数无效");
+  }
   const args = [dshBin, "--profile", "sdk-minimal", "--patch", patchPath];
   if (contextPatchPath) args.push("--patch", contextPatchPath);
+  for (const patch of extraPatchPaths) args.push("--patch", patch);
   return args;
 }
 
