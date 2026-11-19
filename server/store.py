@@ -1,5 +1,7 @@
 import json
+import hashlib
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -14,7 +16,8 @@ DEMO = os.getenv("QO_DEMO", "0") == "1"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
- id TEXT PRIMARY KEY, name TEXT NOT NULL, department TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+ id TEXT PRIMARY KEY, email TEXT, subject TEXT,
+ name TEXT NOT NULL, department TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
  role TEXT NOT NULL CHECK(role IN ('admin','manager','employee','reviewer'))
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -22,11 +25,13 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE TABLE IF NOT EXISTS auth_flows (
  state TEXT PRIMARY KEY, verifier TEXT NOT NULL, nonce TEXT NOT NULL,
- desktop TEXT NOT NULL, browser TEXT NOT NULL, expires TEXT NOT NULL
+ desktop TEXT NOT NULL, port INTEGER, browser TEXT NOT NULL, expires TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS desktop_grants (
- challenge TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS desktop_auth_codes (
+ code_hash TEXT PRIMARY KEY, challenge TEXT NOT NULL,
+ user_id TEXT NOT NULL REFERENCES users(id), expires TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS desktop_auth_codes_expiry ON desktop_auth_codes(expires);
 CREATE TABLE IF NOT EXISTS templates (
  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
  data TEXT NOT NULL, state TEXT NOT NULL, next_date TEXT,
@@ -205,31 +210,67 @@ def initialize():
     with database(write=True) as db:
         if DSN:
             db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS enabled INTEGER NOT NULL DEFAULT 1")
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT")
+            db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subject TEXT")
+            db.execute("ALTER TABLE auth_flows ADD COLUMN IF NOT EXISTS port INTEGER")
             db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS project_id TEXT REFERENCES office_projects(id)")
-        elif "enabled" not in {row["name"] for row in db.all("PRAGMA table_info(users)")}:
-            db.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        else:
+            user_columns = {row["name"] for row in db.all("PRAGMA table_info(users)")}
+            if "enabled" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            if "email" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            if "subject" not in user_columns:
+                db.execute("ALTER TABLE users ADD COLUMN subject TEXT")
+            flow_columns = {row["name"] for row in db.all("PRAGMA table_info(auth_flows)")}
+            if "port" not in flow_columns:
+                db.execute("ALTER TABLE auth_flows ADD COLUMN port INTEGER")
         if not DSN and "project_id" not in {row["name"] for row in db.all("PRAGMA table_info(office_conversations)")}:
             db.execute("ALTER TABLE office_conversations ADD COLUMN project_id TEXT REFERENCES office_projects(id)")
-        users = DEMO_USERS if DEMO else []
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email)")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_subject_unique ON users(subject)")
+        users = [(user_id, None, None, name, department, role) for user_id, name, department, role in DEMO_USERS] if DEMO else []
         if roster := os.getenv("QO_USERS_FILE"):
             records = json.loads(Path(roster).read_text(encoding="utf-8"))
+            emails = set()
+            subjects = set()
             for item in records:
-                if not all(isinstance(item.get(key), str) and item[key].strip() for key in ("sub", "name", "department", "role")):
+                if not isinstance(item, dict) or not all(isinstance(item.get(key), str) and item[key].strip() for key in ("email", "name", "department", "role")):
                     raise ValueError("Invalid QO_USERS_FILE entry")
-                users = [*users, (item["sub"], item["name"], item["department"], item["role"])]
-        if not DEMO and not any(user[3] == "admin" for user in users):
+                email = item["email"].strip().lower()
+                if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                    raise ValueError("Invalid QO_USERS_FILE email")
+                subject = item.get("sub")
+                if subject is not None and (not isinstance(subject, str) or not subject.strip()):
+                    raise ValueError("Invalid QO_USERS_FILE subject")
+                subject = subject.strip() if subject is not None else None
+                if email in emails or subject is not None and subject in subjects:
+                    raise ValueError("Duplicate QO_USERS_FILE email or subject")
+                emails.add(email)
+                if subject is not None:
+                    subjects.add(subject)
+                user_id = "u_" + hashlib.sha256(email.encode("utf-8")).hexdigest()[:24]
+                users.append((user_id, email, subject, item["name"].strip(), item["department"].strip(), item["role"].strip()))
+        if not DEMO and not any(user[5] == "admin" for user in users):
             raise ValueError("The enterprise roster requires at least one admin.")
         if not DEMO:
             db.execute("UPDATE users SET enabled=0")
-        for user in users:
-            db.execute(
-                "INSERT INTO users(id,name,department,role) VALUES(?,?,?,?) "
-                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,department=excluded.department,role=excluded.role,enabled=1",
-                user,
-            )
+        for user_id, email, subject, name, department, role in users:
+            if subject is None:
+                db.execute(
+                    "INSERT INTO users(id,email,name,department,role) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET email=excluded.email,name=excluded.name,department=excluded.department,role=excluded.role,enabled=1",
+                    (user_id, email, name, department, role),
+                )
+            else:
+                db.execute(
+                    "INSERT INTO users(id,email,subject,name,department,role) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET email=excluded.email,subject=excluded.subject,name=excluded.name,department=excluded.department,role=excluded.role,enabled=1",
+                    (user_id, email, subject, name, department, role),
+                )
         if not DEMO:
             db.execute("DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE enabled=0)")
-            db.execute("DELETE FROM desktop_grants WHERE user_id IN (SELECT id FROM users WHERE enabled=0)")
+            db.execute("DELETE FROM desktop_auth_codes WHERE user_id IN (SELECT id FROM users WHERE enabled=0)")
         if DEMO and not db.one("SELECT id FROM templates WHERE id=?", ("demo-first",)):
             seed_demo(db)
 

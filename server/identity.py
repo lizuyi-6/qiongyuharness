@@ -9,7 +9,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from .store import DEMO, audit, database, instant
@@ -56,7 +56,7 @@ def user_for(request: Request):
         fail(401, "请先登录")
     with database() as db:
         user = db.one(
-            "SELECT u.id,u.name,u.department,u.role FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.enabled=1",
+            "SELECT u.id,u.email,u.name,u.department,u.role FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.enabled=1",
             (digest(token), instant()),
         )
     if not user:
@@ -87,10 +87,19 @@ async def metadata(client):
 
 
 @router.get("/auth/start")
-async def start_auth(request: Request, desktop: str = ""):
+async def start_auth(request: Request, desktop: str = "", port: str | None = None):
     if not ISSUER or not CLIENT:
         fail(503, "企业登录配置尚未启用")
     if desktop and not SAFE_TOKEN.fullmatch(desktop):
+        fail(400, "桌面登录请求无效")
+    callback_port = None
+    if desktop:
+        if port is None or not re.fullmatch(r"[0-9]+", port):
+            fail(400, "桌面登录回环端口无效")
+        callback_port = int(port)
+        if not 1024 <= callback_port <= 65535:
+            fail(400, "桌面登录回环端口无效")
+    elif port is not None:
         fail(400, "桌面登录请求无效")
     try:
         async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
@@ -104,14 +113,14 @@ async def start_auth(request: Request, desktop: str = ""):
     expires = instant(datetime.now(UTC) + timedelta(minutes=8))
     with database(write=True) as db:
         db.execute("DELETE FROM auth_flows WHERE expires<?", (instant(),))
-        db.execute("DELETE FROM desktop_grants WHERE expires<?", (instant(),))
+        db.execute("DELETE FROM desktop_auth_codes WHERE expires<?", (instant(),))
         db.execute(
-            "INSERT INTO auth_flows(state,verifier,nonce,desktop,browser,expires) VALUES(?,?,?,?,?,?)",
-            (digest(state), verifier, nonce, desktop, digest(browser), expires),
+            "INSERT INTO auth_flows(state,verifier,nonce,desktop,port,browser,expires) VALUES(?,?,?,?,?,?,?)",
+            (digest(state), verifier, nonce, desktop, callback_port, digest(browser), expires),
         )
     params = urlencode({
         "client_id": CLIENT, "redirect_uri": f"{ORIGIN}/auth/callback", "response_type": "code",
-        "scope": "openid profile", "state": state, "nonce": nonce, "code_challenge_method": "S256",
+        "scope": "openid profile email", "state": state, "nonce": nonce, "code_challenge_method": "S256",
         "code_challenge": challenge(verifier),
     })
     separator = "&" if "?" in info["authorization_endpoint"] else "?"
@@ -157,6 +166,8 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
             claims = jwt.decode(token, jwt.PyJWK.from_dict(key, algorithm=header["alg"]).key,
                                 algorithms=[header["alg"]], audience=CLIENT, issuer=ISSUER, leeway=15,
                                 options={"require": ["iss", "sub", "aud", "exp", "iat", "nonce"]})
+            if not isinstance(claims["sub"], str) or not claims["sub"].strip():
+                raise ValueError("invalid subject")
             if claims["nonce"] != flow["nonce"]:
                 raise ValueError("nonce mismatch")
             audience = claims["aud"]
@@ -166,18 +177,36 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
     except (httpx.HTTPError, jwt.PyJWTError, ValueError, KeyError, TypeError, StopIteration):
         fail(401, "企业身份验证失败，请重新登录")
     with database(write=True) as db:
-        user = db.one("SELECT id FROM users WHERE id=? AND enabled=1", (claims["sub"],))
+        subject = claims["sub"]
+        user = db.one("SELECT id,email,subject,role FROM users WHERE subject=? AND enabled=1", (subject,))
         if not user:
-            fail(403, "此企业账号尚未开通工作台权限")
+            email_value = claims.get("email")
+            email = email_value.strip().lower() if isinstance(email_value, str) else ""
+            user = db.one("SELECT id,email,subject,role FROM users WHERE email=? AND enabled=1", (email,)) if email else None
+            if user and user["subject"] is not None and user["subject"] != subject:
+                fail(403, "此邮箱已绑定其他造场账号")
+            if claims.get("email_verified") is not True or not email:
+                fail(403, "造场账号未提供已验证邮箱，无法开通工作台权限")
+            if user and user["subject"] is None:
+                if db.one("SELECT id FROM users WHERE subject=?", (subject,)):
+                    fail(403, "此账号尚未开通工作台权限")
+                db.execute("UPDATE users SET subject=? WHERE id=? AND subject IS NULL", (subject, user["id"]))
+                user = db.one("SELECT id,email,subject,role FROM users WHERE id=? AND enabled=1", (user["id"],))
+                if not user or user["subject"] != subject:
+                    fail(403, "此账号尚未开通工作台权限")
+                audit(db, "auth.subject_bound", user["id"], subject=subject)
+            else:
+                fail(403, "此账号尚未开通工作台权限")
         audit(db, "auth.login", user["id"], mode="oidc")
         if flow["desktop"]:
+            if not flow["port"] or not 1024 <= flow["port"] <= 65535:
+                fail(400, "桌面登录回环端口无效")
+            raw_code = secrets.token_urlsafe(32)
             expires = instant(datetime.now(UTC) + timedelta(minutes=2))
-            db.execute("INSERT INTO desktop_grants(challenge,user_id,expires) VALUES(?,?,?) "
-                       "ON CONFLICT(challenge) DO UPDATE SET user_id=excluded.user_id,expires=excluded.expires",
-                       (flow["desktop"], user["id"], expires))
-            response = HTMLResponse(
-                '<html lang="zh-CN"><meta charset="utf-8"><title>登录完成</title>'
-                '<body><h1>企业登录完成</h1><p>请返回穹驭办公桌面应用。</p></body></html>'
+            db.execute("INSERT INTO desktop_auth_codes(code_hash,challenge,user_id,expires) VALUES(?,?,?,?)",
+                       (digest(raw_code), flow["desktop"], user["id"], expires))
+            response = RedirectResponse(
+                f"http://127.0.0.1:{flow['port']}/callback?{urlencode({'code': raw_code})}", status_code=303
             )
         else:
             response = RedirectResponse("/", status_code=303)
@@ -187,17 +216,20 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
 
 
 class DesktopGrant(BaseModel):
+    code: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     verifier: str = Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 @router.post("/api/v1/auth/desktop/claim")
 def desktop_claim(body: DesktopGrant):
     with database(write=True) as db:
-        key = challenge(body.verifier)
-        row = db.one("SELECT g.user_id FROM desktop_grants g JOIN users u ON u.id=g.user_id WHERE g.challenge=? AND g.expires>? AND u.enabled=1", (key, instant()))
+        row = db.one("SELECT g.challenge,g.user_id FROM desktop_auth_codes g JOIN users u ON u.id=g.user_id "
+                     "WHERE g.code_hash=? AND g.expires>? AND u.enabled=1", (digest(body.code), instant()))
         if not row:
-            fail(404, "等待企业登录")
-        db.execute("DELETE FROM desktop_grants WHERE challenge=?", (key,))
+            fail(404, "授权码无效或已过期")
+        if challenge(body.verifier) != row["challenge"]:
+            fail(400, "桌面登录校验失败")
+        db.execute("DELETE FROM desktop_auth_codes WHERE code_hash=?", (digest(body.code),))
         return {"session": make_session(db, row["user_id"])}
 
 
