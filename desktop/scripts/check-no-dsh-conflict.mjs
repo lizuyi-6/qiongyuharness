@@ -6,11 +6,22 @@ const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopDirectory = path.resolve(scriptDirectory, "..");
 const resourcesDirectory = path.join(desktopDirectory, "dist", "win-unpacked", "resources");
 const packageJson = JSON.parse(await readFile(path.join(desktopDirectory, "package.json"), "utf8"));
-const installer = await readFile(path.join(desktopDirectory, "installer.nsi"), "utf8");
 const runtimeEnv = await readFile(path.join(desktopDirectory, "lib", "runtime-env.cjs"), "utf8");
 const forbiddenNames = /deepseek harness|dsh desktop|deepseek-harness|dsh-desktop|dsh-plugin-desktop|dsh-desktop-next/i;
+const forbiddenHarnessNames = /deepseek|dsh/i;
 const violations = [];
 let checked = 0;
+
+const nsisOptions = packageJson.build?.nsis;
+const buildResourcesDirectory = path.join(desktopDirectory, "build");
+const nsisIncludePath = path.resolve(buildResourcesDirectory, String(nsisOptions?.include || ""));
+const nsisIncludeRelative = path.relative(buildResourcesDirectory, nsisIncludePath);
+const nsisIncludeInsideBuild = nsisIncludeRelative !== "" && nsisIncludeRelative !== ".." &&
+  !nsisIncludeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(nsisIncludeRelative);
+let nsisInclude;
+if (nsisIncludeInsideBuild) {
+  try { nsisInclude = await readFile(nsisIncludePath, "utf8"); } catch {}
+}
 
 function check(condition, message) {
   checked += 1;
@@ -65,11 +76,9 @@ check(typeof packageJson.name === "string" && !forbiddenNames.test(packageJson.n
 check(typeof packageJson.build?.productName === "string" && !forbiddenNames.test(packageJson.build.productName), "安装显示名含冲突名称");
 check(typeof packageJson.build?.artifactName === "string" && !forbiddenNames.test(packageJson.build.artifactName), "exe/安装包文件名含冲突名称");
 check(!forbiddenNames.test(packageJson.build?.win?.executableName || packageJson.build?.productName || ""), "exe 名含冲突名称");
-check(!forbiddenNames.test(installer), "installer.nsi 含冲突显示名、快捷方式名或安装目录");
-check(installer.includes('CreateShortcut "$SMPROGRAMS\\穹驭办公.lnk"') && installer.includes('"DisplayName" "穹驭办公"'),
-  "快捷方式名或卸载注册表 DisplayName 未使用穹驭办公");
-check(installer.includes('RMDir /r "$LOCALAPPDATA\\Programs\\QiongyuOffice"') && installer.includes('RMDir /r "$APPDATA\\QiongyuOffice"'),
-  "卸载范围未限定为穹驭办公安装目录和 userData");
+check(nsisOptions?.deleteAppDataOnUninstall === true, "NSIS 未配置普通卸载删除 userData");
+check(nsisIncludeInsideBuild && typeof nsisInclude === "string", "NSIS include 文件不存在或不在 desktop/build 内");
+check(typeof nsisInclude === "string" && !forbiddenHarnessNames.test(nsisInclude), "NSIS include 含 DeepSeek/DSH 名称");
 check(Array.isArray(packageJson.build?.files) && packageJson.build.files.includes("agent.cjs") && packageJson.build.files.includes("lib/**"),
   "Electron files 未显式包含桌面主进程逻辑");
 check(!packageJson.build.files.some((entry) => /harness|runtime-stage|node_modules/i.test(entry)),
