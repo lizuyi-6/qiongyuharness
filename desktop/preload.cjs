@@ -1,7 +1,15 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("officeDesktop", {
-  signIn: () => ipcRenderer.invoke("qo:sign-in")
+  signIn: () => ipcRenderer.invoke("qo:sign-in"),
+  models: () => ipcRenderer.invoke("qo:models"),
+  runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
+  onAgentEvent: (callback) => {
+    if (typeof callback !== "function") throw new TypeError("callback must be a function");
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on("qo:agent-event", listener);
+    return () => ipcRenderer.removeListener("qo:agent-event", listener);
+  }
 });
 
 window.addEventListener("DOMContentLoaded", async () => {
