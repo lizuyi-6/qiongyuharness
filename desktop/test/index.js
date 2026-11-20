@@ -9,3 +9,4 @@ require("./runtime-env-image.test.cjs");
 require("./agent-image.test.cjs");
 require("./frontend-fixes.test.cjs");
 require("./chat-frontend.test.cjs");
+require("./runtime-files.test.cjs");
