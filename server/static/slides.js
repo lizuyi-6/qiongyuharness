@@ -156,12 +156,22 @@ function textLines(ctx, text, maxWidth) {
   });
 }
 
+function hexToRgba(hex, alpha = 1) {
+  const clean = String(hex || "#000000").replace(/^#/, "");
+  if (clean.length !== 6) return hex || "#000000";
+  const r = parseInt(clean.slice(0, 2), 16);
+  const g = parseInt(clean.slice(2, 4), 16);
+  const b = parseInt(clean.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, alpha))})`;
+}
+
 function traceShapePath(ctx, shape, left, top, width, height) {
   ctx.beginPath();
   if (shape.shape === "ellipse") {
     ctx.ellipse(left + width / 2, top + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
   } else if (shape.shape === "round_rect") {
-    const r = Math.min(12, width * 0.12, height * 0.12);
+    const ratio = typeof shape.radius === "number" ? shape.radius : 0.08;
+    const r = Math.min(28, Math.min(width, height) * Math.max(0.02, Math.min(0.5, ratio)));
     if (typeof ctx.roundRect === "function") {
       ctx.roundRect(left, top, width, height, r);
     } else {
@@ -188,15 +198,34 @@ async function art(canvas, scene, selected) {
   ctx.fillRect(0, 0, scene.width, scene.height);
   for (const [index, shape] of scene.objects.entries()) {
     const { left, top, width, height } = shape;
-    if (shape.fill || shape.border) {
+    if (shape.fill || shape.gradient || shape.border) {
       ctx.save();
       if (typeof shape.opacity === "number" && shape.opacity < 1) ctx.globalAlpha = Math.max(0, Math.min(1, shape.opacity));
+      if (shape.shadow) {
+        ctx.shadowColor = "rgba(15, 23, 42, 0.11)";
+        ctx.shadowBlur = 14;
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 4;
+      }
       traceShapePath(ctx, shape, left, top, width, height);
-      if (shape.fill) {
+      if (shape.gradient?.stops?.length >= 2) {
+        const rad = ((Number(shape.gradient.angle) || 0) * Math.PI) / 180;
+        const cx = left + width / 2;
+        const cy = top + height / 2;
+        const dx = Math.cos(rad) * (width / 2);
+        const dy = Math.sin(rad) * (height / 2);
+        const grad = ctx.createLinearGradient(cx - dx, cy - dy, cx + dx, cy + dy);
+        for (const stop of shape.gradient.stops) {
+          grad.addColorStop(Math.max(0, Math.min(1, stop.pos)), hexToRgba(stop.color, stop.alpha));
+        }
+        ctx.fillStyle = grad;
+        ctx.fill();
+      } else if (shape.fill) {
         ctx.fillStyle = shape.fill;
         ctx.fill();
       }
       if (shape.border) {
+        ctx.shadowColor = "transparent";
         ctx.strokeStyle = shape.border;
         ctx.lineWidth = 1;
         ctx.stroke();

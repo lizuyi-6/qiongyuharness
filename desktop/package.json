@@ -1,6 +1,6 @@
 {
   "name": "qiongyu-office-desktop",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Qiongyu Office employee desktop",
   "author": "Qiongyu Technology",
   "main": "main.cjs",

@@ -104,6 +104,46 @@ def shape_kind(shape):
     return "rect"
 
 
+def shape_gradient(shape):
+    try:
+        grad = shape._element.find(f".//{DRAW}gradFill")
+        if grad is None:
+            return None
+        stops = []
+        for gs in grad.findall(f"./{DRAW}gsLst/{DRAW}gs"):
+            pos = int(gs.get("pos", "0")) / 100000.0
+            srgb = gs.find(f"{DRAW}srgbClr")
+            if srgb is None or not srgb.get("val"):
+                continue
+            alpha_el = srgb.find(f"{DRAW}alpha")
+            alpha = int(alpha_el.get("val")) / 100000.0 if alpha_el is not None and alpha_el.get("val") else 1.0
+            stops.append({"pos": round(max(0.0, min(1.0, pos)), 3), "color": f"#{srgb.get('val')}", "alpha": round(max(0.0, min(1.0, alpha)), 3)})
+        if len(stops) < 2:
+            return None
+        lin = grad.find(f"{DRAW}lin")
+        angle = int(lin.get("ang", "0")) / 60000.0 if lin is not None and lin.get("ang") else 0.0
+        return {"angle": round(angle, 1), "stops": stops}
+    except Exception:
+        return None
+
+
+def shape_has_shadow(shape):
+    try:
+        return shape._element.find(f".//{DRAW}effectLst/{DRAW}outerShdw") is not None
+    except Exception:
+        return False
+
+
+def shape_radius(shape):
+    try:
+        if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE and shape.auto_shape_type == MSO_SHAPE.ROUNDED_RECTANGLE:
+            if len(shape.adjustments) > 0:
+                return round(max(0.0, min(0.5, float(shape.adjustments[0]))), 3)
+    except Exception:
+        pass
+    return None
+
+
 def selected_layout(prs,page):
     slide=get_page(prs,page)
     scale=1000/(prs.slide_width or 1)
@@ -112,13 +152,21 @@ def selected_layout(prs,page):
     for shape in list(slide.shapes)[:180]:
         item={key:round(int(getattr(shape,key) or 0)*scale,2) for key in ("left","top","width","height")}
         fill = shape_fill(shape)
+        gradient = shape_gradient(shape) if not fill else None
         border = shape_border(shape)
         opacity = shape_opacity(shape) if fill else 1.0
+        radius = shape_radius(shape)
         item.update(id=shape.shape_id, fill=fill, shape=shape_kind(shape))
+        if gradient:
+            item["gradient"] = gradient
         if border:
             item["border"] = border
         if opacity < 0.999:
             item["opacity"] = opacity
+        if radius is not None:
+            item["radius"] = radius
+        if shape_has_shadow(shape):
+            item["shadow"] = True
         if shape.shape_type==MSO_SHAPE_TYPE.PICTURE and image_budget>0:
             picture=shape.image
             if picture.content_type in {"image/png","image/jpeg","image/gif"} and len(picture.blob)<=image_budget:
@@ -143,7 +191,7 @@ def selected_layout(prs,page):
                         color=color_value(font.color,"#182231") if font else "#182231",
                         align=align, valign=valign,
                         editable=editable_text(shape) is not None)
-        if item.get("text") or item.get("image") or item["fill"] or item.get("border"):
+        if item.get("text") or item.get("image") or item["fill"] or item.get("gradient") or item.get("border"):
             objects.append(item)
     bg=slide.background.fill
     color=color_value(bg.fore_color,"#ffffff") if bg.type==MSO_FILL_TYPE.SOLID else "#ffffff"

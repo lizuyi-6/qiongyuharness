@@ -20,6 +20,12 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 from pydantic import BaseModel, ConfigDict, Field
 
+try:
+    from PIL import Image as PilImage, ImageDraw as PilImageDraw
+except ImportError:  # pragma: no cover
+    PilImage = None
+    PilImageDraw = None
+
 from .identity import fail
 from .store import audit, instant, uid
 
@@ -556,6 +562,14 @@ _ELEMENT_TYPE_ALIASES = {
     "picture": "image",
     "photo": "image",
     "table": "table",
+    "chart": "chart",
+    "bar_chart": "chart",
+    "hbar": "chart",
+    "vbar": "chart",
+    "kpi": "chart",
+    "kpi_row": "chart",
+    "metrics": "chart",
+    "progress": "chart",
 }
 
 
@@ -614,7 +628,8 @@ def _coerce_str(value: Any, limit: int = 2000) -> str:
 class OverlaySpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
     color: str = "#000000"
-    opacity: float = 0.45
+    opacity: float = 0.65
+    mode: Literal["solid", "scrim_left", "scrim_bottom"] = "scrim_left"
 
 
 class DeckDesign(BaseModel):
@@ -626,16 +641,18 @@ class DeckDesign(BaseModel):
 
 class SlideElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    type: Literal["rect", "round_rect", "ellipse", "line", "text", "image", "table"]
+    type: Literal["rect", "round_rect", "ellipse", "line", "text", "image", "table", "chart"]
     x: float = 0.0
     y: float = 0.0
     w: float = 1.0
     h: float = 0.5
     fill: str | None = None
+    gradient: dict[str, Any] | None = None
     opacity: float | None = None
     border: str | None = None
     border_width: float = 1.0
     radius: float | None = None
+    shadow: bool = False
     text: str | None = None
     size: float = 16.0
     bold: bool = False
@@ -644,7 +661,7 @@ class SlideElement(BaseModel):
     font: str | None = None
     align: Literal["left", "center", "right"] = "left"
     valign: Literal["top", "middle", "bottom"] = "top"
-    line_spacing: float = 1.25
+    line_spacing: float = 1.28
     image_index: int | None = None
     fit: Literal["cover", "contain"] = "cover"
     columns: list[str] | None = None
@@ -655,6 +672,10 @@ class SlideElement(BaseModel):
     alt_fill: str | None = None
     text_color: str | None = None
     border_color: str | None = None
+    chart_kind: Literal["hbar", "vbar", "kpi_row"] = "hbar"
+    chart_title: str | None = None
+    unit: str | None = None
+    items: list[dict[str, Any]] | None = None
 
 
 class FreeSlide(BaseModel):
@@ -721,10 +742,14 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
         bg_overlay = None
         if isinstance(raw_ov, dict):
             ov_color = raw_ov.get("color") if isinstance(raw_ov.get("color"), str) and parse_hex_color(raw_ov.get("color")) else bg
-            ov_opacity = _coerce_opacity(raw_ov.get("opacity"), 0.5)
-            bg_overlay = OverlaySpec(color=ov_color, opacity=ov_opacity if ov_opacity is not None else 0.5)
+            ov_opacity = _coerce_opacity(raw_ov.get("opacity"), 0.68)
+            ov_mode_raw = str(raw_ov.get("mode") or ("scrim_left" if s_idx == 0 else "solid")).strip().lower()
+            ov_mode = ov_mode_raw if ov_mode_raw in {"solid", "scrim_left", "scrim_bottom"} else "scrim_left"
+            bg_overlay = OverlaySpec(color=ov_color, opacity=ov_opacity if ov_opacity is not None else 0.68, mode=ov_mode)
         elif isinstance(raw_ov, str) and parse_hex_color(raw_ov):
-            bg_overlay = OverlaySpec(color=raw_ov.strip(), opacity=0.5)
+            bg_overlay = OverlaySpec(color=raw_ov.strip(), opacity=0.68, mode="scrim_left" if s_idx == 0 else "solid")
+        elif bg_image is not None and s_idx == 0:
+            bg_overlay = OverlaySpec(color=bg, opacity=0.72, mode="scrim_left")
 
         elements: list[SlideElement] = []
         raw_elements = item.get("elements") if isinstance(item.get("elements"), list) else []
@@ -785,6 +810,54 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
             if el_type == "text" and not text_val:
                 continue
 
+            gradient = None
+            raw_grad = el.get("gradient")
+            if isinstance(raw_grad, dict):
+                g_from = raw_grad.get("from") or raw_grad.get("start")
+                g_to = raw_grad.get("to") or raw_grad.get("end")
+                if isinstance(g_from, str) and parse_hex_color(g_from) and isinstance(g_to, str) and parse_hex_color(g_to):
+                    gradient = {
+                        "from": g_from.strip(),
+                        "to": g_to.strip(),
+                        "angle": _clamp(_to_float(raw_grad.get("angle"), 0.0), 0.0, 360.0),
+                    }
+
+            chart_kind = "hbar"
+            chart_items = None
+            chart_title = None
+            chart_unit = None
+            if el_type == "chart":
+                ck_raw = str(el.get("chart_kind") or el.get("kind") or raw_type or "hbar").strip().lower()
+                if ck_raw in {"vbar", "column", "vertical"}:
+                    chart_kind = "vbar"
+                elif ck_raw in {"kpi", "kpi_row", "metrics", "stats"}:
+                    chart_kind = "kpi_row"
+                else:
+                    chart_kind = "hbar"
+                chart_title = _coerce_str(el.get("title") or el.get("chart_title"), 100) or None
+                chart_unit = _coerce_str(el.get("unit"), 24) or None
+                raw_items = el.get("items") or el.get("data")
+                if isinstance(raw_items, list):
+                    chart_items = []
+                    for it in raw_items[:10]:
+                        if not isinstance(it, dict):
+                            continue
+                        lbl = _coerce_str(it.get("label") or it.get("name"), 60)
+                        disp = _coerce_str(it.get("display") or it.get("value_text") or it.get("value"), 40)
+                        val = _to_float(it.get("value"), 0.0)
+                        sub = _coerce_str(it.get("sub") or it.get("note") or it.get("desc"), 100)
+                        if lbl or disp:
+                            chart_items.append({
+                                "label": lbl,
+                                "value": max(0.0, val),
+                                "display": disp,
+                                "sub": sub,
+                                "highlight": bool(it.get("highlight")),
+                                "color": it.get("color") if isinstance(it.get("color"), str) and parse_hex_color(it.get("color")) else None,
+                            })
+                if not chart_items:
+                    continue
+
             elements.append(SlideElement(
                 type=el_type,
                 x=x,
@@ -792,10 +865,12 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 w=w,
                 h=h,
                 fill=el.get("fill") if isinstance(el.get("fill"), str) else None,
+                gradient=gradient,
                 opacity=_coerce_opacity(el.get("opacity")),
                 border=el.get("border") if isinstance(el.get("border"), str) else (el.get("stroke") if isinstance(el.get("stroke"), str) else None),
                 border_width=_clamp(_to_float(el.get("border_width", el.get("stroke_width")), 1.0), 0.0, 12.0),
                 radius=radius,
+                shadow=bool(el.get("shadow")),
                 text=text_val,
                 size=_clamp(_to_float(el.get("size", el.get("font_size")), 16.0), 8.0, 120.0),
                 bold=bool(el.get("bold") or str(el.get("font_weight") or "").lower() in {"bold", "600", "700", "800"}),
@@ -804,7 +879,7 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 font=_coerce_str(el.get("font"), 60) or None,
                 align=align,
                 valign=valign,
-                line_spacing=_clamp(_to_float(el.get("line_spacing"), 1.25), 0.9, 2.4),
+                line_spacing=_clamp(_to_float(el.get("line_spacing"), 1.28), 0.9, 2.4),
                 image_index=img_idx,
                 fit=fit,
                 columns=cols,
@@ -815,6 +890,10 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 alt_fill=el.get("alt_fill") if isinstance(el.get("alt_fill"), str) else None,
                 text_color=el.get("text_color") if isinstance(el.get("text_color"), str) else None,
                 border_color=el.get("border_color") if isinstance(el.get("border_color"), str) else None,
+                chart_kind=chart_kind,
+                chart_title=chart_title,
+                unit=chart_unit,
+                items=chart_items,
             ))
 
         slides.append(FreeSlide(
@@ -873,6 +952,58 @@ def _set_shape_fill(shape, color_hex: str | None, opacity: float | None = None):
             _apply_alpha(srgb, opacity)
 
 
+def _is_dark_hex(hex_str: str | None) -> bool:
+    code = parse_hex_color(hex_str)
+    if not code:
+        return False
+    r, g, b = int(code[0:2], 16), int(code[2:4], 16), int(code[4:6], 16)
+    return (0.299 * r + 0.587 * g + 0.114 * b) < 142.0
+
+
+def _set_shape_gradient(shape, stops: list[tuple[int, str, float]], angle_deg: float = 0.0):
+    """用 DrawingML <a:gradFill> 渲染多段线性渐变（支持起止透明度，用于电影感封面蒙层与高端卡片）。"""
+    sp_pr = shape._element.spPr
+    for tag in ("noFill", "solidFill", "gradFill", "blipFill", "pattFill", "grpFill"):
+        existing = sp_pr.find(f"{DRAW}{tag}")
+        if existing is not None:
+            sp_pr.remove(existing)
+    grad_fill = etree.Element(f"{DRAW}gradFill")
+    gs_lst = etree.SubElement(grad_fill, f"{DRAW}gsLst")
+    for pos_pct, hex_code, alpha in stops:
+        gs = etree.SubElement(gs_lst, f"{DRAW}gs", pos=str(max(0, min(100000, int(pos_pct)))))
+        srgb = etree.SubElement(gs, f"{DRAW}srgbClr", val=hex_code)
+        if alpha < 0.999:
+            etree.SubElement(srgb, f"{DRAW}alpha", val=str(max(0, min(100000, int(round(alpha * 100000))))))
+    ang_val = int(round((angle_deg % 360.0) * 60000))
+    etree.SubElement(grad_fill, f"{DRAW}lin", ang=str(ang_val), scaled="1")
+    ln = sp_pr.find(f"{DRAW}ln")
+    if ln is not None:
+        sp_pr.insert(sp_pr.index(ln), grad_fill)
+    else:
+        sp_pr.append(grad_fill)
+
+
+def _apply_soft_shadow(shape, is_dark_bg: bool = False):
+    """为卡片或高亮模块施加现代 Keynote 风格柔和外投影。"""
+    sp_pr = shape._element.spPr
+    existing = sp_pr.find(f"{DRAW}effectLst")
+    if existing is not None:
+        sp_pr.remove(existing)
+    eff_lst = etree.Element(f"{DRAW}effectLst")
+    shdw = etree.SubElement(
+        eff_lst,
+        f"{DRAW}outerShdw",
+        blurRad="152400",
+        dist="38100",
+        dir="5400000",
+        algn="ctr",
+        rotWithShape="0",
+    )
+    srgb = etree.SubElement(shdw, f"{DRAW}srgbClr", val="000000")
+    etree.SubElement(srgb, f"{DRAW}alpha", val="22000" if is_dark_bg else "12000")
+    sp_pr.append(eff_lst)
+
+
 def _set_shape_border(shape, border_hex: str | None, border_width: float = 1.0):
     if not border_hex or border_width <= 0:
         shape.line.fill.background()
@@ -889,37 +1020,219 @@ def _png_dimensions(blob: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _add_fitted_picture(slide, blob: bytes, x: float, y: float, w: float, h: float, fit: str = "cover"):
-    dims = _png_dimensions(blob)
-    if not dims:
-        return slide.shapes.add_picture(BytesIO(blob), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
+def _prepare_picture_blob(blob: bytes, w: float, h: float, fit: str = "cover", corner_radius_in: float = 0.0) -> bytes:
+    """用 Pillow 做真正的高清等比裁切与 4x 超采样圆角遮罩，避免拉伸变形和生硬直角。"""
+    if PilImage is None or PilImageDraw is None:
+        return blob
+    if fit != "cover" and corner_radius_in <= 0:
+        return blob
+    try:
+        img = PilImage.open(BytesIO(blob)).convert("RGBA")
+        iw, ih = img.size
+        if iw <= 0 or ih <= 0:
+            return blob
+        box_ratio = max(0.05, w / max(0.05, h))
+        img_ratio = iw / ih
+        if fit == "cover":
+            if img_ratio > box_ratio:
+                new_w = max(1, int(round(ih * box_ratio)))
+                left = (iw - new_w) // 2
+                img = img.crop((left, 0, left + new_w, ih))
+            elif img_ratio < box_ratio:
+                new_h = max(1, int(round(iw / box_ratio)))
+                top = (ih - new_h) // 2
+                img = img.crop((0, top, iw, top + new_h))
+        cw, ch = img.size
+        if corner_radius_in > 0:
+            px_per_in = cw / max(0.1, w)
+            radius_px = max(4, min(int(round(corner_radius_in * px_per_in)), min(cw, ch) // 4))
+            scale = 2
+            mask = PilImage.new("L", (cw * scale, ch * scale), 0)
+            draw = PilImageDraw.Draw(mask)
+            draw.rounded_rectangle((0, 0, cw * scale - 1, ch * scale - 1), radius=radius_px * scale, fill=255)
+            mask = mask.resize((cw, ch), PilImage.Resampling.LANCZOS)
+            img.putalpha(mask)
+        out = BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception:
+        return blob
+
+
+def _add_fitted_picture(slide, blob: bytes, x: float, y: float, w: float, h: float, fit: str = "cover", corner_radius_in: float = 0.0):
+    processed = _prepare_picture_blob(blob, w, h, fit=fit, corner_radius_in=corner_radius_in)
+    dims = _png_dimensions(processed)
+    if not dims or fit == "cover":
+        return slide.shapes.add_picture(BytesIO(processed), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
     iw, ih = dims
     img_ratio = iw / ih
     box_ratio = w / h
-    if fit == "contain":
-        if img_ratio > box_ratio:
-            draw_w = w
-            draw_h = w / img_ratio
-            draw_x = x
-            draw_y = y + (h - draw_h) / 2
-        else:
-            draw_h = h
-            draw_w = h * img_ratio
-            draw_x = x + (w - draw_w) / 2
-            draw_y = y
-        return slide.shapes.add_picture(BytesIO(blob), Inches(draw_x), Inches(draw_y),
-                                        width=Inches(draw_w), height=Inches(draw_h))
-    # cover：等比铺满目标框，裁去超出部分，不拉伸变形
-    pic = slide.shapes.add_picture(BytesIO(blob), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
     if img_ratio > box_ratio:
-        crop = max(0.0, (1.0 - box_ratio / img_ratio) / 2.0)
-        pic.crop_left = crop
-        pic.crop_right = crop
-    elif img_ratio < box_ratio:
-        crop = max(0.0, (1.0 - img_ratio / box_ratio) / 2.0)
-        pic.crop_top = crop
-        pic.crop_bottom = crop
-    return pic
+        draw_w = w
+        draw_h = w / img_ratio
+        draw_x = x
+        draw_y = y + (h - draw_h) / 2
+    else:
+        draw_h = h
+        draw_w = h * img_ratio
+        draw_x = x + (w - draw_w) / 2
+        draw_y = y
+    return slide.shapes.add_picture(BytesIO(processed), Inches(draw_x), Inches(draw_y),
+                                    width=Inches(draw_w), height=Inches(draw_h))
+
+
+def _add_free_chart(slide, el: SlideElement, palette: dict[str, str], default_font: str, is_dark_slide: bool):
+    """将结构化 chart 原语渲染为 100% 原生可编辑的咨询级数据可视化（hbar / vbar / kpi_row）。"""
+    items = el.items or []
+    if not items:
+        return
+    primary = parse_hex_color(palette.get("primary")) or "2563EB"
+    accent = parse_hex_color(palette.get("accent")) or primary
+    text_hex = parse_hex_color(palette.get("text")) or ("F8FAFC" if is_dark_slide else "111827")
+    muted_hex = parse_hex_color(palette.get("muted")) or ("94A3B8" if is_dark_slide else "64748B")
+    surface_hex = parse_hex_color(palette.get("surface")) or ("1E293B" if is_dark_slide else "FFFFFF")
+    border_hex = parse_hex_color(palette.get("border")) or ("334155" if is_dark_slide else "E2E8F0")
+    track_hex = "1E293B" if is_dark_slide else "E8EEF6"
+
+    top = el.y
+    if el.chart_title:
+        title_el = SlideElement(
+            type="text", x=el.x, y=top, w=el.w, h=0.38,
+            text=el.chart_title, size=14.5, bold=True, color="#" + text_hex, font=default_font,
+        )
+        _add_free_text(slide, title_el, default_font, text_hex)
+        top += 0.46
+
+    avail_h = max(0.8, el.y + el.h - top)
+
+    if el.chart_kind == "kpi_row":
+        n = len(items)
+        gap = 0.24
+        card_w = (el.w - gap * (n - 1)) / max(1, n)
+        for idx, it in enumerate(items):
+            cx = el.x + idx * (card_w + gap)
+            hl = bool(it.get("highlight"))
+            card_fill = primary if hl else surface_hex
+            card = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(cx), Inches(top), Inches(card_w), Inches(avail_h))
+            try:
+                card.adjustments[0] = 0.08
+            except Exception:
+                pass
+            _set_shape_fill(card, card_fill)
+            _set_shape_border(card, None if hl else border_hex, 0.0 if hl else 0.75)
+            _apply_soft_shadow(card, is_dark_slide)
+            bar_color = "FFFFFF" if hl else (parse_hex_color(it.get("color")) or accent)
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(cx + 0.28), Inches(top + 0.24), Inches(0.42), Inches(0.06))
+            _set_shape_fill(bar, bar_color, 0.9)
+            bar.line.fill.background()
+
+            val_color = "FFFFFF" if hl else (parse_hex_color(it.get("color")) or primary)
+            lbl_color = "E2E8F0" if hl else text_hex
+            sub_color = "CBD5E1" if hl else muted_hex
+            display_val = str(it.get("display") or it.get("value") or "")
+            if el.unit and el.unit not in display_val:
+                display_val = f"{display_val}{el.unit}"
+            val_h = min(1.05, avail_h * 0.42)
+            _add_free_text(slide, SlideElement(
+                type="text", x=cx + 0.26, y=top + 0.44, w=card_w - 0.52, h=val_h,
+                text=display_val, size=36.0 if n <= 3 else 30.0, bold=True, color="#" + val_color, font=default_font, valign="middle",
+            ), default_font, val_color)
+            _add_free_text(slide, SlideElement(
+                type="text", x=cx + 0.26, y=top + 0.44 + val_h + 0.06, w=card_w - 0.52, h=0.42,
+                text=str(it.get("label") or ""), size=14.5, bold=True, color="#" + lbl_color, font=default_font,
+            ), default_font, lbl_color)
+            if it.get("sub"):
+                sub_y = top + 0.44 + val_h + 0.48
+                sub_h = max(0.35, top + avail_h - sub_y - 0.18)
+                _add_free_text(slide, SlideElement(
+                    type="text", x=cx + 0.26, y=sub_y, w=card_w - 0.52, h=sub_h,
+                    text=str(it.get("sub")), size=12.5, color="#" + sub_color, font=default_font, line_spacing=1.25,
+                ), default_font, sub_color)
+        return
+
+    max_val = max((float(it.get("value") or 0.0) for it in items), default=1.0) or 1.0
+
+    if el.chart_kind == "vbar":
+        n = len(items)
+        gap = min(0.35, el.w * 0.04)
+        col_w = (el.w - gap * (n - 1)) / max(1, n)
+        bar_w = min(0.85, col_w * 0.56)
+        label_h = 0.52
+        val_h = 0.34
+        plot_h = max(0.8, avail_h - label_h - val_h - 0.14)
+        base_y = top + val_h + plot_h
+        axis = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(el.x), Inches(base_y), Inches(el.w), Inches(0.015))
+        _set_shape_fill(axis, border_hex)
+        axis.line.fill.background()
+        for idx, it in enumerate(items):
+            cx = el.x + idx * (col_w + gap)
+            ratio = _clamp(float(it.get("value") or 0.0) / max_val, 0.06, 1.0)
+            bh = max(0.18, plot_h * ratio)
+            bx = cx + (col_w - bar_w) / 2
+            by = base_y - bh
+            bar_color = parse_hex_color(it.get("color")) or (accent if it.get("highlight") else primary)
+            bar = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(bx), Inches(by), Inches(bar_w), Inches(bh))
+            try:
+                bar.adjustments[0] = 0.08
+            except Exception:
+                pass
+            _set_shape_fill(bar, bar_color, 1.0 if it.get("highlight") else 0.78)
+            bar.line.fill.background()
+            disp = str(it.get("display") or it.get("value") or "")
+            _add_free_text(slide, SlideElement(
+                type="text", x=cx, y=by - val_h, w=col_w, h=val_h,
+                text=disp, size=13.5, bold=bool(it.get("highlight")), color="#" + (bar_color if it.get("highlight") else text_hex),
+                font=default_font, align="center", valign="bottom",
+            ), default_font, text_hex)
+            _add_free_text(slide, SlideElement(
+                type="text", x=cx, y=base_y + 0.08, w=col_w, h=label_h,
+                text=str(it.get("label") or ""), size=12.5, bold=bool(it.get("highlight")), color="#" + muted_hex,
+                font=default_font, align="center", valign="top",
+            ), default_font, muted_hex)
+        return
+
+    # 默认 hbar：咨询级横向对比条形图
+    n = len(items)
+    row_h = min(0.76, avail_h / max(1, n))
+    label_w = min(2.6, el.w * 0.27)
+    val_w = min(1.35, el.w * 0.16)
+    track_x = el.x + label_w + 0.16
+    track_w = max(1.2, el.w - label_w - val_w - 0.34)
+    bar_h = min(0.32, row_h * 0.48)
+    for idx, it in enumerate(items):
+        ry = top + idx * row_h
+        by = ry + (row_h - bar_h) / 2
+        hl = bool(it.get("highlight"))
+        bar_color = parse_hex_color(it.get("color")) or (accent if hl else primary)
+        _add_free_text(slide, SlideElement(
+            type="text", x=el.x, y=ry + 0.02, w=label_w, h=row_h - 0.04,
+            text=str(it.get("label") or ""), size=13.5, bold=hl, color="#" + (text_hex if hl else muted_hex),
+            font=default_font, align="left", valign="middle",
+        ), default_font, text_hex)
+        track = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(track_x), Inches(by), Inches(track_w), Inches(bar_h))
+        try:
+            track.adjustments[0] = 0.35
+        except Exception:
+            pass
+        _set_shape_fill(track, track_hex)
+        track.line.fill.background()
+
+        ratio = _clamp(float(it.get("value") or 0.0) / max_val, 0.05, 1.0)
+        fill_w = max(0.18, track_w * ratio)
+        fill_bar = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, Inches(track_x), Inches(by), Inches(fill_w), Inches(bar_h))
+        try:
+            fill_bar.adjustments[0] = 0.35
+        except Exception:
+            pass
+        _set_shape_fill(fill_bar, bar_color, 1.0 if hl else 0.72)
+        fill_bar.line.fill.background()
+
+        disp = str(it.get("display") or it.get("value") or "")
+        _add_free_text(slide, SlideElement(
+            type="text", x=track_x + track_w + 0.16, y=ry + 0.02, w=val_w, h=row_h - 0.04,
+            text=disp, size=14.0, bold=True, color="#" + (bar_color if hl else text_hex),
+            font=default_font, align="right", valign="middle",
+        ), default_font, text_hex)
 
 
 def _fit_free_text_size(text: str, width: float, height: float, target_size: float, line_spacing: float) -> float:
@@ -1046,32 +1359,58 @@ def render_freeform_pptx(deck: DeckSpec, image_blobs: list[bytes] | tuple[bytes,
         "line": MSO_SHAPE.RECTANGLE,
     }
 
-    for slide_spec in deck.slides:
+    total_slides = len(deck.slides)
+    for s_idx, slide_spec in enumerate(deck.slides):
         slide = prs.slides.add_slide(blank)
         bg_hex = parse_hex_color(slide_spec.bg, default_bg) or default_bg
+        is_dark_slide = _is_dark_hex(bg_hex)
         bg_fill = slide.background.fill
         bg_fill.solid()
         bg_fill.fore_color.rgb = RGBColor.from_string(bg_hex)
 
-        # 可选全屏背景图 + 半透明蒙层
+        # 可选全屏背景图 + 电影感渐变蒙层或纯色蒙层
         if slide_spec.bg_image and 1 <= slide_spec.bg_image <= len(image_blobs):
-            _add_fitted_picture(slide, image_blobs[slide_spec.bg_image - 1], 0.0, 0.0, SLIDE_W, SLIDE_H, fit="cover")
+            _add_fitted_picture(slide, image_blobs[slide_spec.bg_image - 1], 0.0, 0.0, SLIDE_W, SLIDE_H, fit="cover", corner_radius_in=0.0)
             if slide_spec.bg_overlay:
                 ov_hex = parse_hex_color(slide_spec.bg_overlay.color, bg_hex)
                 if ov_hex and slide_spec.bg_overlay.opacity > 0:
                     overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0),
                                                      Inches(SLIDE_W), Inches(SLIDE_H))
-                    _set_shape_fill(overlay, ov_hex, slide_spec.bg_overlay.opacity)
+                    op = _clamp(slide_spec.bg_overlay.opacity, 0.15, 0.95)
+                    if slide_spec.bg_overlay.mode == "scrim_left":
+                        _set_shape_gradient(
+                            overlay,
+                            [(0, ov_hex, min(0.92, op + 0.14)), (52000, ov_hex, op), (100000, ov_hex, max(0.12, op * 0.25))],
+                            angle_deg=0.0,
+                        )
+                    elif slide_spec.bg_overlay.mode == "scrim_bottom":
+                        _set_shape_gradient(
+                            overlay,
+                            [(0, ov_hex, max(0.12, op * 0.22)), (55000, ov_hex, op * 0.72), (100000, ov_hex, min(0.92, op + 0.16))],
+                            angle_deg=90.0,
+                        )
+                    else:
+                        _set_shape_fill(overlay, ov_hex, op)
                     overlay.line.fill.background()
+
+        # 非封面页防“无头页”兜底：若顶部区域没有任何文字，自动补齐页面主标题
+        if s_idx > 0 and slide_spec.title and not slide_spec.bg_image:
+            has_header_text = any(el.type == "text" and el.y < 1.35 for el in slide_spec.elements)
+            if not has_header_text:
+                header_color = "F8FAFC" if is_dark_slide else (parse_hex_color(palette.get("text")) or "111827")
+                _add_free_text(slide, SlideElement(
+                    type="text", x=0.68, y=0.52, w=11.9, h=0.68,
+                    text=slide_spec.title, size=25.0, bold=True, color="#" + header_color, font=default_font,
+                ), default_font, header_color)
 
         for el in slide_spec.elements:
             if el.type in shape_map:
                 w = max(0.01, el.w)
                 h = max(0.01, el.h)
                 shape = slide.shapes.add_shape(shape_map[el.type], Inches(el.x), Inches(el.y), Inches(w), Inches(h))
-                if el.type == "round_rect" and el.radius is not None:
+                if el.type == "round_rect":
                     try:
-                        shape.adjustments[0] = max(0.0, min(0.5, float(el.radius)))
+                        shape.adjustments[0] = max(0.0, min(0.5, float(el.radius if el.radius is not None else 0.07)))
                     except Exception:
                         pass
                 fill_hex = parse_hex_color(el.fill)
@@ -1079,16 +1418,62 @@ def render_freeform_pptx(deck: DeckSpec, image_blobs: list[bytes] | tuple[bytes,
                 if el.type == "line" and not fill_hex and border_hex:
                     fill_hex = border_hex
                     border_hex = None
-                _set_shape_fill(shape, fill_hex, el.opacity)
+                if el.gradient and parse_hex_color(el.gradient.get("from")) and parse_hex_color(el.gradient.get("to")):
+                    g_alpha = el.opacity if el.opacity is not None else 1.0
+                    _set_shape_gradient(
+                        shape,
+                        [(0, parse_hex_color(el.gradient["from"]), g_alpha), (100000, parse_hex_color(el.gradient["to"]), g_alpha)],
+                        angle_deg=float(el.gradient.get("angle") or 0.0),
+                    )
+                else:
+                    _set_shape_fill(shape, fill_hex, el.opacity)
                 _set_shape_border(shape, border_hex, el.border_width)
+                # 浅色底上的大卡片自动给柔和投影，告别平面死板感
+                auto_card_shadow = (
+                    el.shadow or (
+                        el.type == "round_rect"
+                        and not is_dark_slide
+                        and fill_hex is not None
+                        and fill_hex != bg_hex
+                        and w >= 2.2
+                        and h >= 1.2
+                        and (el.opacity is None or el.opacity >= 0.9)
+                    )
+                )
+                if auto_card_shadow:
+                    _apply_soft_shadow(shape, is_dark_slide)
             elif el.type == "image":
                 if el.image_index and 1 <= el.image_index <= len(image_blobs):
+                    img_w = max(0.1, el.w)
+                    img_h = max(0.1, el.h)
+                    full_bleed = img_w >= SLIDE_W - 0.5 and img_h >= SLIDE_H - 0.5
+                    corner_r = 0.0 if full_bleed else (el.radius * min(img_w, img_h) if el.radius is not None else 0.14)
                     _add_fitted_picture(slide, image_blobs[el.image_index - 1], el.x, el.y,
-                                        max(0.1, el.w), max(0.1, el.h), fit=el.fit)
+                                        img_w, img_h, fit=el.fit, corner_radius_in=corner_r)
             elif el.type == "text":
                 _add_free_text(slide, el, default_font, default_text)
             elif el.type == "table":
                 _add_free_table(slide, el, palette, default_font)
+            elif el.type == "chart":
+                _add_free_chart(slide, el, palette, default_font, is_dark_slide)
+
+        # 统一杂志级细线页脚与页码（封面页与全出血背景过渡页不加，且不与底部自绘内容冲突）
+        if s_idx > 0 and not slide_spec.bg_image:
+            has_footer = any(el.type == "text" and el.y >= 6.95 for el in slide_spec.elements)
+            if not has_footer:
+                foot_line = "334155" if is_dark_slide else (parse_hex_color(palette.get("border")) or "DCE3EE")
+                foot_text = "94A3B8" if is_dark_slide else (parse_hex_color(palette.get("muted")) or "64748B")
+                rule = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.68), Inches(7.04), Inches(11.97), Inches(0.01))
+                _set_shape_fill(rule, foot_line, 0.55)
+                rule.line.fill.background()
+                _add_free_text(slide, SlideElement(
+                    type="text", x=0.68, y=7.10, w=8.5, h=0.28,
+                    text=deck.title[:48], size=9.5, color="#" + foot_text, font=default_font,
+                ), default_font, foot_text)
+                _add_free_text(slide, SlideElement(
+                    type="text", x=10.8, y=7.10, w=1.85, h=0.28,
+                    text=f"{s_idx + 1:02d} / {total_slides:02d}", size=9.5, bold=True, color="#" + foot_text, font=default_font, align="right",
+                ), default_font, foot_text)
 
         if slide_spec.notes:
             slide.notes_slide.notes_text_frame.text = clean_text(slide_spec.notes, 2000, False)
