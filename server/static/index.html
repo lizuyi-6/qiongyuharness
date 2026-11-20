@@ -3,15 +3,34 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
 <title>穹驭办公</title>
-<link rel="icon" href="/static/office.ico">
-<link rel="stylesheet" href="/static/style.css">
-<link rel="stylesheet" href="/static/chat.css">
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="icon" href="/static/office.ico" sizes="any">
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/base.css">
+<link rel="stylesheet" href="/static/shell.css">
+<link rel="stylesheet" href="/static/workspace.css">
+<link rel="stylesheet" href="/static/pages.css">
 <script type="module" src="/static/app.js"></script>
 </head>
 <body>
-<div id="app"><section class="splash"><div class="brand-mark">Q</div><h1>穹驭办公</h1><p>正在连接工作台…</p></section></div>
+<div id="app">
+  <section class="splash">
+    <div class="splash-card">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="butt" stroke-linejoin="miter">
+          <path class="logo-outer" d="M13 18H6V6h12v7" stroke-width="2"/>
+          <path class="logo-inner" d="M9.6 13.4V9.6h3.8" stroke-width="1.45"/>
+          <path class="logo-axis" d="M12.6 12.6L18.8 18.8" stroke-width="2"/>
+        </svg>
+      </div>
+      <h1>穹驭办公</h1>
+      <p>正在连接企业工作台…</p>
+      <div class="splash-line" aria-hidden="true"></div>
+    </div>
+  </section>
+</div>
 <dialog id="dialog"></dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 </body>
