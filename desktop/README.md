@@ -11,13 +11,13 @@ npm ci
 npm run build:win
 ```
 
-`build:win` 依次运行 `scripts/prepare-runtime.mjs`、Electron Builder 的 Windows x64 打包、`scripts/check-no-dsh-conflict.mjs`。准备脚本将 Harness 的 `package.json`、`package-lock.json`、`office.patch.yml`、`office-context.mjs` 复制到 `runtime-stage/qo-runtime/harness/`，执行 `npm ci --omit=dev --ignore-scripts` 安装运行依赖，并把构建所用且版本至少为 24.9.0 的 Node 可执行文件暂存为 `runtime-stage/qo-runtime/node/node.exe`。构建要求 x64 Node。
+`build:win` 依次运行 `scripts/prepare-runtime.mjs`、Electron Builder 的 Windows x64 打包、`scripts/check-no-dsh-conflict.mjs`。准备脚本将 Harness 运行清单复制到 `runtime-stage/qo-runtime/harness/`，执行 `npm ci --omit=dev --ignore-scripts` 安装运行依赖，再裁掉 `.ts`、`.mts`、`.cts` 和 `.map` 开发期文件。脚本保留 DSH CLI 入口，把构建所用且版本至少为 24.9.0 的 Node 可执行文件暂存为 `runtime-stage/qo-runtime/node/node.exe`，并用 electron-builder 自带的 7za 生成和检查 `runtime-stage/qo-runtime.7z`。构建要求 x64 Node，解包后的 `runtime-stage/qo-runtime/` 也会保留供检查和开发冒烟使用。
 
-Windows 安装器只由 `desktop/package.json` 的 electron-builder `build.nsis` 配置生成；`build.nsis.include` 使用 `desktop/build/uninstaller.nsh`，保留 electron-builder 默认的卸载/升级清理逻辑，并在普通卸载时增加支持长路径的 `$INSTDIR` 清理。升级分支跳过这个额外清理，由 electron-builder 默认升级流程接管。普通卸载会删除 `%APPDATA%\QiongyuOffice`，其中包含连接配置和 safeStorage 加密的模型凭证；覆盖升级保留该目录。
+Windows 安装器只由 `desktop/package.json` 的 electron-builder `build.nsis` 配置生成；`build.nsis.include` 使用 `desktop/build/installer.nsh`，安装模式固定为当前用户，并在解压运行时后校验关键文件。普通卸载保留支持长路径的 `$INSTDIR` 清理；升级分支只清除旧运行时，由 electron-builder 默认升级流程接管。普通卸载会删除 `%APPDATA%\QiongyuOffice`，其中包含连接配置和 safeStorage 加密的模型凭证；覆盖升级保留该目录。
 
-Electron Builder 配置将运行时放到安装目录的 `resources/qo-runtime/`。Electron `files` 只收主进程、桌面模块、页面和 `package.json`，不收 `harness` 或 `runtime-stage`；按此配置 Harness 位于 `resources/app.asar`、`resources/app/` 和 `resources/app.asar.unpacked/` 之外。桌面端从 `resources/qo-runtime/` 解析 Harness 和 Node 路径；打包后的实际目录仍应由构建末尾的检查脚本核对。
+Electron Builder 配置将 `runtime-stage/qo-runtime.7z` 放到安装目录的 `resources/qo-runtime.7z`；NSIS 安装宏把它直接解压到 `resources/qo-runtime/` 并校验 `node.exe` 与 Harness 关键文件。Electron `files` 只收主进程、桌面模块、页面和 `package.json`，不收 `harness` 或 `runtime-stage`；按此配置 Harness 位于 `resources/app.asar`、`resources/app/` 和 `resources/app.asar.unpacked/` 之外。桌面端从 `resources/qo-runtime/` 解析 Harness 和 Node 路径；打包后的实际目录仍应由构建末尾的检查脚本核对。
 
-打包完成后冲突检查脚本扫描 `dist/win-unpacked/resources`，检查 Harness 位于 `resources/qo-runtime/`、归档内没有冲突的 `node_modules/@deepseek-ai/` 路径，以及产品名、安装器和隔离设置。单独运行 `node scripts/check-no-dsh-conflict.mjs --config-only` 只检查配置，不会扫描已生成的安装目录。
+打包完成后冲突检查脚本扫描 `dist/win-unpacked/resources`，检查 `resources/qo-runtime.7z` 非空、暂存目录包含 DSH CLI 归档来源、app 与 app.asar 没有冲突路径，以及产品名、安装器和隔离设置。单独运行 `node scripts/check-no-dsh-conflict.mjs --config-only` 只检查配置，不会扫描已生成的安装目录。
 
 ## 登录、密钥和模型
 
@@ -45,3 +45,6 @@ Electron Builder 配置将运行时放到安装目录的 `resources/qo-runtime/`
 - 每轮临时目录隔离 `HOME`、`USERPROFILE`、`DSH_HOME`、`DSH_AGENTS_HOME` 和 cwd；不使用 `~/.dsh` 或 `~/.agents`。不注册全局 `dsh` 命令，也不修改系统 `PATH`。
 - 使用 `sdk-minimal` profile。卸载器只删除当前穹驭办公安装目录 `$INSTDIR`、穹驭办公自己的 `%APPDATA%\QiongyuOffice` 用户数据、快捷方式和穹驭办公卸载注册表项；普通卸载删除用户数据，覆盖升级保留用户数据。
 - 每次 `build:win` 后运行的冲突检查会核对打包配置和实际 `dist/win-unpacked` 产物；命令带 `--config-only` 时只核对配置。
+## 安装包运行时
+
+Windows 打包前会裁掉运行时中的开发期文件，并将运行时压缩为 `qo-runtime.7z`；安装时直接解压到 `resources/qo-runtime`。安装界面的侧栏与页眉图片由 `scripts/render-installer-art.cjs` 生成。

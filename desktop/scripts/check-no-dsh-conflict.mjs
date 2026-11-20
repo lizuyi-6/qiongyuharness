@@ -83,8 +83,8 @@ check(Array.isArray(packageJson.build?.files) && packageJson.build.files.include
   "Electron files 未显式包含桌面主进程逻辑");
 check(!packageJson.build.files.some((entry) => /harness|runtime-stage|node_modules/i.test(entry)),
   "Electron files 把 Harness 或暂存运行时纳入 app.asar");
-check(packageJson.build?.extraResources?.some((entry) => entry.from === "runtime-stage/qo-runtime" && entry.to === "qo-runtime"),
-  "Harness 运行时未配置到 resources/qo-runtime");
+check(packageJson.build?.extraResources?.some((entry) => entry.from === "runtime-stage/qo-runtime.7z" && entry.to === "qo-runtime.7z"),
+  "运行时 7z 归档未配置到 resources/qo-runtime.7z");
 check(runtimeEnv.includes('env.HOME = home') && runtimeEnv.includes('env.DSH_HOME = home') && runtimeEnv.includes('env.DSH_AGENTS_HOME = home'),
   "DSH 用户目录未全部重定向到本轮临时目录");
 check(runtimeEnv.includes('"sdk-minimal"') && !runtimeEnv.includes('"desktop"'), "DSH profile 不符合约定");
@@ -93,8 +93,13 @@ const configOnly = process.argv.includes("--config-only");
 let distributionPresent = false;
 try { distributionPresent = (await stat(resourcesDirectory)).isDirectory(); } catch {}
 if (!configOnly && distributionPresent) {
-  const runtimeDsh = path.join(resourcesDirectory, "qo-runtime", "harness", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
-  try { await stat(runtimeDsh); check(true, ""); } catch { check(false, "resources/qo-runtime 中缺少已打包的 DSH CLI"); }
+  const runtimeArchive = path.join(resourcesDirectory, "qo-runtime.7z");
+  try {
+    const archiveStat = await stat(runtimeArchive);
+    check(archiveStat.isFile() && archiveStat.size > 0, "resources/qo-runtime.7z 不存在或为空");
+  } catch { check(false, "resources/qo-runtime.7z 不存在"); }
+  const stagedRuntimeDsh = path.join(desktopDirectory, "runtime-stage", "qo-runtime", "harness", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+  try { await stat(stagedRuntimeDsh); check(true, ""); } catch { check(false, "暂存运行时缺少 Harness DSH CLI 归档来源"); }
   for (const layout of ["app", "app.asar.unpacked"]) {
     const root = path.join(resourcesDirectory, layout);
     try {
