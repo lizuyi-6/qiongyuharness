@@ -194,7 +194,7 @@ export function apply(ctx) {
     name: "office_ppt_check",
     description: "在输出最终 PPT 自由画布 JSON 前必须调用，自动检测每一页的坐标越界、文本框重叠、蚂蚁字、空洞大卡片、全套死黑单调底色及连续撞版，返回精准修改建议。",
     parameters: {
-      deck: { type: "object", required: true, description: "待校验的 deck 自由画布对象（含 title、design、slides）。" }
+      deck: { type: "json", description: "必填。待校验的 deck 自由画布对象（含 title、design、slides）。" }
     },
     timeoutMs: 15_000,
     output: { schema: { type: "string" }, render: (_args, value) => [{ type: "text", text: value }] },

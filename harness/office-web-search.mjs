@@ -157,9 +157,8 @@ export function apply(ctx) {
     parameters: {
       queries: {
         type: "array",
-        required: true,
         items: { type: "string" },
-        description: `1–4 条精准搜索关键词（当前服务器年份为 ${srvTime.year} 年，检索最新动态/产品/模型/数据时请显式包含 ${srvTime.year}，切勿将 2024/2025 当作当前年份）。`
+        description: `必填。1–4 条精准搜索关键词（当前服务器年份为 ${srvTime.year} 年，检索最新动态/产品/模型/数据时请显式包含 ${srvTime.year}，切勿将 2024/2025 当作当前年份）。`
       },
       count: {
         type: "number",
@@ -182,8 +181,7 @@ export function apply(ctx) {
     parameters: {
       url: {
         type: "string",
-        required: true,
-        description: "要读取的公开 HTTP/HTTPS 网页地址。"
+        description: "必填。要读取的公开 HTTP/HTTPS 网页地址。"
       }
     },
     timeoutMs: 45_000,

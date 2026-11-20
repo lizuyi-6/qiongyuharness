@@ -22,11 +22,11 @@ function brokerAddress() {
 }
 
 async function generate(args, execution) {
-  const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
-  const size = args.size || "1024x1024";
-  const quality = args.quality || "medium";
-  if (prompt.length < 1 || prompt.length > 4000 || !SIZES.includes(size) || !QUALITIES.includes(quality)) {
-    return "生图失败：生图请求参数无效";
+  const prompt = typeof args?.prompt === "string" ? args.prompt.trim() : "";
+  const size = SIZES.includes(args?.size) ? args.size : "1024x1024";
+  const quality = QUALITIES.includes(args?.quality) ? args.quality : "medium";
+  if (prompt.length < 1 || prompt.length > 4000) {
+    return "生图未执行：参数缺少有效的 prompt 字符串。请重新调用 office_image_generate，传入完整的 JSON 参数，例如 {\"prompt\":\"详细的无文字画面描述\",\"size\":\"1536x864\",\"quality\":\"high\"}（建议每次单独调用 1 张）。";
   }
   let endpoint;
   try {
@@ -62,9 +62,9 @@ export function apply(ctx) {
   ctx.tools.guard((execution) => ALLOWED_TOOLS.has(execution.name) ? undefined : "本轮只允许调用办公资料读取和生图工具");
   ctx.tools.register(defineTool({
     name: "office_image_generate",
-    description: "用于生成 PPT 封面主视觉/配图，或用户明确需要的插图、海报、示意图等；按张计费，PPT 配图提示词中请要求画面无文字。",
+    description: "用于生成 PPT 封面主视觉/配图，或用户明确需要的插图、海报、示意图等；按张计费，PPT 配图提示词中请要求画面无文字。建议每次调用生成 1 张。",
     parameters: {
-      prompt: { type: "string", required: true, description: "图片生成提示词，1 至 4000 字。" },
+      prompt: { type: "string", description: "必填。图片生成提示词，1 至 4000 字。" },
       size: { type: "string", enum: SIZES, default: "1024x1024", description: "图片尺寸。" },
       quality: { type: "string", enum: QUALITIES, default: "medium", description: "图片质量。" }
     },

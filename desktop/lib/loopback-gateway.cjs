@@ -190,7 +190,7 @@ function quotaErrorDetails(upstream, body) {
 }
 
 function extractDeltaSignals(payload, seenTools, onStreamEvent) {
-  if (!payload || typeof payload !== "object") return;
+  if (!payload || typeof payload !== "object" || typeof onStreamEvent !== "function") return;
   for (const choice of Array.isArray(payload.choices) ? payload.choices : []) {
     const delta = choice?.delta || choice?.message;
     if (!delta || typeof delta !== "object") continue;
@@ -217,6 +217,320 @@ function extractDeltaSignals(payload, seenTools, onStreamEvent) {
       onStreamEvent({ type: "content", chars: delta.content.length });
     }
   }
+}
+
+function repairToolJsonText(text) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  const stack = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+      } else if (ch === "\\") {
+        out += ch;
+        escaped = true;
+      } else if (ch === "\"") {
+        out += ch;
+        inString = false;
+      } else if (ch === "\n") {
+        out += "\\n";
+      } else if (ch === "\r") {
+        out += "\\r";
+      } else if (ch === "\t") {
+        out += "\\t";
+      } else if (code < 0x20) {
+        out += " ";
+      } else {
+        out += ch;
+      }
+    } else {
+      if (ch === "\"") {
+        inString = true;
+        out += ch;
+      } else if (ch === "{") {
+        stack.push("}");
+        out += ch;
+      } else if (ch === "[") {
+        stack.push("]");
+        out += ch;
+      } else if ((ch === "}" || ch === "]") && stack.length > 0 && stack[stack.length - 1] === ch) {
+        stack.pop();
+        out += ch;
+      } else {
+        out += ch;
+      }
+    }
+  }
+  if (inString) out += "\"";
+  out = out.replace(/,\s*([}\]])/g, "$1").replace(/,\s*$/g, "");
+  while (stack.length > 0) {
+    out += stack.pop();
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
+function splitTopLevelJsonObjects(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  const objects = [];
+  let inString = false;
+  let escaped = false;
+  let depth = 0;
+  let start = -1;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+    } else {
+      if (ch === "\"") {
+        inString = true;
+      } else if (ch === "{") {
+        if (depth === 0) start = i;
+        depth += 1;
+      } else if (ch === "}") {
+        if (depth > 0) {
+          depth -= 1;
+          if (depth === 0 && start !== -1) {
+            objects.push(s.slice(start, i + 1));
+            start = -1;
+          }
+        }
+      }
+    }
+  }
+  if (start !== -1) {
+    objects.push(s.slice(start));
+  }
+  return objects.length > 0 ? objects : [s];
+}
+
+function sanitizeToolArguments(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return { json: "{}", empty: true };
+  try {
+    const parsed = JSON.parse(s);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { json: JSON.stringify(parsed), empty: Object.keys(parsed).length === 0 };
+    }
+  } catch {}
+
+  let stripped = s;
+  while (/^\{\s*\{/.test(stripped)) {
+    stripped = stripped.replace(/^\{\s*/, "");
+    if (stripped.endsWith("}}")) {
+      stripped = stripped.slice(0, -1);
+    }
+  }
+
+  for (const cand of [stripped, s]) {
+    const firstBrace = cand.indexOf("{");
+    const sub = firstBrace >= 0 ? cand.slice(firstBrace) : cand;
+    for (const attempt of [sub, repairToolJsonText(sub)]) {
+      try {
+        const parsed = JSON.parse(attempt);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return { json: JSON.stringify(parsed), empty: Object.keys(parsed).length === 0 };
+        }
+      } catch {}
+    }
+  }
+  return { json: "{}", empty: true };
+}
+
+function createSseToolCallNormalizer() {
+  let hasToolCalls = false;
+  let templateMeta = {
+    id: "chatcmpl-qo",
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: ""
+  };
+  const calls = [];
+  const byId = new Map();
+  const byRawIndex = new Map();
+  let activeCall = null;
+  let deferredFinishReason = null;
+  let deferredUsage = null;
+  let flushed = false;
+
+  function processChunk(payload) {
+    if (!isObject(payload)) return [payload];
+    if (typeof payload.id === "string" && payload.id) templateMeta.id = payload.id;
+    if (typeof payload.object === "string" && payload.object) templateMeta.object = payload.object;
+    if (Number.isInteger(payload.created)) templateMeta.created = payload.created;
+    if (typeof payload.model === "string" && payload.model) templateMeta.model = payload.model;
+
+    if (!Array.isArray(payload.choices) || payload.choices.length === 0) {
+      if (hasToolCalls && isObject(payload.usage)) {
+        deferredUsage = payload.usage;
+        return [];
+      }
+      return [payload];
+    }
+
+    const choice = payload.choices[0];
+    if (!isObject(choice)) return [payload];
+    const delta = isObject(choice.delta) ? choice.delta : null;
+    const rawToolCalls = Array.isArray(delta?.tool_calls) ? delta.tool_calls : null;
+
+    if (rawToolCalls && rawToolCalls.length > 0) {
+      hasToolCalls = true;
+      for (const tc of rawToolCalls) {
+        if (!isObject(tc)) continue;
+        const rawIdx = typeof tc.index === "number" ? tc.index : undefined;
+        const tcId = typeof tc.id === "string" ? tc.id.trim() : "";
+        const tcName = typeof tc.function?.name === "string" ? tc.function.name.trim() : "";
+        const tcArgs = typeof tc.function?.arguments === "string" ? tc.function.arguments : "";
+
+        let target = null;
+        if (tcId && byId.has(tcId)) {
+          target = byId.get(tcId);
+        } else if (tcId && !byId.has(tcId)) {
+          target = null;
+        } else if (rawIdx !== undefined && byRawIndex.has(rawIdx)) {
+          const candidate = byRawIndex.get(rawIdx);
+          if (tcName && candidate.name && candidate.rawArgs.trim().endsWith("}")) {
+            target = null;
+          } else {
+            target = candidate;
+          }
+        } else if (!tcName && activeCall) {
+          target = activeCall;
+        }
+
+        if (!target) {
+          target = {
+            id: tcId || `call_${calls.length + 1}_${randomBytes(3).toString("hex")}`,
+            name: tcName || activeCall?.name || "",
+            rawArgs: ""
+          };
+          calls.push(target);
+          if (tcId) byId.set(tcId, target);
+          if (rawIdx !== undefined) byRawIndex.set(rawIdx, target);
+        } else {
+          if (tcId && !target.id) {
+            target.id = tcId;
+            byId.set(tcId, target);
+          }
+          if (tcName && !target.name) {
+            target.name = tcName;
+          }
+          if (rawIdx !== undefined) {
+            byRawIndex.set(rawIdx, target);
+          }
+        }
+
+        if (tcArgs) {
+          if (target.rawArgs.trim() === "{" && /^\s*\{\s*"/.test(tcArgs)) {
+            target.rawArgs = tcArgs;
+          } else {
+            target.rawArgs += tcArgs;
+          }
+        }
+        activeCall = target;
+      }
+    }
+
+    if (!hasToolCalls) {
+      return [payload];
+    }
+
+    if (typeof choice.finish_reason === "string" && choice.finish_reason) {
+      deferredFinishReason = choice.finish_reason;
+    }
+    if (isObject(payload.usage)) {
+      deferredUsage = payload.usage;
+    }
+
+    if (delta) {
+      const restDelta = {};
+      for (const [k, v] of Object.entries(delta)) {
+        if (k !== "tool_calls") restDelta[k] = v;
+      }
+      const hasVisibleDelta = Object.keys(restDelta).some((k) => k !== "role" && restDelta[k] !== null && restDelta[k] !== "");
+      if (hasVisibleDelta) {
+        return [{
+          ...templateMeta,
+          choices: [{
+            index: choice.index ?? 0,
+            delta: restDelta,
+            finish_reason: null
+          }]
+        }];
+      }
+    }
+    return [];
+  }
+
+  function flush() {
+    if (flushed || !hasToolCalls) return [];
+    flushed = true;
+    const expanded = [];
+    for (const c of calls) {
+      if (!c.name) continue;
+      const parts = splitTopLevelJsonObjects(c.rawArgs);
+      if (parts.length <= 1) {
+        expanded.push({ id: c.id, name: c.name, ...sanitizeToolArguments(c.rawArgs) });
+      } else {
+        parts.forEach((part, idx) => {
+          const sub = sanitizeToolArguments(part);
+          if (!sub.empty || idx === 0) {
+            expanded.push({
+              id: idx === 0 ? c.id : `${c.id}_${idx + 1}`,
+              name: c.name,
+              ...sub
+            });
+          }
+        });
+      }
+    }
+
+    const nonEmpty = expanded.filter((item) => !item.empty || item.name === "office_context_read");
+    const finalCalls = nonEmpty.length > 0 ? nonEmpty : expanded.slice(0, 1);
+    const out = [];
+
+    if (finalCalls.length > 0) {
+      out.push({
+        ...templateMeta,
+        choices: [{
+          index: 0,
+          delta: {
+            role: "assistant",
+            tool_calls: finalCalls.map((item, idx) => ({
+              index: idx,
+              id: item.id || `call_${idx + 1}`,
+              type: "function",
+              function: {
+                name: item.name,
+                arguments: item.json
+              }
+            }))
+          },
+          finish_reason: null
+        }]
+      });
+    }
+
+    out.push({
+      ...templateMeta,
+      choices: [{
+        index: 0,
+        delta: {},
+        finish_reason: finalCalls.length > 0 ? (deferredFinishReason || "tool_calls") : (deferredFinishReason || "stop")
+      }],
+      ...(deferredUsage ? { usage: deferredUsage } : {})
+    });
+    return out;
+  }
+
+  return { processChunk, flush };
 }
 
 async function pipeResponse(upstream, response, state) {
@@ -249,15 +563,46 @@ async function pipeResponse(upstream, response, state) {
   const isSse = contentType.includes("text/event-stream");
   const decoder = isSse ? new StringDecoder("utf8") : null;
   const seenTools = new Set();
+  const normalizer = isSse ? createSseToolCallNormalizer() : null;
   let sseBuffer = "";
-  const parseSseLine = (line) => {
-    if (!line.startsWith("data:")) return;
-    const raw = line.slice(5).trim();
-    if (!raw || raw === "[DONE]") return;
-    try {
-      extractDeltaSignals(JSON.parse(raw), seenTools, state.onStreamEvent);
-    } catch {}
+  let doneWritten = false;
+
+  const writeDownstream = async (buf) => {
+    if (!response.write(buf)) {
+      await new Promise((resolve) => response.once("drain", resolve));
+    }
   };
+
+  const handleSseLine = async (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    if (!trimmed.startsWith("data:")) {
+      await writeDownstream(Buffer.from(`${line}\n`, "utf8"));
+      return;
+    }
+    const raw = trimmed.slice(5).trim();
+    if (!raw) return;
+    if (raw === "[DONE]") {
+      for (const p of normalizer.flush()) {
+        await writeDownstream(Buffer.from(`data: ${JSON.stringify(p)}\n\n`, "utf8"));
+      }
+      doneWritten = true;
+      await writeDownstream(Buffer.from("data: [DONE]\n\n", "utf8"));
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      await writeDownstream(Buffer.from(`${line}\n\n`, "utf8"));
+      return;
+    }
+    extractDeltaSignals(parsed, seenTools, state.onStreamEvent);
+    for (const p of normalizer.processChunk(parsed)) {
+      await writeDownstream(Buffer.from(`data: ${JSON.stringify(p)}\n\n`, "utf8"));
+    }
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -270,20 +615,29 @@ async function pipeResponse(upstream, response, state) {
       }
       const chunk = Buffer.from(value);
       chunks.push(chunk);
-      if (isSse && typeof state.onStreamEvent === "function") {
+      if (isSse) {
         sseBuffer += decoder.write(chunk);
         let nl;
         while ((nl = sseBuffer.indexOf("\n")) >= 0) {
           const line = sseBuffer.slice(0, nl).replace(/\r$/, "");
           sseBuffer = sseBuffer.slice(nl + 1);
-          parseSseLine(line);
+          await handleSseLine(line);
         }
+      } else {
+        await writeDownstream(chunk);
       }
-      if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
     }
-    if (isSse && typeof state.onStreamEvent === "function") {
+    if (isSse) {
       sseBuffer += decoder.end();
-      if (sseBuffer.trim()) parseSseLine(sseBuffer.replace(/\r$/, ""));
+      if (sseBuffer.trim()) {
+        await handleSseLine(sseBuffer.replace(/\r$/, ""));
+      }
+      for (const p of normalizer.flush()) {
+        await writeDownstream(Buffer.from(`data: ${JSON.stringify(p)}\n\n`, "utf8"));
+      }
+      if (!doneWritten) {
+        await writeDownstream(Buffer.from("data: [DONE]\n\n", "utf8"));
+      }
     }
     response.end();
     const fullBody = Buffer.concat(chunks, total);
