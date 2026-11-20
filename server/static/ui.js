@@ -17,6 +17,7 @@ export const state = {
   usageState: null,
   contextOpen: false,
   studioTab: "context",
+  imageDrawerOpen: false,
   filesCache: [],
   filesFilter: "all",
   filesQuery: "",
@@ -65,7 +66,11 @@ const paths = {
   inbox: '<path d="M3 13V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7l-3 7H6l-3-7Z"/><path d="M3 13h5l2 3h4l2-3h5"/>',
   layers: '<path d="m12 3 9 4.5-9 4.5-9-4.5L12 3Zm-9 9 9 4.5 9-4.5M3 16.5 12 21l9-4.5"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.4-11.4 1.4-1.4"/>',
-  moon: '<path d="M20 14.5A8 8 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z"/>'
+  moon: '<path d="M20 14.5A8 8 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z"/>',
+  arrowUp: '<path d="M12 19V5m-6 6 6-6 6 6"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 15-4.5-4.5L9 18"/>',
+  slash: '<path d="M15 4 9 20"/>',
+  maximize: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>'
 };
 
 const THEME_KEY = "qo-theme";

@@ -311,6 +311,19 @@
 .engine-card-row span { color: var(--ink-3); font-size: 12.5px; flex: none; }
 .engine-card-row strong { font-size: 13px; font-weight: 560; color: var(--ink); text-align: right; }
 
+/* 列表与卡片克制交错入场动画 */
+.work-list tbody tr,
+.project-card,
+.file-list .file {
+  animation: item-rise 220ms var(--ease-line) both;
+}
+.work-list tbody tr:nth-child(2), .project-card:nth-child(2), .file-list .file:nth-child(2) { animation-delay: 22ms; }
+.work-list tbody tr:nth-child(3), .project-card:nth-child(3), .file-list .file:nth-child(3) { animation-delay: 44ms; }
+.work-list tbody tr:nth-child(4), .project-card:nth-child(4), .file-list .file:nth-child(4) { animation-delay: 66ms; }
+.work-list tbody tr:nth-child(5), .project-card:nth-child(5), .file-list .file:nth-child(5) { animation-delay: 88ms; }
+.work-list tbody tr:nth-child(6), .project-card:nth-child(6), .file-list .file:nth-child(6) { animation-delay: 110ms; }
+.work-list tbody tr:nth-child(n+7), .project-card:nth-child(n+7), .file-list .file:nth-child(n+7) { animation-delay: 130ms; }
+
 @media (max-width: 1080px) {
   .dashboard { grid-template-columns: minmax(0, 1fr) 210px; gap: 18px; }
   .deadlines { padding-left: 16px; }

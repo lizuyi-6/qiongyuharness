@@ -4,6 +4,7 @@
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   background: var(--bg-page);
+  transition: grid-template-columns var(--t-panel);
 }
 
 .app-shell.sidebar-collapsed {
@@ -39,10 +40,10 @@
 .brand-mark {
   display: grid;
   place-items: center;
-  width: 26px;
-  height: 26px;
-  flex: 0 0 26px;
-  border-radius: var(--radius);
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 9px;
   background: var(--accent);
   color: var(--ink-inverse);
   font-weight: 700;
@@ -99,6 +100,18 @@
   gap: 1px;
   min-width: 0;
 }
+
+.nav-group.subtle {
+  margin-top: 6px;
+  padding-top: 8px;
+}
+.nav-group.subtle .nav {
+  min-height: 30px;
+  font-size: 12.5px;
+  color: var(--ink-3);
+}
+.nav-group.subtle .nav:hover,
+.nav-group.subtle .nav.active { color: var(--ink); }
 
 .nav-label {
   margin: 0 8px 4px;
@@ -185,10 +198,10 @@
 .avatar {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  flex: 0 0 28px;
-  border-radius: var(--radius);
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 50%;
   border: 1px solid var(--line-strong);
   background: var(--bg-page);
   color: var(--ink);
@@ -283,7 +296,9 @@
 .crumbs svg { width: 12px; height: 12px; color: var(--ink-placeholder); }
 .crumbs strong { font-weight: 600; color: var(--ink); }
 
-.top-actions { display: flex; align-items: center; gap: 7px; }
+.top-actions { display: flex; align-items: center; gap: 6px; }
+.top-actions [data-theme-toggle] svg { transition: transform 280ms var(--ease-panel); }
+.top-actions [data-theme-toggle]:hover svg { transform: rotate(-16deg) scale(1.06); }
 
 .search-button {
   position: relative;
@@ -291,11 +306,11 @@
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  min-width: 176px;
+  min-width: 172px;
   height: 30px;
-  padding: 0 8px 0 9px;
+  padding: 0 10px 0 11px;
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--radius-pill);
   background: var(--bg-subtle);
   color: var(--ink-3);
   font-size: 12px;
@@ -304,8 +319,8 @@
 .search-button::after {
   content: "";
   position: absolute;
-  left: 0;
-  right: 0;
+  left: 14px;
+  right: 14px;
   bottom: 0;
   height: 1px;
   background: var(--hairline);
@@ -357,7 +372,11 @@ main.content {
   width: 100%;
   max-width: 1320px;
   margin: 0 auto;
-  padding: 26px 32px 48px;
+  padding: 24px 32px 48px;
+}
+
+main.content.view-entering {
+  animation: view-enter var(--t-view) both;
 }
 
 .app-shell.workspace-route main.content {
@@ -520,6 +539,26 @@ main.content {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+}
+
+@media (max-width: 1260px) and (min-width: 861px) {
+  .app-shell.canvas-side-by-side {
+    grid-template-columns: var(--sidebar-collapsed) minmax(0, 1fr);
+  }
+  .app-shell.canvas-side-by-side .sidebar { padding-inline: 8px; }
+  .app-shell.canvas-side-by-side .sidebar-top { flex-direction: column; gap: 6px; justify-content: center; padding-inline: 0; }
+  .app-shell.canvas-side-by-side .brand-name,
+  .app-shell.canvas-side-by-side .nav-label,
+  .app-shell.canvas-side-by-side .nav .nav-text,
+  .app-shell.canvas-side-by-side .nav-count,
+  .app-shell.canvas-side-by-side .id-copy,
+  .app-shell.canvas-side-by-side .identity > svg,
+  .app-shell.canvas-side-by-side .recent-sessions,
+  .app-shell.canvas-side-by-side .new-session-label { display: none; }
+  .app-shell.canvas-side-by-side .nav { justify-content: center; padding: 7px 0; }
+  .app-shell.canvas-side-by-side .identity { justify-content: center; padding: 5px 0; }
+  .app-shell.canvas-side-by-side .workspace-nav .history-trigger { display: inline-flex; justify-content: center; padding: 0; }
+  .app-shell.canvas-side-by-side .new-session.button { justify-content: center; padding: 0; }
 }
 
 @media (max-width: 1080px) {
