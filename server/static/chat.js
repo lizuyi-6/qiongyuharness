@@ -1958,6 +1958,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
     live.phase = "agent";
     const enableImageTool = Boolean(workspace.image_models?.length) && allowImageTool === true;
     const job = {
+      conversation_id: live.threadId, run_id: prepared.run_id,
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
       ...(prepared.wants_pptx ? { ppt_check: true } : {}),
       ...(prepared.web_search ? { web_search: prepared.web_search } : {}),

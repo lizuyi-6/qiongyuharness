@@ -22,6 +22,61 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function repairJsonText(text) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  const stack = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    const code = text.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        out += ch;
+        escaped = false;
+      } else if (ch === "\\") {
+        out += ch;
+        escaped = true;
+      } else if (ch === "\"") {
+        out += ch;
+        inString = false;
+      } else if (ch === "\n") {
+        out += "\\n";
+      } else if (ch === "\r") {
+        out += "\\r";
+      } else if (ch === "\t") {
+        out += "\\t";
+      } else if (code < 0x20) {
+        out += " ";
+      } else {
+        out += ch;
+      }
+    } else {
+      if (ch === "\"") {
+        inString = true;
+        out += ch;
+      } else if (ch === "{") {
+        stack.push("}");
+        out += ch;
+      } else if (ch === "[") {
+        stack.push("]");
+        out += ch;
+      } else if ((ch === "}" || ch === "]") && stack.length > 0 && stack[stack.length - 1] === ch) {
+        stack.pop();
+        out += ch;
+      } else {
+        out += ch;
+      }
+    }
+  }
+  if (inString) out += "\"";
+  out = out.replace(/,\s*([}\]])/g, "$1").replace(/,\s*$/g, "");
+  while (stack.length > 0) {
+    out += stack.pop();
+  }
+  return out.replace(/,\s*([}\]])/g, "$1");
+}
+
 function tryParseJson(text) {
   try {
     return JSON.parse(text);
@@ -32,6 +87,9 @@ function tryParseJson(text) {
         return JSON.parse(cleaned);
       } catch {}
     }
+    try {
+      return JSON.parse(repairJsonText(text));
+    } catch {}
     return undefined;
   }
 }
@@ -52,6 +110,9 @@ function parseJsonObject(value) {
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     candidates.push(unfenced.slice(firstBrace, lastBrace + 1));
   }
+  if (firstBrace !== -1) {
+    candidates.push(unfenced.slice(firstBrace));
+  }
   for (const candidate of candidates) {
     const parsed = tryParseJson(candidate);
     if (isObject(parsed)) return parsed;
@@ -59,19 +120,27 @@ function parseJsonObject(value) {
   throw new Error("响应必须是有效 JSON 对象");
 }
 
+function normalizeStringList(raw, maxItems = 12, maxLen = 500) {
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((item) => typeof item === "string" && item.trim())
+      .slice(0, maxItems)
+      .map((item) => item.trim().slice(0, maxLen));
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    return [raw.trim().slice(0, maxLen)];
+  }
+  return [];
+}
+
 function parseBrief(value) {
   const parsed = parseJsonObject(value);
-  const tier = new Set(["light", "standard", "critical"]).has(parsed.tier) ? parsed.tier : "";
-  const goal = typeof parsed.goal === "string" ? parsed.goal.trim().slice(0, 500) : "";
-  const constraints = Array.isArray(parsed.constraints)
-    ? parsed.constraints.filter((item) => typeof item === "string" && item.trim()).slice(0, 12).map((item) => item.trim().slice(0, 500))
-    : null;
-  const acceptance = Array.isArray(parsed.acceptance)
-    ? parsed.acceptance.filter((item) => typeof item === "string" && item.trim()).slice(0, 12).map((item) => item.trim().slice(0, 500))
-    : null;
-  if (!tier || !goal || !constraints || !acceptance) {
-    throw new Error("理解结果字段不符合约定");
-  }
+  const rawTier = typeof parsed.tier === "string" ? parsed.tier.trim().toLowerCase() : "";
+  const tier = new Set(["light", "standard", "critical"]).has(rawTier) ? rawTier : "standard";
+  const rawGoal = parsed.goal ?? parsed.target ?? parsed.summary ?? parsed.objective ?? "";
+  const goal = typeof rawGoal === "string" && rawGoal.trim() ? rawGoal.trim().slice(0, 500) : "按员工当前请求完成交付";
+  const constraints = normalizeStringList(parsed.constraints, 12, 500);
+  const acceptance = normalizeStringList(parsed.acceptance, 12, 500);
   return {
     tier,
     goal,
@@ -81,31 +150,64 @@ function parseBrief(value) {
 }
 
 function parseDeliverable(value) {
-  const parsed = parseJsonObject(value);
-  const hasArtifact = isObject(parsed.deck) || isObject(parsed.plan) || Array.isArray(parsed.slides);
-  if (typeof parsed.reply !== "string" || !parsed.reply.trim()) {
-    if (hasArtifact) {
-      const title = parsed.deck?.title || parsed.plan?.title || parsed.title || "";
-      parsed.reply = title ? `已为你生成《${String(title).trim().slice(0, 80)}》。` : "已按要求完成生成。";
-    } else {
-      throw new Error("交付结果缺少 reply 字符串");
+  try {
+    const parsed = parseJsonObject(value);
+    if (!isObject(parsed.deck) && Array.isArray(parsed.slides)) {
+      parsed.deck = {
+        title: parsed.title || "演示文稿",
+        subtitle: parsed.subtitle || "",
+        ...(isObject(parsed.design) ? { design: parsed.design } : {}),
+        slides: parsed.slides
+      };
     }
+    const hasDeck = isObject(parsed.deck) && Array.isArray(parsed.deck.slides);
+    const hasPlan = isObject(parsed.plan);
+    const hasArtifact = hasDeck || hasPlan || Array.isArray(parsed.slides);
+    if (hasDeck && !parsed.kind) parsed.kind = "pptx";
+    if (hasPlan && !parsed.kind) parsed.kind = "docx";
+    if (hasArtifact && !parsed.action) parsed.action = "export";
+    if (!hasArtifact && !parsed.action) parsed.action = "reply";
+    if (typeof parsed.reply !== "string" || !parsed.reply.trim()) {
+      if (hasArtifact) {
+        const title = parsed.deck?.title || parsed.plan?.title || parsed.title || "";
+        parsed.reply = title ? `已为你生成《${String(title).trim().slice(0, 80)}》。` : "已按要求完成生成。";
+      } else {
+        const fallbackReply = parsed.content ?? parsed.message ?? parsed.answer ?? parsed.text ?? "";
+        if (typeof fallbackReply === "string" && fallbackReply.trim()) {
+          parsed.reply = fallbackReply.trim().slice(0, 6500);
+        } else {
+          throw new Error("交付结果缺少 reply 字符串");
+        }
+      }
+    }
+    return parsed;
+  } catch (error) {
+    if (typeof value === "string") {
+      const cleaned = value.replace(/^\s*```(?:markdown|md|text)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+      if (cleaned.length >= 4 && !cleaned.startsWith("{") && !/"slides"\s*:\s*\[/.test(cleaned)) {
+        return {
+          action: "reply",
+          reply: cleaned.slice(0, 6500)
+        };
+      }
+    }
+    throw error;
   }
-  return parsed;
 }
 
 function parseAssessment(value) {
   const parsed = parseJsonObject(value);
-  const verdict = new Set(["pass", "fail"]).has(parsed.verdict) ? parsed.verdict : "";
-  const rawIssues = Array.isArray(parsed.issues) ? parsed.issues : null;
-  const summary = typeof parsed.summary === "string" ? parsed.summary.trim().slice(0, 500) : "";
-  if (!verdict || !rawIssues) {
+  const rawVerdict = typeof parsed.verdict === "string" ? parsed.verdict.trim().toLowerCase() : "";
+  const verdict = rawVerdict === "pass" || rawVerdict === "passed" || rawVerdict === "ok" || parsed.verdict === true
+    ? "pass"
+    : rawVerdict === "fail" || rawVerdict === "failed" || parsed.verdict === false
+      ? "fail"
+      : "";
+  if (!verdict) {
     throw new Error("验收结果字段不符合约定");
   }
-  const issues = rawIssues
-    .map((item) => (typeof item === "string" ? item.trim().slice(0, 300) : ""))
-    .filter(Boolean)
-    .slice(0, 10);
+  const issues = normalizeStringList(parsed.issues, 10, 300);
+  const summary = typeof parsed.summary === "string" ? parsed.summary.trim().slice(0, 500) : "";
   return { verdict, issues, summary };
 }
 

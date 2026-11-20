@@ -654,8 +654,17 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         ...(imageBroker ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
       };
     } catch (error) {
-      if (imageBroker?.images.length) {
-        error.message = `${error.message || "桌面执行失败"}（本轮已生成 ${imageBroker.images.length} 张图片并已计费，因执行失败未能保存）`;
+      if (imageBroker?.images.length && origin && job.conversation_id && job.run_id) {
+        const imgEndpoint = `${origin}/api/v1/conversations/${encodeURIComponent(job.conversation_id)}/turns/${encodeURIComponent(job.run_id)}/images`;
+        for (const image of imageBroker.images) {
+          try {
+            await readSessionJson(origin, imgEndpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Accept: "application/json" },
+              body: JSON.stringify(image)
+            });
+          } catch {}
+        }
       }
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;

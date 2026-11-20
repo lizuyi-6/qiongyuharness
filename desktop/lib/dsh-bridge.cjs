@@ -11,6 +11,59 @@ function textFromMessage(event) {
     .map((part) => part.text).join("");
 }
 
+function extractCheckedDeck(event) {
+  const message = event?.data?.message || event?.data || {};
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  let found = null;
+  for (const part of blocks) {
+    if (part?.type !== "tool-call" || part?.name !== "office_ppt_check") continue;
+    let args = part.arguments;
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); } catch { args = null; }
+    }
+    let deck = args?.deck;
+    if (typeof deck === "string") {
+      try { deck = JSON.parse(deck); } catch { deck = null; }
+    }
+    if (deck && typeof deck === "object" && Array.isArray(deck.slides) && deck.slides.length > 0) {
+      found = deck;
+    }
+  }
+  return found;
+}
+
+function selectBestOutput(assistantTexts, finalText, lastCheckedDeck) {
+  for (let i = assistantTexts.length - 1; i >= 0; i -= 1) {
+    const candidate = assistantTexts[i].trim();
+    const first = candidate.indexOf("{");
+    const last = candidate.lastIndexOf("}");
+    if (first !== -1 && last > first) {
+      const slice = candidate.slice(first, last + 1);
+      if (/"(?:reply|deck|plan|slides|verdict|goal|changes)"/.test(slice)) {
+        if (lastCheckedDeck && !/"slides"\s*:/.test(slice)) {
+          break;
+        }
+        return candidate;
+      }
+    }
+  }
+  if (lastCheckedDeck) {
+    const title = typeof lastCheckedDeck.title === "string" && lastCheckedDeck.title.trim()
+      ? lastCheckedDeck.title.trim().slice(0, 80)
+      : "演示文稿";
+    const plainNote = (finalText && !finalText.trim().startsWith("{"))
+      ? finalText.trim().slice(0, 1200)
+      : `已按要求完成《${title}》（共 ${lastCheckedDeck.slides.length} 页）的设计与排版校验。`;
+    return JSON.stringify({
+      action: "export",
+      kind: "pptx",
+      reply: plainNote,
+      deck: lastCheckedDeck
+    });
+  }
+  return finalText;
+}
+
 function abortError() {
   return Object.assign(new Error("已停止生成"), { code: "ABORTED" });
 }
@@ -55,6 +108,9 @@ function runDsh({
   let active = false;
   let promptSent = false;
   let finalText = "";
+  const assistantTexts = [];
+  let lastCheckedDeck = null;
+  let turnErrorMessage = "";
   let pending = "";
   const decoder = new StringDecoder("utf8");
   let processClosed = false;
@@ -71,12 +127,13 @@ function runDsh({
   };
   const succeed = () => {
     if (settled) return;
-    if (!finalText) {
-      fail(new Error("DSH 未返回文本结果"));
+    const chosen = selectBestOutput(assistantTexts, finalText, lastCheckedDeck);
+    if (!chosen) {
+      fail(new Error(turnErrorMessage || "DSH 未返回文本结果"));
       return;
     }
     settled = true;
-    resolveResult(finalText);
+    resolveResult(chosen);
   };
   const send = (message) => {
     if (!child.stdin.writable) throw new Error("DSH 输入通道已关闭");
@@ -105,7 +162,21 @@ function runDsh({
     if (params.sessionId !== runId) return;
     const event = params.event || {};
     if (event.type === "agent/inbox/spliced") active = true;
-    if (event.type === "assistant/message") finalText = textFromMessage(event) || finalText;
+    if (event.type === "assistant/message") {
+      const checkedDeck = extractCheckedDeck(event);
+      if (checkedDeck) lastCheckedDeck = checkedDeck;
+      const text = textFromMessage(event);
+      if (text && text.trim()) {
+        finalText = text;
+        assistantTexts.push(text);
+      }
+    }
+    if (event.type === "turn/end" && event.data?.reason?.kind === "error") {
+      const errMsg = event.data?.reason?.error?.message;
+      if (typeof errMsg === "string" && errMsg.trim()) {
+        turnErrorMessage = errMsg.trim().slice(0, 240);
+      }
+    }
     if (message.method === "session.status" && params.status === "idle" && active) succeed();
   }
 

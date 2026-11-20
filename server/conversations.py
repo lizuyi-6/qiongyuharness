@@ -409,23 +409,77 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
             }}
 
 
+def _repair_json_text(text: str) -> str:
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    stack: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch == '"':
+                out.append(ch)
+                in_string = False
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            elif code < 0x20:
+                out.append(" ")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"':
+                in_string = True
+                out.append(ch)
+            elif ch == "{":
+                stack.append("}")
+                out.append(ch)
+            elif ch == "[":
+                stack.append("]")
+                out.append(ch)
+            elif ch in ("}", "]") and stack and stack[-1] == ch:
+                stack.pop()
+                out.append(ch)
+            else:
+                out.append(ch)
+    if in_string:
+        out.append('"')
+    joined = re.sub(r",\s*([}\]])", r"\1", "".join(out))
+    joined = re.sub(r",\s*$", "", joined)
+    if stack:
+        joined += "".join(reversed(stack))
+    return re.sub(r",\s*([}\]])", r"\1", joined)
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
     cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.I)
-    try:
-        parsed = json.loads(cleaned)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
+    candidates = [cleaned]
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start != -1 and end > start:
-        try:
-            parsed = json.loads(cleaned[start:end + 1])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
+        candidates.append(cleaned[start:end + 1])
+    if start != -1:
+        candidates.append(cleaned[start:])
+    for cand in candidates:
+        for variant in (cand, re.sub(r",\s*([}\]])", r"\1", cand), _repair_json_text(cand)):
+            try:
+                parsed = json.loads(variant)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+    plain = re.sub(r"^\s*```(?:markdown|md|text)?\s*|\s*```\s*$", "", text.strip(), flags=re.I).strip()
+    if len(plain) >= 2 and not plain.startswith("{") and '"slides"' not in plain:
+        return {"action": "reply", "reply": plain[:6500]}
     fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
 
 
@@ -492,12 +546,7 @@ def office_file(decision, mode, image_blobs=()):
         deck = decision.deck.clean()
         name = safe_name(deck.title[:105]) + ".pptx"
         data = render_freeform_pptx(deck, image_blobs)
-        summary = {
-            "title": deck.title,
-            "subtitle": deck.subtitle,
-            "design": deck.design.model_dump(),
-            "slides": [{"title": slide.title, "notes": slide.notes[:200]} for slide in deck.slides],
-        }
+        summary = deck.model_dump()
         return kind, summary, name, data
     if not decision.plan:
         fail(502, "返回的文稿缺少内容结构")
@@ -686,6 +735,24 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
                 art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user["id"]))
                 if art and art["data"]:
                     image_blobs.append(bytes(art["data"]))
+        if not image_blobs:
+            prior_turns = db.all(
+                "SELECT result FROM office_turns WHERE conversation_id=? AND id!=? AND status IN ('completed','failed') ORDER BY created_at DESC LIMIT 8",
+                (key, run),
+            )
+            for p_row in prior_turns:
+                p_res = unpack(p_row["result"] or "{}")
+                p_imgs = p_res.get("images") or []
+                if not p_imgs:
+                    continue
+                for img_entry in p_imgs:
+                    fid = (img_entry.get("file") or {}).get("id") if isinstance(img_entry, dict) else None
+                    if fid:
+                        art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user["id"]))
+                        if art and art["data"]:
+                            image_blobs.append(bytes(art["data"]))
+                if image_blobs:
+                    break
 
     if len(payload.text.encode("utf-8")) > 512 * 1024:
         fail_turn(run, user, assignment, "模型响应超过 512 KB")
