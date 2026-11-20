@@ -302,23 +302,30 @@ export async function copyReply(index) {
   const turn = state.chatWorkspace?.session?.turns?.[Number(index)];
   const text = turn?.reply;
   if (!text) return;
+  // 桌面端会话拒绝全部权限检查，clipboard.writeText 可能被拒；被拒时改用 execCommand，并以其返回值判定是否成功。
+  let copied = false;
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(text);
-    } else {
-      const area = document.createElement("textarea");
+      copied = true;
+    }
+  } catch {}
+  if (!copied) {
+    const area = document.createElement("textarea");
+    try {
       area.value = text;
       area.style.position = "fixed";
       area.style.opacity = "0";
       document.body.append(area);
       area.select();
-      document.execCommand("copy");
+      copied = document.execCommand("copy") === true;
+    } catch {
+      copied = false;
+    } finally {
       area.remove();
     }
-    toastMessage("已复制回复内容");
-  } catch {
-    toastMessage("复制失败，请手动选择文本复制");
   }
+  toastMessage(copied ? "已复制回复内容" : "复制失败，请手动选择文本复制");
 }
 
 function turnView(turn, index) {

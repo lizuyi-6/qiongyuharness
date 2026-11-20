@@ -8,4 +8,4 @@ require("./image-broker.test.cjs");
 require("./runtime-env-image.test.cjs");
 require("./agent-image.test.cjs");
 require("./frontend-fixes.test.cjs");
-require("./image-preference.test.cjs");
+require("./chat-frontend.test.cjs");
