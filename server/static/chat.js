@@ -1960,6 +1960,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
     const job = {
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
       ...(prepared.wants_pptx ? { ppt_check: true } : {}),
+      ...(prepared.web_search ? { web_search: prepared.web_search } : {}),
       ...(enableImageTool ? { image_tool: true } : {})
     };
     return await runDesktopAgent(job, (label) => {

@@ -3,7 +3,7 @@ const path = require("node:path");
 const PASSTHROUGH_ENV = ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG"];
 
 function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, model, system, contextPath,
-  imageBrokerUrl, imageBrokerKey, dshBin }) {
+  imageBrokerUrl, imageBrokerKey, searchBrokerUrl, searchBrokerKey, dshBin }) {
   if (!home || !gatewayUrl || !gatewayKey || !model) throw new Error("桌面运行环境参数无效");
   const env = {};
   for (const name of PASSTHROUGH_ENV) {
@@ -18,19 +18,24 @@ function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, 
   env.QO_RUNTIME_KEY = gatewayKey;
   env.QO_RUNTIME_MODEL = model;
   env.DSH_SYSTEM_PROMPT = typeof system === "string" ? system : "";
-  if (contextPath || imageBrokerUrl || imageBrokerKey) {
+  if (contextPath || imageBrokerUrl || imageBrokerKey || searchBrokerUrl || searchBrokerKey) {
     if (!dshBin) throw new Error("缺少 DSH 执行路径");
   }
   if (contextPath) {
     env.QO_DSH_PLUGIN_CONTEXT = contextPath;
   }
-  if (contextPath || imageBrokerUrl || imageBrokerKey) {
+  if (contextPath || imageBrokerUrl || imageBrokerKey || searchBrokerUrl || searchBrokerKey) {
     env.QO_DSH_EXECUTABLE = dshBin;
   }
   if (imageBrokerUrl || imageBrokerKey) {
     if (!imageBrokerUrl || !imageBrokerKey) throw new Error("图片服务凭证无效");
     env.QO_IMAGE_BROKER_URL = imageBrokerUrl;
     env.QO_IMAGE_BROKER_KEY = imageBrokerKey;
+  }
+  if (searchBrokerUrl || searchBrokerKey) {
+    if (!searchBrokerUrl || !searchBrokerKey) throw new Error("联网搜索服务凭证无效");
+    env.QO_SEARCH_BROKER_URL = searchBrokerUrl;
+    env.QO_SEARCH_BROKER_KEY = searchBrokerKey;
   }
   return env;
 }

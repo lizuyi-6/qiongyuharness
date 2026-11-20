@@ -12,6 +12,7 @@ const { sessionFetch } = require("./lib/session-cookie.cjs");
 const { quotaExhaustionMessage, requestUsage, USAGE_TIMEOUT_MS } = require("./lib/usage.cjs");
 const { createImageGenerator } = require("./lib/image-gen.cjs");
 const { createImageBroker } = require("./lib/image-broker.cjs");
+const { createSearchBroker } = require("./lib/search-broker.cjs");
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -45,6 +46,7 @@ const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
 const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
 const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
 const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：当制作 PPT 需要封面主视觉、章节过渡或关键配图，或用户明确需要图片时，可按需调用 office_image_generate（按张计费，不限张数）；制作 PPT 时提示词强调画面无文字，并用返回的 image_index 填入 deck.slides 的 bg_image 或 image 元素；不要在 reply 文字中输出图片链接、Markdown 图片或 base64；不需要配图的纯文字问答不要调用。";
+const SEARCH_TOOL_INSTRUCTIONS = "DeepSeek 联网搜索工具使用说明（强制要求）：本轮已提供 web_search 与 web_fetch 工具。在给出最终答复、文档或 PPT 之前，你必须至少调用 1 次 web_search（传入 1–4 条关键词）检索最新权威资料，需要精读某条来源时调用 web_fetch，并在回答中注明来源链接。未调用 web_search 将被程序拦截重写。";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -252,6 +254,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
   });
   const imageGenerateImpl = dependencies.imageGenerate || generateImage;
   const createImageBrokerImpl = dependencies.createImageBroker || createImageBroker;
+  const createSearchBrokerImpl = dependencies.createSearchBroker || createSearchBroker;
 
   async function loadPipelineConfig(origin) {
     const payload = await readSessionJson(origin, `${origin}/api/v1/me/pipeline`);
@@ -343,17 +346,29 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     const imageModels = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
     const imageToolEnabled = job.image_tool === true && imageModels.length > 0;
     const pptCheckEnabled = job.ppt_check === true;
+    let webSearchEnabled = job.web_search?.enabled === true;
+    let webSearchRequired = job.web_search?.required === true;
+    if (job.web_search === undefined && origin) {
+      try {
+        const searchStatus = await readSessionJson(origin, `${origin}/api/v1/search/status`);
+        webSearchEnabled = searchStatus?.configured === true;
+        webSearchRequired = Boolean(webSearchEnabled && searchStatus?.required !== false);
+      } catch {}
+    }
     const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 ? job.max_images : null;
     const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
     ensureNotAborted();
     const { credential } = await getCredentialImpl(origin);
     ensureNotAborted();
     let imageBroker;
+    let searchBroker;
 
     const toolDisplayNames = {
       office_context_read: "读取授权项目资料",
       office_image_generate: "生成专属配图",
-      office_ppt_check: "校验 PPT 自由画布排版"
+      office_ppt_check: "校验 PPT 自由画布排版",
+      web_search: "联网搜索（DeepSeek Search）",
+      web_fetch: "读取网页全文"
     };
 
     async function runStage(stage) {
@@ -362,6 +377,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       let gateway;
       const stageImageEnabled = Boolean(imageToolEnabled && imageBroker && stage.withImages !== false);
       const stagePptCheckEnabled = Boolean(pptCheckEnabled && stage.withImages !== false);
+      const stageSearchEnabled = Boolean(webSearchEnabled && searchBroker && stage.withSearch !== false);
       let thinkingBuffer = "";
       let thinkingTimer = null;
       let contentChars = 0;
@@ -404,6 +420,14 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             { encoding: "utf8", mode: 0o600 });
           extraPatchPaths.push(checkPatchPath);
         }
+        if (stageSearchEnabled) {
+          const searchPatchPath = path.join(place, "office-web-search.patch.yml");
+          const searchPluginPath = path.join(runtimePaths.harnessRoot, "office-web-search.mjs").replaceAll("\\", "/");
+          await fs.writeFile(searchPatchPath,
+            `- insert:\n    - id: office-web-search\n      name: ${JSON.stringify(searchPluginPath)}\n`,
+            { encoding: "utf8", mode: 0o600 });
+          extraPatchPaths.push(searchPatchPath);
+        }
 
         gateway = await makeGateway({
           baseUrl: credential.baseUrl,
@@ -412,7 +436,8 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           allowedTools: [
             ...(contextPath ? ["office_context_read"] : []),
             ...(stageImageEnabled ? ["office_image_generate"] : []),
-            ...(stagePptCheckEnabled ? ["office_ppt_check"] : [])
+            ...(stagePptCheckEnabled ? ["office_ppt_check"] : []),
+            ...(stageSearchEnabled ? ["web_search", "web_fetch"] : [])
           ],
           stickyQuotaError: pipelineRequested,
           fetchImpl: (url, options) => net.fetch(url, options),
@@ -453,6 +478,10 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           ...(stageImageEnabled ? {
             imageBrokerUrl: imageBroker.url,
             imageBrokerKey: imageBroker.key
+          } : {}),
+          ...(stageSearchEnabled ? {
+            searchBrokerUrl: searchBroker.url,
+            searchBrokerKey: searchBroker.key
           } : {}),
           dshBin: runtimePaths.dshBin
         });
@@ -523,10 +552,37 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           now: clockNow
         });
       }
+      if (webSearchEnabled) {
+        searchBroker = await createSearchBrokerImpl({
+          search: (payload, { signal: reqSignal }) => readSessionJson(origin, `${origin}/api/v1/search/query`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(payload),
+            signal: reqSignal
+          }),
+          fetchPage: (payload, { signal: reqSignal }) => readSessionJson(origin, `${origin}/api/v1/search/fetch`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(payload),
+            signal: reqSignal
+          }),
+          onSearch: (queries) => {
+            const label = queries.slice(0, 3).join(" / ").slice(0, 100);
+            emit({ type: "step", label: `DeepSeek 搜索：${label}` });
+          },
+          onFetch: (targetUrl) => {
+            let host = targetUrl;
+            try { host = new URL(targetUrl).hostname; } catch {}
+            emit({ type: "step", label: `读取网页：${host}` });
+          }
+        });
+      }
+      const extraSystemParts = [];
+      if (imageBroker) extraSystemParts.push(IMAGE_TOOL_INSTRUCTIONS);
+      if (searchBroker && webSearchRequired) extraSystemParts.push(SEARCH_TOOL_INSTRUCTIONS);
+      const effectiveSystem = extraSystemParts.length ? `${job.system}\n\n${extraSystemParts.join("\n\n")}` : job.system;
       if (pipelineRequested) {
-        const pipelineJob = imageBroker
-          ? { ...job, system: `${job.system}\n\n${IMAGE_TOOL_INSTRUCTIONS}` }
-          : job;
+        const pipelineJob = { ...job, system: effectiveSystem };
         const pipelineResult = await runPipeline({
           job: pipelineJob,
           config,
@@ -536,21 +592,37 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           now: clockNow,
           startedAt,
           signal,
-          getGeneratedImageCount: () => imageBroker?.images.length || 0
+          getGeneratedImageCount: () => imageBroker?.images.length || 0,
+          requireSearch: Boolean(searchBroker && webSearchRequired),
+          getSearchCount: () => searchBroker?.searchCount || 0
         });
         return {
           ...pipelineResult,
           ...(imageBroker?.images.length ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
         };
       }
-      const result = await runStage({
+      let result = await runStage({
         role: "execute",
         model: job.model,
-        system: imageBroker ? `${job.system}\n\n${IMAGE_TOOL_INSTRUCTIONS}` : job.system,
+        system: effectiveSystem,
         prompt: job.prompt,
         withContext: hasContext,
+        withSearch: Boolean(searchBroker),
         timeoutMs: STAGE_TIMEOUT_MS
       });
+      if (searchBroker && webSearchRequired && searchBroker.searchCount < 1) {
+        emit({ type: "step", label: "程序校验：尚未联网搜索，正在强制调用 DeepSeek 搜索" });
+        result = await runStage({
+          role: "execute",
+          model: job.model,
+          system: effectiveSystem,
+          prompt: `${job.prompt}\n\n【程序强制拦截】本轮强制要求先调用 web_search（DeepSeek 联网搜索）检索最新资料后再作答。你刚才未调用 web_search，请立即调用 web_search（传入 1–4 个关键词），基于检索结果重新输出完整 JSON 交付物！`,
+          withContext: hasContext,
+          withImages: !(imageBroker?.images.length),
+          withSearch: true,
+          timeoutMs: STAGE_TIMEOUT_MS
+        });
+      }
       emit({ type: "step", label: "处理完成" });
       return {
         text: result.text,
@@ -569,6 +641,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       throw error;
     } finally {
       await imageBroker?.close().catch(() => {});
+      await searchBroker?.close().catch(() => {});
     }
     } finally {
       activeRuns.delete(controller);

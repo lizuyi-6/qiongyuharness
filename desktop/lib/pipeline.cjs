@@ -153,7 +153,9 @@ function runPipeline({
   now = Date.now,
   startedAt = now(),
   signal,
-  getGeneratedImageCount = () => 0
+  getGeneratedImageCount = () => 0,
+  requireSearch = false,
+  getSearchCount = () => 0
 }) {
   return (async () => {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" ||
@@ -207,7 +209,7 @@ function runPipeline({
       return true;
     }
 
-    async function callValidatedStage({ role, model, system, prompt, withContext, withImages = false, parser }) {
+    async function callValidatedStage({ role, model, system, prompt, withContext, withImages = false, withSearch = false, enforceSearch = false, parser }) {
       let currentPrompt = prompt;
       let stageWithImages = withImages;
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -217,7 +219,7 @@ function runPipeline({
         calls += 1;
         let result;
         try {
-          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, withImages: stageWithImages, timeoutMs, signal });
+          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, withImages: stageWithImages, withSearch, timeoutMs, signal });
         } catch (error) {
           if (error?.code === "ABORTED" || signal?.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
           if (error?.quota_error) throw error;
@@ -229,6 +231,20 @@ function runPipeline({
         const usage = isObject(result?.usage) ? result.usage : {};
         try {
           const parsed = parser(result?.text);
+          if (enforceSearch && Number(getSearchCount()) < 1) {
+            if (attempt === 0 && canStartStage()) {
+              stages.push({ role, model, outcome: "format_error", usage });
+              emit({ type: "step", label: "程序校验：尚未联网搜索，正在强制调用 DeepSeek 搜索" });
+              const imageCount = Number(getGeneratedImageCount()) || 0;
+              const imageReuseNote = stageWithImages && imageCount > 0
+                ? ` 本轮已生成 ${imageCount} 张图片（image_index 为 1 至 ${imageCount}），请直接复用已有 image_index，不要重新生图。`
+                : "";
+              if (imageCount > 0) stageWithImages = false;
+              currentPrompt = `${prompt}\n\n【程序强制拦截】本轮强制要求先调用 web_search（DeepSeek 联网搜索）检索最新资料后再作答。你刚才未调用 web_search，请立即调用 web_search（传入 1–4 个关键词），基于检索到的最新事实重新输出完整 JSON 交付物！${imageReuseNote}`;
+              continue;
+            }
+            addIssue(issues, "模型未在限定重试内执行强制联网搜索");
+          }
           stages.push({ role, model, outcome: role === "accept" || role === "review" ? parsed.verdict : "ok", usage });
           return { parsed, text: JSON.stringify(parsed) };
         } catch (error) {
@@ -277,6 +293,8 @@ function runPipeline({
         prompt: job.prompt,
         withContext: hasContext,
         withImages: true,
+        withSearch: true,
+        enforceSearch: requireSearch,
         parser: parseDeliverable
       });
       if (!light.parsed) {
@@ -306,6 +324,8 @@ function runPipeline({
         prompt: job.prompt,
         withContext: hasContext,
         withImages: true,
+        withSearch: true,
+        enforceSearch: requireSearch && round === 1,
         parser: parseDeliverable
       });
       if (result.parsed) finalText = result.text;

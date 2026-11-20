@@ -476,6 +476,10 @@ export function settingsView() {
         : "企业统一网关";
   const desktopVersion = isDesktopApp ? formatVersion(detectDesktopVersion()) : "";
   const serverVersion = formatVersion(state.config?.version);
+  const webSearch = state.config?.web_search;
+  const webSearchLabel = webSearch?.configured
+    ? (webSearch.required ? "DeepSeek Search · 已启用（强制搜索）" : "DeepSeek Search · 已启用")
+    : "DeepSeek Search · 待补入密钥";
   const updateBody = renderUpdatePanelBody();
   return `${pageHead("设置")}
    <div class="settings-grid">
@@ -506,6 +510,7 @@ export function settingsView() {
          <div class="engine-card-row"><span>运行方式</span><strong>${e(engineLabel)}</strong></div>
          ${state.engine?.model ? `<div class="engine-card-row"><span>默认模型</span><strong class="mono">${e(state.engine.model)}</strong></div>` : ""}
          <div class="engine-card-row"><span>当前环境</span><strong>${isDesktopApp ? "穹驭办公桌面端" : "网页端"}</strong></div>
+         <div class="engine-card-row"><span>联网搜索</span><strong>${e(webSearchLabel)}</strong></div>
          ${isDesktopApp ? `<div class="engine-card-row"><span>客户端版本</span><strong class="mono">${e(desktopVersion || "桌面版")}</strong></div>` : ""}
          ${serverVersion ? `<div class="engine-card-row"><span>工作台版本</span><strong class="mono">${e(serverVersion)}</strong></div>` : ""}
        </div>

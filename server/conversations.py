@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from . import gateway, prompting
+from . import gateway, prompting, search
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
 from .identity import fail
 from .office import DeckSpec, Plan, add_file, clean_text, coerce_deck_spec, powerpoint, render_freeform_pptx, safe_name, word
@@ -352,7 +352,7 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
         if gateway.MODE in {"dsh", "desktop"}:
             prompt = {"请求": body.message, "说明": "先调用 office_context_read 获取选区与资料。"}
         return {"kind": "slide", "system": prompting.SLIDE_SYSTEM, "prompt": pack(prompt), "context": context,
-                "preset_step": None}
+                "preset_step": None, "wants_pptx": False, "web_search": {"enabled": False, "required": False}}
 
     task_fields = {name: task[name] for name in ("title", "description", "deliverable", "due_at")} if task else None
     plan = latest.get("plan") if latest else None
@@ -373,11 +373,16 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
         payload["项目"] = project
         payload["参考资料"] = []
         payload["接入说明"] = "先调用 office_context_read，获取本轮授权资料。"
+    web_search = search.search_status()
+    require_search = bool(web_search["configured"] and web_search["required"])
     return {"kind": "conversation",
-            "system": prompting.conversation_system(body.mode, operation, genre, include_pptx=include_pptx),
+            "system": prompting.conversation_system(body.mode, operation, genre,
+                                                    include_pptx=include_pptx,
+                                                    require_web_search=require_search),
             "prompt": pack(payload), "context": plugin_context,
             "preset_step": prompting.steps_label(operation, genre),
-            "wants_pptx": include_pptx}
+            "wants_pptx": include_pptx,
+            "web_search": {"enabled": bool(web_search["configured"]), "required": require_search}}
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -626,6 +631,7 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
     return {"run_id": run, "kind": prompt_data["kind"], "system": prompt_data["system"],
             "prompt": prompt_data["prompt"], "context": prompt_data["context"],
             "steps": [*steps, "正在整理回复"], "wants_pptx": bool(prompt_data.get("wants_pptx")),
+            "web_search": prompt_data.get("web_search") or {"enabled": False, "required": False},
             "body": body, "user": user, "assignment": assignment,
             "task": task, "sources": sources, "recent": recent, "latest": latest,
             "project": project, "scope": scope, "target": target, "engine": engine,
@@ -889,7 +895,7 @@ async def prepare_turn_route(key: str, body: TurnRequest, user: User):
     prepared = await prepare_conversation(key, body, user, engine="desktop")
     if "replay" in prepared:
         fail(409, "本轮请求已经提交，请等待执行完成")
-    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps", "wants_pptx")}
+    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps", "wants_pptx", "web_search")}
 
 
 @router.post("/{key}/turns/{run}/complete")
