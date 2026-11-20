@@ -18,7 +18,7 @@ test("运行时裁剪只匹配指定的开发期文件后缀", async () => {
 
 test("electron-builder 配置指向 7z 运行时并保留 NSIS 默认压缩类型", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(DESKTOP_ROOT, "package.json"), "utf8"));
-  assert.equal(packageJson.version, "0.2.2");
+  assert.equal(packageJson.version, "0.2.4");
   assert.deepEqual(packageJson.build.extraResources, [{ from: "runtime-stage/qo-runtime.7z", to: "qo-runtime.7z" }]);
   assert.deepEqual(packageJson.build.electronLanguages, ["zh-CN", "en-US"]);
   assert.equal(packageJson.build.nsis.oneClick, false);

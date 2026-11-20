@@ -1,4 +1,5 @@
 import hashlib
+import math
 import re
 import socket
 import struct
@@ -37,12 +38,35 @@ WORD_PART = re.compile(r"word/(document|header\d+|footer\d+|footnotes|endnotes)\
 SLIDE_PART = re.compile(r"ppt/slides/slide(\d+)\.xml$")
 
 
-class Section(BaseModel):
-    heading: str = Field(min_length=1, max_length=80)
-    points: list[str] = Field(min_length=1, max_length=8)
+class Table(BaseModel):
+    columns: list[str] = Field(min_length=2, max_length=5)
+    rows: list[list[str]] = Field(min_length=1, max_length=8)
 
     def clean(self):
-        return Section(heading=clean_text(self.heading, 80), points=[clean_text(point, 600) for point in self.points])
+        columns = [clean_text(" ".join(cell.split()), 40) for cell in self.columns]
+        rows = []
+        for row in self.rows:
+            if len(row) > len(columns):
+                fail(422, "表格某一行的格数多于表头")
+            # 短行补空格子，避免整份文稿因一行少写一格而失败；多写的格子不截断，直接拒绝。
+            rows.append([clean_text(" ".join(cell.split()), 80, False) for cell in row] + [""] * (len(columns) - len(row)))
+        return Table(columns=columns, rows=rows)
+
+
+class Section(BaseModel):
+    heading: str = Field(min_length=1, max_length=80)
+    points: list[str] = Field(default_factory=list, max_length=8)
+    conclusion: str = Field(default="", max_length=200)
+    notes: str = Field(default="", max_length=2000)
+    table: Table | None = None
+
+    def clean(self):
+        if not self.points and not self.table:
+            fail(422, "每一节至少需要一条要点或一张表格")
+        return Section(heading=clean_text(self.heading, 80), points=[clean_text(point, 600) for point in self.points],
+                       conclusion=clean_text(" ".join(self.conclusion.split()), 200, False),
+                       notes=clean_text(self.notes, 2000, False),
+                       table=self.table.clean() if self.table else None)
 
 
 class Plan(BaseModel):
@@ -274,6 +298,19 @@ def word(plan):
         doc.add_heading(section.heading, 1)
         for point in section.points:
             doc.add_paragraph(point)
+        if section.table:
+            table = doc.add_table(rows=1 + len(section.table.rows), cols=len(section.table.columns))
+            table.style = "Table Grid"
+            for row_index, row in enumerate([section.table.columns, *section.table.rows]):
+                for col_index, value in enumerate(row):
+                    cell = table.cell(row_index, col_index)
+                    cell.text = value
+                    if row_index == 0:
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
+            doc.add_paragraph()
+        if section.conclusion:
+            doc.add_paragraph().add_run("结论：" + conclusion_text(section.conclusion)).bold = True
     doc.core_properties.author = "穹驭办公"
     doc.core_properties.title = plan.title
     out = BytesIO()
@@ -307,19 +344,154 @@ def deck_text(slide, text, x, y, width, height, size, color, bold=False):
     return shape
 
 
+PAGE_POINTS = 6
+TABLE_PAGE_POINTS = 3
+CJK = re.compile(r"[⺀-鿿豈-﫿＀-￯　-〿]")
+
+
+def conclusion_text(text):
+    return re.sub(r"^\s*结论\s*[:：]\s*", "", text)
+
+
+def text_em(text):
+    return sum(1.0 if CJK.match(char) else 0.56 for char in text)
+
+
+def fit_text(text, width, height, sizes):
+    """按估算的换行行数选能放下的最大字号，返回 (字号, 实际占用高度英寸)。都放不下时用最小字号。"""
+    for size in sizes:
+        per_line = max(1.0, width * 72 / size * 0.94)
+        lines = max(1, math.ceil(text_em(text) / per_line))
+        used = lines * size * 1.32 / 72
+        if used <= height or size == sizes[-1]:
+            return size, used
+    return sizes[-1], height
+
+
+def split_point(point):
+    """"小标题：说明" 拆成 (小标题, 说明)；没有合适的小标题时返回 ("", 原文)。"""
+    for mark in ("：", ":"):
+        label, sep, body = point.partition(mark)
+        if sep and 1 <= len(label.strip()) <= 16 and body.strip():
+            return label.strip(), body.strip()
+    return "", point
+
+
 def paginate_deck(plan):
     pages = []
     for part in plan.sections:
-        lines = []
-        for point in part.points:
-            lines.extend(chunk[i:i+82] for chunk in point.splitlines() for i in range(0, len(chunk), 82) if chunk)
-        for offset in range(0, len(lines), 4):
-            suffix = "（续）" if offset else ""
+        points = [" ".join(point.split()) for point in part.points]
+        first = TABLE_PAGE_POINTS if part.table else PAGE_POINTS
+        chunks = [points[:first]] + [points[i:i+PAGE_POINTS] for i in range(first, len(points), PAGE_POINTS)]
+        for index, chunk in enumerate(chunks):
+            suffix = "（续）" if index else ""
             pages.append(Section(heading=part.heading + suffix if len(part.heading) < 77 else part.heading,
-                                 points=lines[offset:offset+4]))
+                                 points=chunk, conclusion=part.conclusion if index == len(chunks) - 1 else "",
+                                 notes=part.notes if index == 0 else "", table=part.table if index == 0 else None))
     if len(pages) > 30:
         fail(422, "演示内容超过 30 页，请精简段落后再生成")
     return pages
+
+
+def deck_cards(slide, points, x, y, width, height):
+    count = len(points)
+    columns = 2 if count == 4 else count
+    rows = 2 if count == 4 else 1
+    gap = .28
+    card_w = (width - gap * (columns - 1)) / columns
+    card_h = (height - gap * (rows - 1)) / rows
+    for index, point in enumerate(points):
+        cx = x + (index % columns) * (card_w + gap)
+        cy = y + (index // columns) * (card_h + gap)
+        deck_box(slide, cx, cy, card_w, card_h, "FFFFFF")
+        deck_box(slide, cx, cy, card_w, .06, "345BDD")
+        label, body = split_point(point)
+        inner_w = card_w - .5
+        top = cy + .28
+        if label:
+            size, used = fit_text(label, inner_w, .85, (20, 18, 16, 15, 14))
+            deck_text(slide, label, cx + .25, top, inner_w, used + .05, size, "19284F", True)
+            top += used + .18
+        body_h = cy + card_h - .22 - top
+        size, _ = fit_text(body, inner_w, body_h, (20, 18, 17, 16, 15, 14, 13, 12, 11))
+        deck_text(slide, body, cx + .25, top, inner_w, body_h, size, "30405C")
+
+
+def deck_rows(slide, points, x, y, width, height):
+    count = len(points)
+    row_h = height / count
+    labelled = any(split_point(point)[0] for point in points)
+    label_w = 2.55 if labelled else 0
+    for index, point in enumerate(points):
+        ry = y + index * row_h
+        label, body = split_point(point)
+        if labelled:
+            text = label or "要点"
+            size, used = fit_text(text, label_w - .25, row_h - .12, (17, 16, 15, 14, 13))
+            deck_text(slide, text, x + .25, ry + max(.06, (row_h - used) / 2), label_w - .25, used + .05, size, "2D4FC4", True)
+        else:
+            deck_box(slide, x + .05, ry + row_h / 2 - .035, .07, .07, "345BDD")
+        body_x = x + (label_w + .2 if labelled else .3)
+        body_w = width - (body_x - x)
+        size, used = fit_text(body, body_w, row_h - .1, (17, 16, 15, 14, 13, 12, 11))
+        deck_text(slide, body, body_x, ry + max(.05, (row_h - used) / 2), body_w, min(used + .05, row_h), size, "30405C")
+        if index < count - 1:
+            deck_box(slide, x, ry + row_h - .006, width, .012, "D6DFF2")
+
+
+def deck_table(slide, table, x, y, width, height):
+    columns = len(table.columns)
+    first_w = width * (.24 if columns >= 3 else .34)
+    other_w = (width - first_w) / (columns - 1)
+    widths = [first_w] + [other_w] * (columns - 1)
+    lines = [table.columns, *table.rows]
+    row_h = min(.72, height / len(lines))
+    for row_index, row in enumerate(lines):
+        cx = x
+        ry = y + row_index * row_h
+        for col_index, value in enumerate(row):
+            header = row_index == 0
+            fill = "345BDD" if header else ("FFFFFF" if row_index % 2 else "EEF2FB")
+            deck_box(slide, cx, ry, widths[col_index] - .02, row_h - .02, fill)
+            if value:
+                size, used = fit_text(value, widths[col_index] - .24, row_h - .1, (16, 15, 14, 13, 12, 11, 10))
+                color = "FFFFFF" if header else ("19284F" if col_index == 0 else "30405C")
+                deck_text(slide, value, cx + .12, ry + max(.04, (row_h - used) / 2), widths[col_index] - .24,
+                          min(used + .04, row_h - .04), size, color, header or col_index == 0)
+            cx += widths[col_index]
+    return row_h * len(lines)
+
+
+def deck_page(slide, part, number):
+    deck_box(slide, 0, 0, 13.333, 7.5, "F6F8FD")
+    deck_box(slide, .83, .66, .07, .46, "345BDD")
+    size, _ = fit_text(part.heading, 11.3, .8, (28, 25, 22, 19))
+    deck_text(slide, part.heading, 1.0, .6, 11.3, .8, size, "19284F", True)
+    x, width, top, bottom = 1.0, 11.33, 1.62, 6.6
+    if part.conclusion:
+        text = "结论：" + conclusion_text(part.conclusion)
+        bar_h = .66
+        bar_y = 6.6 - bar_h
+        deck_box(slide, x, bar_y, width, bar_h, "E6EDFF")
+        deck_box(slide, x, bar_y, .08, bar_h, "345BDD")
+        size, used = fit_text(text, width - .5, bar_h - .14, (17, 16, 15, 14, 13, 12))
+        deck_text(slide, text, x + .3, bar_y + (bar_h - used) / 2, width - .5, used + .04, size, "1F3FAF", True)
+        bottom = bar_y - .22
+    area = bottom - top
+    if part.table:
+        points_h = min(len(part.points) * .62, area * .38) if part.points else 0
+        used = deck_table(slide, part.table, x, top, width, area - points_h - (.2 if points_h else 0))
+        if part.points:
+            deck_rows(slide, part.points, x, top + used + .2, width, bottom - (top + used + .2))
+    elif part.points and len(part.points) <= 4:
+        deck_cards(slide, part.points, x, top, width, area)
+    elif part.points:
+        deck_rows(slide, part.points, x, top, width, area)
+    if part.notes:
+        slide.notes_slide.notes_text_frame.text = part.notes
+    deck_box(slide, 1.0, 6.82, 11.25, .012, "D6DFF2")
+    deck_text(slide, "穹驭办公", 1.0, 7.0, 4, .31, 10, "50618A")
+    deck_text(slide, f"{number:02}", 11.7, 7.0, .5, .31, 10, "50618A")
 
 
 def powerpoint(plan):
@@ -334,17 +506,7 @@ def powerpoint(plan):
     deck_text(cover, plan.title, 0.85, 2.53, 9.1, 2.35, 34 if len(plan.title) < 50 else 25, "FFFFFF", True)
     deck_text(cover, plan.subtitle or "项目资料", 0.85, 5.14, 9.1, 1.25, 17, "CBD6FA")
     for i, part in enumerate(paginate_deck(plan), 2):
-        slide = prs.slides.add_slide(blank)
-        deck_box(slide, 0, 0, 13.333, 7.5, "F6F8FD")
-        deck_box(slide, .83, .78, .07, .43, "345BDD")
-        deck_text(slide, part.heading, 1.0, .73, 11.45, 1.05, 28 if len(part.heading) < 34 else 19, "19284F", True)
-        for j, point in enumerate(part.points):
-            y = 2.0 + j * 1.05
-            deck_box(slide, 1.02, y + .14, .065, .065, "345BDD")
-            deck_text(slide, point, 1.23, y, 10.98, .91, 17 if len(point) <= 60 else 15, "30405C")
-        deck_box(slide, 1.0, 6.82, 11.25, .012, "D6DFF2")
-        deck_text(slide, "穹驭办公", 1.0, 7.0, 4, .31, 10, "50618A")
-        deck_text(slide, f"{i:02}", 11.7, 7.0, .5, .31, 10, "50618A")
+        deck_page(prs.slides.add_slide(blank), part, i)
     prs.core_properties.title = plan.title
     prs.core_properties.author = "穹驭办公"
     out = BytesIO()

@@ -33,9 +33,9 @@ Electron Builder 配置将 `runtime-stage/qo-runtime.7z` 放到安装目录的 `
 本机网关只接收带本轮随机 bearer key 的 `POST /v1/chat/completions`：
 
 - 请求体最大 2 MiB，响应最大 3 MiB；请求中的模型必须等于本轮选择的模型。
-- `max_tokens` 缺省或为 0 时使用 3500，超过 3500 时夹到 3500；小于 1 或非整数输入会按请求格式错误拒绝。
+- 不再自设输出上限：glm-5.3 / step-5-preview / deepseek-v4.1-flash-1017 / k3.1-pro 按官方单次输出上限下发 `max_tokens`，并统一用各自最高的 `reasoning_effort`（step 为 high，其余为 max）；表外模型两者都不下发。DSH 请求里的这两个值会被覆盖。
 - 每轮最多接受 4 次模型调用；只有本轮上下文授权的 `office_context_read` 工具可以出现，未授权时不接受工具或工具调用。其他远程请求由 DSH 桥拒绝。
-- Harness 使用 `sdk-minimal` profile，不使用名为 `desktop` 的 profile。DSH 调用超时为 95 秒。
+- Harness 使用 `sdk-minimal` profile，不使用名为 `desktop` 的 profile。单次上游模型调用最长 600 秒，DSH 单阶段最长 620 秒，智能分工全程最长 25 分钟。
 
 这是本地请求边界，sub2api 仍是模型授权、分组策略、计费和实际用量的依据。若上游分组启用了“账号级破甲”，其提示词改写可能与穹驭办公的 JSON 输出约定冲突；为穹驭办公分组选择未开启破甲的上游账号。
 

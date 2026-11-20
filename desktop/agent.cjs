@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { createLoopbackGateway } = require("./lib/loopback-gateway.cjs");
 const { runDsh } = require("./lib/dsh-bridge.cjs");
-const { runPipeline } = require("./lib/pipeline.cjs");
+const { STAGE_TIMEOUT_MS, runPipeline } = require("./lib/pipeline.cjs");
 const { listModelsWithRefresh, modelServiceCode, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
@@ -483,7 +483,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         system: imageBroker ? `${job.system}\n\n${IMAGE_TOOL_INSTRUCTIONS}` : job.system,
         prompt: job.prompt,
         withContext: hasContext,
-        timeoutMs: imageBroker ? 240_000 : 95_000
+        timeoutMs: STAGE_TIMEOUT_MS
       });
       emit({ type: "step", label: "处理完成" });
       return {

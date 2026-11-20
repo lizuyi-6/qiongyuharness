@@ -36,6 +36,7 @@
             models:
               - id: !!js process.env.QO_RUNTIME_MODEL
                 contextWindow: 128000
+                # 仅供 DSH 内部预算（compaction 预留）；发给上游的 max_tokens 由桌面回环网关按模型官方上限改写。
                 maxTokens: 3500
                 reasoningEfforts: false
             compat:

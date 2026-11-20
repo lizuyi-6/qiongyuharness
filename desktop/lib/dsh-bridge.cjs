@@ -1,7 +1,7 @@
 const { randomUUID } = require("node:crypto");
 const { spawn } = require("node:child_process");
 const { StringDecoder } = require("node:string_decoder");
-const { RESPONSE_LIMIT, TOKEN_LIMIT } = require("./loopback-gateway.cjs");
+const { RESPONSE_LIMIT } = require("./loopback-gateway.cjs");
 const { buildDshArgs } = require("./runtime-env.cjs");
 
 function textFromMessage(event) {
@@ -26,7 +26,7 @@ function runDsh({
   model,
   prompt,
   onEvent = () => {},
-  timeoutMs = 95_000,
+  timeoutMs = 620_000,
   signal,
   spawnImpl = spawn
 }) {
@@ -140,7 +140,6 @@ function runDsh({
       cwd,
       provider: "company",
       model,
-      maxTokens: TOKEN_LIMIT,
       approvalRequests: true
     } });
   } catch {

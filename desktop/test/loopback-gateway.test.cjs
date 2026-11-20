@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createLoopbackGateway } = require("../lib/loopback-gateway.cjs");
+const { MODEL_OUTPUT_LIMITS, createLoopbackGateway } = require("../lib/loopback-gateway.cjs");
 const { quotaExhaustionMessage } = require("../lib/usage.cjs");
 const { readJson, sseResponse, startServer } = require("./helpers.cjs");
 
@@ -37,24 +37,37 @@ test("回环网关拒绝未放行的工具和错误模型", async (t) => {
   assert.equal(wrongToken.status, 403);
 });
 
-test("回环网关把 5000 max_tokens 夹到 3500 并记录事件与 SSE usage", async (t) => {
-  let forwarded;
+test("已知模型一律按官方单次输出上限下发 max_tokens，忽略 DSH 请求值，并记录 SSE usage", async (t) => {
+  const forwarded = [];
   const upstream = await startServer(async (request, response) => {
-    forwarded = await readJson(request);
+    forwarded.push(await readJson(request));
     sseResponse(response, { usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 } });
   });
-  const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
-  t.after(async () => { await gateway.close(); await upstream.close(); });
+  t.after(async () => { await upstream.close(); });
 
-  const response = await post(gateway, validRequest({ max_tokens: 5000 }));
-  assert.equal(response.status, 200);
-  assert.equal(forwarded.max_tokens, 3500);
-  assert.deepEqual(gateway.usage, { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 });
-  assert.deepEqual(gateway.max_tokens_clamped, [{ requested: 5000, applied: 3500 }]);
-  assert.equal(await response.text().then((value) => value.includes("fake model response")), true);
+  const expected = {
+    "glm-5.3": 131072,
+    "step-5-preview": 64000,
+    "deepseek-v4.1-flash-1017": 393216,
+    "k3.1-pro": 131072
+  };
+  assert.deepEqual({ ...MODEL_OUTPUT_LIMITS }, expected);
+  for (const [model, limit] of Object.entries(expected)) {
+    const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model });
+    forwarded.length = 0;
+    for (const extra of [{ max_tokens: 3500 }, { max_tokens: 5000 }, { max_tokens: null }, { max_tokens: 0 }, {}]) {
+      const response = await post(gateway, validRequest({ model, ...extra }));
+      assert.equal(response.status, 200);
+      assert.equal(await response.text().then((value) => value.includes("fake model response")), true);
+    }
+    assert.deepEqual(forwarded.map((request) => request.max_tokens), [limit, limit, limit, limit, limit], model);
+    assert.deepEqual(gateway.usage, { prompt_tokens: 20, completion_tokens: 25, total_tokens: 45 });
+    assert.deepEqual(gateway.max_tokens_clamped, []);
+    await gateway.close();
+  }
 });
 
-test("回环网关拒绝非正 max_tokens，null 和缺省值使用 3500 且不记夹逼", async (t) => {
+test("表外模型不下发 max_tokens，交给上游默认值", async (t) => {
   const forwarded = [];
   const upstream = await startServer(async (request, response) => {
     forwarded.push(await readJson(request));
@@ -63,17 +76,13 @@ test("回环网关拒绝非正 max_tokens，null 和缺省值使用 3500 且不�
   const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
   t.after(async () => { await gateway.close(); await upstream.close(); });
 
-  for (const max_tokens of [0, -1]) {
-    const rejected = await post(gateway, validRequest({ max_tokens }));
-    assert.equal(rejected.status, 422);
-    await rejected.text();
-  }
-  for (const extra of [{ max_tokens: null }, {}]) {
+  for (const extra of [{ max_tokens: 3500 }, { max_tokens: null }, {}]) {
     const accepted = await post(gateway, validRequest(extra));
     assert.equal(accepted.status, 200);
     await accepted.text();
   }
-  assert.deepEqual(forwarded.map((request) => request.max_tokens), [3500, 3500]);
+  assert.equal(forwarded.length, 3);
+  assert.deepEqual(forwarded.map((request) => Object.hasOwn(request, "max_tokens")), [false, false, false]);
   assert.deepEqual(gateway.max_tokens_clamped, []);
 });
 

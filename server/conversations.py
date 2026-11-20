@@ -362,6 +362,8 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
     rules = prompting.checklist(operation, genre)
     if rules:
         payload["写作规范"] = rules
+    if pages := prompting.page_rule(body.message, body.mode, latest.get("kind") if latest else None):
+        payload["页数要求"] = pages
     plugin_context = {"项目": project, "资料": sources} if project else None
     if project and gateway.MODE in {"dsh", "desktop"}:
         payload["项目"] = project
@@ -414,8 +416,10 @@ def office_file(decision, mode):
     if not decision.kind or not decision.plan or mode == "reply" or (mode in FORMATS and mode != decision.kind):
         fail(502, "返回的文稿格式与本轮请求不一致")
     plan = decision.plan.clean()
-    if decision.kind == "pptx" and any(len(s.points)>4 or any(len(p)>82 or "\n" in p for p in s.points) for s in plan.sections):
-        fail(502, "大纲超出当前 PPT 版式，请缩短每页内容后重试")
+    # 版式按条数自动排（卡片 / 两栏列表 / 表格），字号随字数缩放；每页超过 6 条由分页拆成"（续）"页。
+    # 只拒绝单条长到任何字号都放不下的情况。
+    if decision.kind == "pptx" and any(len(" ".join(p.split())) > 200 for s in plan.sections for p in s.points):
+        fail(502, "有要点超过 200 字，超出 PPT 版式，请缩短后重试")
     kind = decision.kind
     name = safe_name(plan.title[:105]) + "." + kind
     data = word(plan) if kind == "docx" else powerpoint(plan)
@@ -478,7 +482,9 @@ def selection_target(db, key, body, user):
 
 
 def stale_before():
-    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5))
+    # 桌面端智能分工全程上限 25 分钟（desktop/lib/pipeline.cjs DEADLINE_MS），这里必须更长，
+    # 否则仍在执行的一轮会被下一次请求判成"已中断"。
+    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30))
 
 
 def check_existing(db, key, body, request, allow_replay, stale):

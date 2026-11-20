@@ -10,9 +10,12 @@ const ROLE_LABELS = {
 };
 const MAX_STAGE_CALLS = 8;
 const MAX_EXEC_ROUNDS = 2;
-const DEADLINE_MS = 270_000;
-const STAGE_TIMEOUT_MS = 95_000;
-const MIN_REMAINING_MS = 15_000;
+// 最高推理强度下单阶段可能要几分钟：每阶段最多 620 秒（上游单次 600 秒 + DSH 启动），全程 25 分钟。
+// 服务端 conversations.py 的 stale_before（30 分钟）必须大于 DEADLINE_MS。
+// 服务端下发的 limits.deadline_ms 仍是 270000（旧版桌面端严格校验这个值），本机以这里的常量为准。
+const DEADLINE_MS = 1_500_000;
+const STAGE_TIMEOUT_MS = 620_000;
+const MIN_REMAINING_MS = 60_000;
 const TOKEN_FIELDS = ["prompt_tokens", "completion_tokens", "total_tokens"];
 
 function isObject(value) {

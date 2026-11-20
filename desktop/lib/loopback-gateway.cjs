@@ -4,11 +4,31 @@ const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
 const RESPONSE_LIMIT = 3 * 1024 * 1024;
-const TOKEN_LIMIT = 3500;
 const MAX_CALLS = 4;
+// 不再自设输出上限：表内模型按其官方单次输出上限下发 max_tokens（2026-11-20 查官方/公开文档，
+// 并在线上以该值实测上游返回 200）；表外模型不下发 max_tokens，由上游默认值决定。
+// 显式下发而不是省略，是因为 sub2api 转 Anthropic 协议上游时，缺省会补 8192。
+const MODEL_OUTPUT_LIMITS = Object.freeze({
+  "glm-5.3": 131_072,
+  "step-5-preview": 64_000,
+  "deepseek-v4.1-flash-1017": 393_216,
+  "k3.1-pro": 131_072
+});
+// 推理强度一律用各模型的最高档（公司要求质量优先，2026-11-20）。依据官方/公开文档：
+// glm-5.3 low/high/max（默认 max）；k3.1-pro low/high/max（默认 max）；
+// deepseek-v4.1-flash low/high/max（默认 high）；step-5-preview 公开文档最高为 high。
+// sub2api 把 step / deepseek 转成 Anthropic 协议时映射为 output_config.effort + thinking。
+const MODEL_REASONING_EFFORT = Object.freeze({
+  "glm-5.3": "max",
+  "step-5-preview": "high",
+  "deepseek-v4.1-flash-1017": "max",
+  "k3.1-pro": "max"
+});
+// 单次上游调用的时限。最高推理强度下执行阶段实测 95 秒（默认强度），留足余量。
+const UPSTREAM_TIMEOUT_MS = 600_000;
 const FORWARDED_FIELDS = [
   "model", "messages", "stream", "stream_options", "temperature", "top_p",
-  "max_tokens", "reasoning_effort", "thinking"
+  "reasoning_effort", "thinking"
 ];
 
 function isObject(value) {
@@ -25,7 +45,7 @@ function allowedFunction(value, allowed) {
   return isObject(value) && typeof value.name === "string" && allowed.has(value.name);
 }
 
-function sanitizeRequest(value, model, allowedTools, stats = null) {
+function sanitizeRequest(value, model, allowedTools) {
   if (!isObject(value) || value.model !== model || !Array.isArray(value.messages)) {
     throw new Error("invalid request");
   }
@@ -52,16 +72,9 @@ function sanitizeRequest(value, model, allowedTools, stats = null) {
   }
   if (tools.length) params.tools = tools;
 
-  let maxTokens = value.max_tokens;
-  if (maxTokens === undefined || maxTokens === null) maxTokens = TOKEN_LIMIT;
-  if (typeof maxTokens !== "number" || !Number.isFinite(maxTokens) || !Number.isInteger(maxTokens)) {
-    throw new Error("invalid max_tokens");
-  }
-  if (maxTokens <= 0) throw new Error("invalid max_tokens");
-  params.max_tokens = Math.min(maxTokens, TOKEN_LIMIT);
-  if (maxTokens > TOKEN_LIMIT && stats) {
-    stats.max_tokens_clamped.push({ requested: maxTokens, applied: TOKEN_LIMIT });
-  }
+  // DSH 请求里的 max_tokens 来自它的内部预算配置，不转发。
+  if (Object.hasOwn(MODEL_OUTPUT_LIMITS, model)) params.max_tokens = MODEL_OUTPUT_LIMITS[model];
+  if (Object.hasOwn(MODEL_REASONING_EFFORT, model)) params.reasoning_effort = MODEL_REASONING_EFFORT[model];
   return params;
 }
 
@@ -262,10 +275,9 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     }
 
     let params;
-    const clampEventsBefore = state.max_tokens_clamped.length;
     try {
       const raw = await readBody(request);
-      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools, state);
+      params = sanitizeRequest(JSON.parse(raw.toString("utf8")), model, state.allowedTools);
     } catch (error) {
       replyError(response, error.statusCode || 422, "请求格式或工具权限无效");
       return;
@@ -273,7 +285,6 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
 
     state.calls += 1;
     if (state.calls > MAX_CALLS) {
-      state.max_tokens_clamped.splice(clampEventsBefore);
       replyError(response, 429, "本轮模型调用次数已达上限");
       return;
     }
@@ -283,7 +294,7 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", Accept: "text/event-stream, application/json" },
         body: JSON.stringify(params),
-        signal: AbortSignal.timeout(80_000)
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
       });
       await pipeResponse(upstream, response, state);
     } catch {
@@ -292,7 +303,7 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
   });
 
   server.headersTimeout = 10_000;
-  server.requestTimeout = 85_000;
+  server.requestTimeout = UPSTREAM_TIMEOUT_MS + 10_000;
   await new Promise((resolve, reject) => {
     const onError = (error) => { server.off("listening", onListening); reject(error); };
     const onListening = () => { server.off("error", onError); resolve(); };
@@ -319,9 +330,11 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
 
 module.exports = {
   MAX_CALLS,
+  MODEL_OUTPUT_LIMITS,
+  MODEL_REASONING_EFFORT,
   REQUEST_LIMIT,
   RESPONSE_LIMIT,
-  TOKEN_LIMIT,
+  UPSTREAM_TIMEOUT_MS,
   createLoopbackGateway,
   sanitizeRequest
 };
