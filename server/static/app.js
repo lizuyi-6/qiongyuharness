@@ -3,14 +3,16 @@ import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, erro
 import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pageHead, planSection,
   renderFilesList, settingsView, taskDetail, views } from "./views.js";
 import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator, syncShell,
-  syncSidebarConversations, syncThemeToggle, syncTodayBadge, toggleSidebar, triggerTopbarSweep, unmountShell } from "./shell.js";
+  syncSidebarConversations, syncThemeToggle, syncTodayBadge, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
-import { attachFiles, cancelActiveChat, chooseSources, copyReply, loadDesktopModelState, loadEarlier,
-  loadWorkspace, openDeckInStudio, removeSource, runDesktopAgent, refreshDesktopUsage, saveWorkspaceInput,
-  selectDesktopModel, switchStudioTab, syncChatSubmit, syncDesktopUsagePanel, toggleDesktopUsage,
-  toggleWorkspaceContext, scrollToLatest, selectChatModel, sendMessage, showConversationHistory,
-  showSources, useExample, workspaceView, generateImageFromComposer, saveImageAutoPreference } from "./chat.js";
+import { applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeSlashMenu, copyReply,
+  generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier, loadWorkspace,
+  openDeckInStudio, openImageLightbox, refreshDesktopUsage, removeSource, retryTurn, runDesktopAgent,
+  saveImageAutoPreference, saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel,
+  sendMessage, showConversationHistory, showSources, switchStudioTab, syncChatSubmit, syncComposerGrow,
+  syncDesktopUsagePanel, syncImageAutoIndicator, syncShellCanvasState, toggleDesktopUsage, toggleImageDrawer,
+  toggleWorkspaceContext, triggerSlashMenu, updateSlashMenu, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -74,6 +76,7 @@ async function login(user) {
   state.usageState = null;
   state.contextOpen = false;
   state.studioTab = "context";
+  state.imageDrawerOpen = false;
   state._lastStudioKey = "";
   state.filesCache = [];
   state.filesFilter = "all";
@@ -164,13 +167,20 @@ function display(content, ticket, keepScroll = false) {
   if (!workplace) return;
   workplace.innerHTML = content;
   syncShell();
-  triggerTopbarSweep();
+  if (!keepScroll) {
+    triggerViewEnter();
+    triggerTopbarSweep();
+  }
   setMobileNav(false);
+  syncShellCanvasState();
   window.scrollTo(0, keepScroll ? y : 0);
   if (state.route[0] === "chat") {
     syncDesktopUsagePanel();
     scrollToLatest();
     mountDeck();
+    if (!keepScroll && !state.chatWorkspace?.session?.turns?.length) {
+      document.querySelector("[data-form=conversation] textarea")?.focus({ preventScroll: true });
+    }
   }
 }
 
@@ -386,6 +396,8 @@ async function handleUpload(list, element) {
 const actionCopy = { extension: "申请延期", comment: "留言", revoke: "撤销任务", close: "关闭任务" };
 
 async function onClick(event) {
+  if (!event.target.closest("[data-form=conversation]")) closeSlashMenu();
+  if (event.target.closest("a[data-stop-prop]")) return;
   const target = event.target.closest("[data-act]");
   if (!target || target.disabled) return;
   const { act, id } = target.dataset;
@@ -417,6 +429,11 @@ async function onClick(event) {
     case "agent-task": go("chat/task/" + encodeURIComponent(id)); break;
     case "chat-example": useExample(id); break;
     case "chat-generate-image": await generateImageFromComposer(target, render); break;
+    case "toggle-image-drawer": toggleImageDrawer(); break;
+    case "slash-trigger": triggerSlashMenu(); break;
+    case "slash-pick": await applySlashCommand(id); break;
+    case "image-lightbox": openImageLightbox(id, target.dataset.alt || "", target.dataset.meta || ""); break;
+    case "chat-retry": retryTurn(id); break;
     case "chat-remove-source": removeSource(id); break;
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
@@ -738,7 +755,13 @@ document.addEventListener("input", (event) => {
     localRefresh();
     return;
   }
-  if (element.matches("[data-form=conversation] textarea, [data-form=conversation] select")) saveWorkspaceInput(element.form);
+  if (element.matches("[data-form=conversation] textarea")) {
+    syncComposerGrow(element);
+    updateSlashMenu(element);
+    saveWorkspaceInput(element.form);
+  } else if (element.matches("[data-form=conversation] select")) {
+    saveWorkspaceInput(element.form);
+  }
   if (element.closest("form[data-form=submission]")) submissionInput(element.form, true);
   if (element.closest("form[data-form=generate]")) {
     const agent = state.agent;
@@ -765,6 +788,7 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", (event) => {
   if (event.target.matches("[name=allow_ai_images]")) {
     saveImageAutoPreference(event.target.checked);
+    syncImageAutoIndicator();
     return;
   }
   if (event.target.matches("[data-chat-model]")) {
@@ -779,23 +803,49 @@ document.addEventListener("change", (event) => {
   handleUpload([...event.target.files], event.target).catch((error) => toastMessage(error.message, "error"));
 });
 document.addEventListener("dragover", (event) => {
+  const hasFiles = [...(event.dataTransfer?.types || [])].includes("Files");
   const zone = event.target.closest("[data-upload-zone]");
-  if (zone) { event.preventDefault(); zone.classList.add("drag"); }
+  if (zone) { event.preventDefault(); zone.classList.add("drag"); return; }
+  const chatZone = hasFiles && event.target.closest("[data-chat-dropzone]");
+  if (chatZone) { event.preventDefault(); chatZone.classList.add("drag-over"); }
 });
-document.addEventListener("dragleave", (event) => event.target.closest("[data-upload-zone]")?.classList.remove("drag"));
+document.addEventListener("dragleave", (event) => {
+  event.target.closest("[data-upload-zone]")?.classList.remove("drag");
+  const chatZone = event.target.closest("[data-chat-dropzone]");
+  if (chatZone && !chatZone.contains(event.relatedTarget)) chatZone.classList.remove("drag-over");
+});
 document.addEventListener("drop", (event) => {
   const zone = event.target.closest("[data-upload-zone]");
-  if (!zone) return;
-  event.preventDefault();
-  handleUpload([...event.dataTransfer.files], zone.querySelector("input")).catch((error) => toastMessage(error.message, "error"));
+  if (zone) {
+    event.preventDefault();
+    zone.classList.remove("drag");
+    handleUpload([...event.dataTransfer.files], zone.querySelector("input")).catch((error) => toastMessage(error.message, "error"));
+    return;
+  }
+  const chatZone = event.target.closest("[data-chat-dropzone]");
+  if (chatZone && event.dataTransfer?.files?.length) {
+    event.preventDefault();
+    chatZone.classList.remove("drag-over");
+    attachFiles([...event.dataTransfer.files]).catch((error) => toastMessage(error.message, "error"));
+  }
 });
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     setMobileNav(false);
+    closeSlashMenu();
   }
-  if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && event.target.matches?.("[data-form=conversation] textarea")) {
+  if (event.target.matches?.("[data-form=conversation] textarea")) {
+    if (handleSlashKeydown(event)) return;
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault();
+      if (event.target.value.trim()) event.target.form.requestSubmit();
+      return;
+    }
+  }
+  if ((event.key === "Enter" || event.key === " ") && event.target.matches?.(".artifact-card[data-act=deck-open]")) {
     event.preventDefault();
-    event.target.form.requestSubmit();
+    openDeckInStudio(event.target.dataset.id);
+    return;
   }
   if (state.me && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
@@ -803,6 +853,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 window.addEventListener("hashchange", () => { if (dialog.open) dialog.close(); void render(); });
+window.addEventListener("qo:conversations-updated", () => { syncSidebarConversations(); });
 for (const eventName of ["online", "offline"]) {
   window.addEventListener(eventName, () => {
     syncConnectionIndicator();

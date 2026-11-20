@@ -65,7 +65,10 @@ export function ensureShell() {
         <div data-workspace-nav-slot>${conversationNav({ conversations })}</div>
         <div class="nav-group">
           <p class="nav-label">办公</p>
-          ${["today", "projects", "history", "files", "agent"].map(navItem).join("")}
+          ${["today", "projects", "files"].map(navItem).join("")}
+        </div>
+        <div class="nav-group subtle">
+          ${["agent", "history"].map(navItem).join("")}
         </div>
         ${isReview() ? `<div class="nav-group">
           <p class="nav-label">管理</p>
@@ -102,11 +105,8 @@ export function ensureShell() {
           <button class="icon-button bordered" type="button" data-act="toggle-theme" data-theme-toggle aria-label="切换浅色或深色外观" title="切换浅色 / 深色">
             ${icon(getTheme() === "dark" ? "sun" : "moon")}
           </button>
-          <button class="icon-button bordered" type="button" data-act="refresh" aria-label="刷新当前页面" title="刷新">
-            ${icon("refresh")}
-          </button>
-          <span class="connection-state ${offline ? "offline" : ""}" data-connection-state>
-            <i class="dot"></i>${offline ? "离线" : "已连接"}
+          <span class="connection-state offline" data-connection-state ${offline ? "" : "hidden"}>
+            <i class="dot"></i>离线
           </span>
         </div>
         <div class="topbar-line" data-topbar-line aria-hidden="true"></div>
@@ -176,8 +176,15 @@ export function syncTodayBadge() {
 export function syncConnectionIndicator() {
   const indicator = root.querySelector("[data-connection-state]");
   if (!indicator) return;
-  indicator.classList.toggle("offline", !navigator.onLine);
-  indicator.innerHTML = `<i class="dot"></i>${navigator.onLine ? "已连接" : "离线"}`;
+  indicator.hidden = navigator.onLine;
+}
+
+export function triggerViewEnter() {
+  const workplace = root.querySelector("#workplace");
+  if (!workplace) return;
+  workplace.classList.remove("view-entering");
+  void workplace.offsetWidth;
+  workplace.classList.add("view-entering");
 }
 
 export function syncThemeToggle() {
