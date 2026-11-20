@@ -1,6 +1,6 @@
 {
   "name": "qiongyu-office-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Qiongyu Office employee desktop",
   "author": "Qiongyu Technology",
   "main": "main.cjs",
@@ -28,12 +28,13 @@
     ],
     "extraResources": [
       {
-        "from": "runtime-stage/qo-runtime",
-        "to": "qo-runtime",
-        "filter": [
-          "**/*"
-        ]
+        "from": "runtime-stage/qo-runtime.7z",
+        "to": "qo-runtime.7z"
       }
+    ],
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
     ],
     "win": {
       "target": [
@@ -47,7 +48,28 @@
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": true,
-      "include": "uninstaller.nsh"
+      "include": "installer.nsh",
+      "installerLanguages": [
+        "zh_CN"
+      ],
+      "language": "2052",
+      "multiLanguageInstaller": false,
+      "installerSidebar": "installerSidebar.bmp",
+      "uninstallerSidebar": "installerSidebar.bmp",
+      "installerHeader": "installerHeader.bmp",
+      "shortcutName": "穹驭办公",
+      "preCompressedFileExtensions": [
+        ".avi",
+        ".mov",
+        ".m4v",
+        ".mp4",
+        ".m4p",
+        ".qt",
+        ".mkv",
+        ".webm",
+        ".vmdk",
+        ".7z"
+      ]
     }
   }
 }

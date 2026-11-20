@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { cp, mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDevOnlyRuntimeFile } from "./runtime-prune.mjs";
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const desktopDirectory = path.resolve(scriptDirectory, "..");
@@ -9,6 +11,7 @@ const repositoryDirectory = path.resolve(desktopDirectory, "..");
 const sourceHarness = path.join(repositoryDirectory, "harness");
 const runtimeStage = path.join(desktopDirectory, "runtime-stage");
 const runtimeRoot = path.join(runtimeStage, "qo-runtime");
+const runtimeArchive = path.join(runtimeStage, "qo-runtime.7z");
 const harnessRoot = path.join(runtimeRoot, "harness");
 
 function atLeast(version, minimum = [24, 9, 0]) {
@@ -64,10 +67,84 @@ const install = spawnSync(command, args, { cwd: harnessRoot, stdio: "inherit", w
 if (install.error) throw install.error;
 if (install.status !== 0) throw new Error(`Harness 运行时依赖安装失败，退出码 ${install.status}`);
 
+let prunedFiles = 0;
+let prunedBytes = 0;
+async function pruneRuntimeDirectory(directory) {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await pruneRuntimeDirectory(entryPath);
+    } else if (entry.isFile() && isDevOnlyRuntimeFile(entry.name)) {
+      const fileStat = await stat(entryPath);
+      await rm(entryPath);
+      prunedFiles += 1;
+      prunedBytes += fileStat.size;
+    }
+  }
+}
+await pruneRuntimeDirectory(path.join(harnessRoot, "node_modules"));
+console.log(`Runtime development files removed: ${prunedFiles} files, ${prunedBytes} bytes`);
+
+const requiredDshEntry = path.join(harnessRoot, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js");
+try {
+  await readFile(requiredDshEntry);
+} catch {
+  throw new Error("运行时裁剪后缺少 harness/node_modules/@deepseek-ai/dsh/lib/bin.js");
+}
+
 const nodeCheck = spawnSync(path.join(nodeDirectory, "node.exe"), ["--version"], {
   encoding: "utf8", windowsHide: true
 });
 if (nodeCheck.status !== 0 || !atLeast(nodeCheck.stdout.trim())) {
   throw new Error("暂存的 node.exe 版本校验失败");
 }
+
+await rm(runtimeArchive, { force: true });
+const require = createRequire(import.meta.url);
+const { getPath7za } = require("app-builder-lib/out/toolsets/7zip.js");
+const sevenZipPath = await getPath7za();
+const archiveResult = spawnSync(sevenZipPath, [
+  "a", "-t7z", "-mx=7", "-mmt=on", "-bso0", "-bsp0", runtimeArchive, "."
+], { cwd: runtimeRoot, encoding: "utf8", windowsHide: true });
+if (archiveResult.error) throw archiveResult.error;
+if (archiveResult.status !== 0) {
+  throw new Error(`运行时 7z 打包失败，退出码 ${archiveResult.status}: ${archiveResult.stderr || archiveResult.stdout}`);
+}
+
+const archiveTest = spawnSync(sevenZipPath, ["t", runtimeArchive], {
+  encoding: "utf8", windowsHide: true
+});
+if (archiveTest.error) throw archiveTest.error;
+if (archiveTest.status !== 0) {
+  throw new Error(`运行时 7z 自检失败，退出码 ${archiveTest.status}: ${archiveTest.stderr || archiveTest.stdout}`);
+}
+
+// 约 2.8 万个条目的 -slt 列表约十几 MB，超过 spawnSync 默认 1 MB 输出上限会 ENOBUFS。
+const archiveListing = spawnSync(sevenZipPath, ["l", "-slt", runtimeArchive], {
+  encoding: "utf8", windowsHide: true, maxBuffer: 512 * 1024 * 1024
+});
+if (archiveListing.error) throw archiveListing.error;
+if (archiveListing.status !== 0) {
+  throw new Error(`运行时 7z 列表检查失败，退出码 ${archiveListing.status}: ${archiveListing.stderr || archiveListing.stdout}`);
+}
+const normalizedListing = archiveListing.stdout.replaceAll("\\", "/").replaceAll("\r", "");
+const listingDivider = normalizedListing.indexOf("----------");
+const archiveEntryPaths = listingDivider === -1
+  ? []
+  : [...normalizedListing.slice(listingDivider).matchAll(/^Path = (.+)$/gm)].map((match) => match[1]);
+const requiredArchiveEntries = [
+  "node/node.exe",
+  "harness/package.json",
+  "harness/office.patch.yml",
+  "harness/office-image.mjs",
+  "harness/office-context.mjs",
+  "harness/node_modules/@deepseek-ai/dsh/lib/bin.js"
+];
+const missingArchiveEntries = requiredArchiveEntries.filter((entry) => !archiveEntryPaths.includes(entry));
+if (missingArchiveEntries.length) {
+  throw new Error(`运行时归档缺少必需条目：${missingArchiveEntries.join(", ")}`);
+}
+const archiveStat = await stat(runtimeArchive);
+console.log(`Runtime archive: ${archiveStat.size} bytes, ${archiveEntryPaths.length} entries`);
 console.log(`Runtime staged: Node ${nodeCheck.stdout.trim()}, Harness ${harnessRoot}`);

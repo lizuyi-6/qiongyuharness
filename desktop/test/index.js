@@ -10,3 +10,4 @@ require("./agent-image.test.cjs");
 require("./frontend-fixes.test.cjs");
 require("./chat-frontend.test.cjs");
 require("./runtime-files.test.cjs");
+require("./installer-packaging.test.cjs");
