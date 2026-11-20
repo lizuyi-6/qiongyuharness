@@ -10,17 +10,25 @@ const imageAutoPreferenceKey = "qo/chat/allow-ai-images";
 let usageRequestId = 0;
 let activeTurnCancel = null;
 
-function imageAutoPreference() {
+// AI 自行生图按张计费：缺省关闭，由员工本人勾选开启；按账号分开记忆，避免共用电脑时沿用他人的选择。
+function imageAutoPreferenceStorageKey() {
+  return state.me?.id ? `${imageAutoPreferenceKey}/${state.me.id}` : "";
+}
+
+export function imageAutoPreference() {
   try {
-    const stored = localStorage.getItem(imageAutoPreferenceKey);
-    return stored === null ? true : stored === "true";
+    const key = imageAutoPreferenceStorageKey();
+    return Boolean(key) && localStorage.getItem(key) === "true";
   } catch {
-    return true;
+    return false;
   }
 }
 
 export function saveImageAutoPreference(value) {
-  try { localStorage.setItem(imageAutoPreferenceKey, value ? "true" : "false"); } catch {}
+  try {
+    const key = imageAutoPreferenceStorageKey();
+    if (key) localStorage.setItem(key, value ? "true" : "false");
+  } catch {}
 }
 
 function clientExecutionRequired() {
