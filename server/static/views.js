@@ -309,7 +309,7 @@ export function detectDesktopVersion() {
   const direct = typeof window.officeDesktop?.version === "string" ? window.officeDesktop.version.trim() : "";
   if (direct) return direct;
   const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
-  const match = ua.match(/(?:qiongyu-office-desktop|QiongyuOffice)\/([0-9]+\.[0-9]+\.[0-9A-Za-z._-]*)/i);
+  const match = ua.match(/(?:qiongyu-office-desktop|QiongyuOffice|穹驭办公)\/([0-9]+\.[0-9]+\.[0-9A-Za-z._-]*)/i);
   return match ? match[1] : "";
 }
 

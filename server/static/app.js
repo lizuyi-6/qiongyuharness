@@ -25,6 +25,7 @@ let currentMode = "";
 let timerBusy = false;
 let agentDesktopModels = {};
 let updateListenerAttached = false;
+let lastUpdateCheckAt = 0;
 const historySize = 20;
 
 function applyDesktopUpdateState(next) {
@@ -43,6 +44,7 @@ function applyDesktopUpdateState(next) {
 }
 
 async function checkUpdateFallback({ silent = false } = {}) {
+  lastUpdateCheckAt = Date.now();
   const current = detectDesktopVersion();
   if (!silent) {
     state.update = { ...(state.update || {}), status: "checking" };
@@ -87,10 +89,26 @@ async function initDesktopUpdater() {
     try {
       const snapshot = await desktop.getUpdateState();
       if (snapshot) applyDesktopUpdateState(snapshot);
+      if (!snapshot || snapshot.status === "idle") {
+        lastUpdateCheckAt = Date.now();
+        void desktop.checkUpdate?.().then((res) => applyDesktopUpdateState(res)).catch(() => {});
+      }
     } catch {}
     return;
   }
   if (typeof desktop?.runAgent === "function") {
+    void checkUpdateFallback({ silent: true });
+  }
+}
+
+function maybeRefreshUpdateInBackground() {
+  if (!state.me || Date.now() - lastUpdateCheckAt < 10 * 60 * 1000) return;
+  const desktop = window.officeDesktop;
+  if (typeof desktop?.checkUpdate === "function") {
+    if (["downloading", "verifying", "installing", "ready"].includes(state.update?.status)) return;
+    lastUpdateCheckAt = Date.now();
+    void desktop.checkUpdate().then((res) => applyDesktopUpdateState(res)).catch(() => {});
+  } else if (typeof desktop?.runAgent === "function") {
     void checkUpdateFallback({ silent: true });
   }
 }
@@ -315,7 +333,12 @@ async function render(keepScroll = false) {
         content = filesView(state.filesCache);
         break;
       }
-      case "settings": content = settingsView(); break;
+      case "settings":
+        content = settingsView();
+        if (!state.update || Date.now() - lastUpdateCheckAt > 3 * 60 * 1000) {
+          void initDesktopUpdater();
+        }
+        break;
       case "admin":
         if (!isManager()) { go("today"); return; }
         content = await taskAdmin(); break;
@@ -979,6 +1002,9 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     openCommandPalette();
   }
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) maybeRefreshUpdateInBackground();
 });
 window.addEventListener("hashchange", () => { if (dialog.open) dialog.close(); void render(); });
 window.addEventListener("qo:conversations-updated", () => { syncSidebarConversations(); });
