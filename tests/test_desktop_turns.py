@@ -92,6 +92,41 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertEqual(set(value["prompts"]), {"understand", "accept", "review", "revise"})
         self.assertEqual(len(value["version"]), 12)
 
+    def test_prepare_injects_matched_writing_preset(self):
+        key = self.conversation()
+        response = self.clients["lin"].post(f"/api/v1/conversations/{key}/turns/prepare", json={
+            "id": str(uuid4()), "message": "帮我把今天的会议笔记整理成纪要", "mode": "docx"
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        prepared = response.json()
+        self.assertIn("套用写作规范：会议纪要", prepared["steps"])
+        self.assertIn("## 写作规范：会议纪要", prepared["system"])
+        self.assertIn("## Word 导出规则", prepared["system"])
+        payload = json.loads(prepared["prompt"])
+        self.assertEqual(payload["写作规范"]["类型"], "会议纪要")
+        self.assertEqual(payload["写作规范"]["最低分级"], "standard")
+        self.assertIn("会议决定与讨论要点分开写", payload["写作规范"]["验收要点"])
+
+        plain_key = self.conversation()
+        plain = self.clients["lin"].post(f"/api/v1/conversations/{plain_key}/turns/prepare", json={
+            "id": str(uuid4()), "message": "你好", "mode": "reply"
+        }).json()
+        self.assertFalse(any(step.startswith("套用写作规范") for step in plain["steps"]))
+        self.assertNotIn("## 写作规范：", plain["system"])
+        self.assertNotIn("写作规范", json.loads(plain["prompt"]))
+
+    def test_plan_prepare_injects_preset_for_high_stakes_document(self):
+        response = self.clients["lin"].post("/api/v1/agent/plan/prepare", json={
+            "kind": "docx", "title": "技术服务合同", "instructions": "起草一份技术服务合同，我方是甲方", "pages": 8
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        prepared = response.json()
+        self.assertIn("套用写作规范：协议起草", prepared["steps"])
+        self.assertIn("## 写作规范：协议起草", prepared["system"])
+        self.assertIn('{"title":"标题"', prepared["system"])
+        agenda = json.loads(prepared["prompt"].split("\n", 1)[1])
+        self.assertEqual(agenda["写作规范"]["最低分级"], "critical")
+
     def test_invalid_pipeline_environment_value_fails_app_startup(self):
         async def enter_lifespan():
             async with self.app.router.lifespan_context(self.app):

@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import gateway
+from . import gateway, prompting
 from .identity import fail
 from .office import (MAX_FILE, MIMES, Plan, add_file, clean_text, edit_copy, extract, powerpoint,
                      safe_name, verify, word)
@@ -241,11 +241,16 @@ async def prepare_agent(user, payload, assignment_id=None, *, engine="desktop"):
         data = collect_sources(db, user, task, payload.material_ids)
     sources = await read_sources(data)
     run = uid()
-    prompt = gateway.plan_prompt(payload.kind, title, payload.instructions.strip(), task, sources, payload.pages)
+    task_fields = {name: task[name] for name in ("title", "description", "deliverable")} if task else None
+    operation, genre = prompting.route(f"{title}\n{payload.instructions}", task_fields)
+    prompt = gateway.plan_prompt(payload.kind, title, payload.instructions.strip(), task, sources, payload.pages,
+                                 prompting.checklist(operation, genre))
     steps = (["载入任务要求"] if task else [])
     if sources:
         read = sum(bool(source["text"]) for source in sources)
         steps.append(f"读取 {read} 份资料" + (f" · {len(sources)-read} 份没有可提取的正文" if read < len(sources) else ""))
+    if label := prompting.steps_label(operation, genre):
+        steps.append(label)
     steps.append("正在整理文稿")
     with database(write=True) as db:
         task = writable_task(db, assignment_id, user)
@@ -254,7 +259,7 @@ async def prepare_agent(user, payload, assignment_id=None, *, engine="desktop"):
                    (run, assignment_id, user["id"], payload.kind, engine, "running",
                     pack({"model": None, "prepare": {"pages": payload.pages}}), instant()))
         audit(db, "agent.started", user["id"], assignment_id, run_id=run, engine=engine)
-    return {"run_id": run, "system": gateway.PERSONA, "prompt": prompt,
+    return {"run_id": run, "system": prompting.plan_system(payload.kind, operation, genre), "prompt": prompt,
             "context": None, "steps": steps, "task": task, "sources": sources,
             "assignment_id": assignment_id, "kind": payload.kind, "pages": payload.pages,
             "engine": engine}

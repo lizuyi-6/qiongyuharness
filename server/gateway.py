@@ -145,11 +145,13 @@ def response_plan(text, kind, count):
     return plan
 
 
-def plan_prompt(kind, title, instructions, task, materials, count):
+def plan_prompt(kind, title, instructions, task, materials, count, rules=None):
     agenda = {"format": kind, "title": title, "employee_request": instructions,
               "task": {k: task[k] for k in ("title", "description", "deliverable")} if task else None,
               "sources": materials,
               "presentation_rule": f"封面单独生成，sections 必须恰好 {count-1} 项；每项最多四条，每条不超过70字，不换行。" if kind == "pptx" else ""}
+    if rules:
+        agenda["写作规范"] = rules
     return "请按要求制作结构化办公文稿。\n" + json.dumps(agenda, ensure_ascii=False)
 
 
