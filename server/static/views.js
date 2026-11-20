@@ -1,4 +1,4 @@
-import { active, badge, button, dateLabel, deadline, e, eventLabels, fileIcon, fileMarkup, getTheme,
+import { active, badge, button, dateLabel, deadline, e, eventLabels, fileIcon, fileMarkup, formatBytes, getTheme,
   icon, isManager, isReview, labels, outputWarnings, priorities, readDraft, roles, state, uploadMarkup } from "./ui.js";
 
 export const views = {
@@ -305,7 +305,7 @@ export function filesView(items) {
   </section>`;
 }
 
-function detectDesktopVersion() {
+export function detectDesktopVersion() {
   const direct = typeof window.officeDesktop?.version === "string" ? window.officeDesktop.version.trim() : "";
   if (direct) return direct;
   const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
@@ -317,6 +317,151 @@ function formatVersion(value) {
   const raw = String(value || "").trim();
   if (!raw) return "";
   return /^v/i.test(raw) ? raw : `v${raw}`;
+}
+
+export function renderUpdatePanelBody() {
+  const isDesktopApp = typeof window.officeDesktop?.runAgent === "function";
+  const nativeUpdater = typeof window.officeDesktop?.checkUpdate === "function";
+  const info = state.update;
+
+  if (!isDesktopApp) {
+    if (info?.full?.url) {
+      return `<div class="update-box">
+        <div class="update-box-head">
+          <strong>桌面客户端 ${e(formatVersion(info.latestVersion))}</strong>
+          <span class="update-pill">${e(formatBytes(info.full.size))}</span>
+        </div>
+        ${info.notes ? `<p class="update-notes">${e(info.notes)}</p>` : ""}
+        <div class="actions">
+          <a class="button primary" href="${e(info.full.url)}" download>${icon("download")}下载桌面客户端</a>
+        </div>
+      </div>`;
+    }
+    return "";
+  }
+
+  if (!nativeUpdater) {
+    if (info?.hasUpdate && info.full?.url) {
+      return `<div class="update-box is-available">
+        <div class="update-box-head">
+          <strong>发现新版本 ${e(formatVersion(info.latestVersion))}</strong>
+          <span class="update-pill">支持增量更新</span>
+        </div>
+        <p class="update-hint">当前桌面客户端版本较早，升级到 ${e(formatVersion(info.latestVersion))} 后即可支持应用内秒级增量更新与在线下载。</p>
+        ${info.notes ? `<p class="update-notes">${e(info.notes)}</p>` : ""}
+        <div class="actions">
+          <a class="button primary" href="${e(info.full.url)}" download>${icon("download")}下载最新安装包（${e(formatBytes(info.full.size))}）</a>
+          ${button("重新检查", "update-check", { icon: "refresh" })}
+        </div>
+      </div>`;
+    }
+    return `<div class="update-box">
+      <div class="update-box-head">
+        <strong>客户端更新</strong>
+        <span class="update-meta">${info?.status === "checking" ? "正在检查…" : info?.status === "up-to-date" ? "已是最新" : "可手动检查"}</span>
+      </div>
+      <div class="actions">${button("检查更新", "update-check", { icon: "refresh", disabled: info?.status === "checking" })}</div>
+    </div>`;
+  }
+
+  const status = info?.status || "idle";
+  const latest = formatVersion(info?.latestVersion);
+  const isDelta = info?.mode === "delta";
+  const savedPct = isDelta && info?.fullSize > 0 && info?.size > 0 && info.size < info.fullSize
+    ? Math.max(1, Math.round((1 - info.size / info.fullSize) * 1000) / 10)
+    : 0;
+  const modeTag = isDelta
+    ? `增量补丁 · ${formatBytes(info.size)}${savedPct ? ` · 省 ${savedPct}% 流量` : ""}`
+    : info?.size
+      ? `完整安装包 · ${formatBytes(info.size)}`
+      : "";
+
+  if (status === "checking") {
+    return `<div class="update-box">
+      <div class="update-box-head">
+        <strong>客户端更新</strong>
+        <span class="update-meta">正在检查新版本…</span>
+      </div>
+      <div class="actions">${button("正在检查…", "update-check", { icon: "refresh", disabled: true })}</div>
+    </div>`;
+  }
+
+  if (status === "downloading" || status === "verifying") {
+    const pct = Math.max(0, Math.min(100, Number(info?.percent) || 0));
+    const speed = info?.bytesPerSecond > 0 ? `${formatBytes(info.bytesPerSecond)}/s` : "";
+    const progressMeta = status === "verifying"
+      ? "正在校验 SHA-256 与补丁完整性…"
+      : `${formatBytes(info?.received || 0)} / ${formatBytes(info?.total || info?.size || 0)}${speed ? ` · ${speed}` : ""}`;
+    return `<div class="update-box is-active">
+      <div class="update-box-head">
+        <strong>${status === "verifying" ? `正在校验 ${e(latest)}` : `正在下载 ${e(latest)}`}</strong>
+        <span class="update-pill">${e(isDelta ? "增量更新" : "完整更新")} · ${pct}%</span>
+      </div>
+      <div class="update-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
+        <div class="update-progress-fill" style="width:${pct}%"></div>
+      </div>
+      <p class="update-meta">${e(progressMeta)}</p>
+      ${status === "downloading" ? `<div class="actions">${button("取消下载", "update-cancel", { icon: "x" })}</div>` : ""}
+    </div>`;
+  }
+
+  if (status === "ready") {
+    return `<div class="update-box is-ready">
+      <div class="update-box-head">
+        <strong>${e(latest)} 已就绪</strong>
+        <span class="update-pill is-accent">${e(isDelta ? "增量补丁已校验" : "安装包已校验")}</span>
+      </div>
+      ${info?.notes ? `<p class="update-notes">${e(info.notes)}</p>` : ""}
+      <p class="update-hint">点击后将自动替换更新并重启应用，所有会话与已保存文件不受影响。</p>
+      <div class="actions">
+        ${button("立即安装并重启", "update-install", { cls: "primary", icon: "refresh" })}
+      </div>
+    </div>`;
+  }
+
+  if (status === "installing") {
+    return `<div class="update-box is-active">
+      <div class="update-box-head">
+        <strong>正在应用 ${e(latest)} 并重启…</strong>
+      </div>
+      <p class="update-hint">请稍候，穹驭办公将在数秒内自动重新启动。</p>
+    </div>`;
+  }
+
+  if (status === "available") {
+    return `<div class="update-box is-available">
+      <div class="update-box-head">
+        <strong>发现新版本 ${e(latest)}</strong>
+        ${modeTag ? `<span class="update-pill is-accent">${e(modeTag)}</span>` : ""}
+      </div>
+      ${info?.notes ? `<p class="update-notes">${e(info.notes)}</p>` : ""}
+      <div class="actions">
+        ${button(`立即下载更新${info?.size ? `（${formatBytes(info.size)}）` : ""}`, "update-download", { cls: "primary", icon: "download" })}
+        ${isDelta && info?.hasFull ? button(`改下完整包（${formatBytes(info.fullSize)}）`, "update-download-full", { cls: "ghost" }) : ""}
+      </div>
+    </div>`;
+  }
+
+  if (status === "error") {
+    return `<div class="update-box is-error">
+      <div class="update-box-head">
+        <strong>更新未完成</strong>
+      </div>
+      <p class="error">${e(info?.error || "检查或下载更新失败，请稍后重试")}</p>
+      <div class="actions">
+        ${button("重试检查", "update-check", { icon: "refresh" })}
+        ${info?.hasFull && info?.latestVersion ? button(`改用完整安装包（${formatBytes(info.fullSize)}）`, "update-download-full", { icon: "download" }) : ""}
+      </div>
+    </div>`;
+  }
+
+  return `<div class="update-box">
+    <div class="update-box-head">
+      <strong>客户端更新</strong>
+      <span class="update-meta">${status === "up-to-date" ? `已是最新版本（${e(latest || formatVersion(detectDesktopVersion()))}）` : "支持应用内增量更新"}</span>
+    </div>
+    <div class="actions">${button("检查更新", "update-check", { icon: "refresh" })}</div>
+  </div>`;
 }
 
 export function settingsView() {
@@ -331,6 +476,7 @@ export function settingsView() {
         : "企业统一网关";
   const desktopVersion = isDesktopApp ? formatVersion(detectDesktopVersion()) : "";
   const serverVersion = formatVersion(state.config?.version);
+  const updateBody = renderUpdatePanelBody();
   return `${pageHead("设置")}
    <div class="settings-grid">
      <section class="panel pad stack">
@@ -364,6 +510,7 @@ export function settingsView() {
          ${serverVersion ? `<div class="engine-card-row"><span>工作台版本</span><strong class="mono">${e(serverVersion)}</strong></div>` : ""}
        </div>
        <div class="actions">${button("检测服务状态", "check-engine", { icon: "refresh" })}</div>
+       <div data-update-panel>${updateBody}</div>
      </section>
    </div>`;
 }

@@ -21,6 +21,8 @@ export const state = {
   filesCache: [],
   filesFilter: "all",
   filesQuery: "",
+  update: null,
+  updateBannerDismissed: false,
   admin: { offset: 0, department: "", status: "", date: "" },
   auditOffset: 0
 };
@@ -105,6 +107,15 @@ export function icon(name) {
 
 export function e(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+}
+
+export function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${Math.round(value)} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export function outputWarnings(telemetry) {

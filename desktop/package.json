@@ -1,13 +1,14 @@
 {
   "name": "qiongyu-office-desktop",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Qiongyu Office employee desktop",
   "author": "Qiongyu Technology",
   "main": "main.cjs",
   "private": true,
   "scripts": {
     "start": "electron .",
-    "build:win": "node scripts/prepare-runtime.mjs && electron-builder --win --x64 && node scripts/check-no-dsh-conflict.mjs",
+    "build:win": "node scripts/prepare-runtime.mjs && electron-builder --win --x64 && node scripts/check-no-dsh-conflict.mjs && node scripts/build-delta.mjs",
+    "build:delta": "electron-builder --win --x64 --dir && node scripts/build-delta.mjs",
     "build:linux": "electron-builder --linux dir --x64"
   },
   "devDependencies": {

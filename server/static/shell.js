@@ -1,5 +1,5 @@
-import { active, api, dialog, e, getTheme, go, icon, isManager, isReview, modal, roles, root, state } from "./ui.js";
-import { views } from "./views.js";
+import { active, api, dialog, e, formatBytes, getTheme, go, icon, isManager, isReview, modal, roles, root, state } from "./ui.js";
+import { renderUpdatePanelBody, views } from "./views.js";
 import { conversationNav, runningConversationIds, syncDesktopUsagePanel } from "./chat.js";
 
 const SIDEBAR_KEY = "qo-sidebar-collapsed";
@@ -25,7 +25,7 @@ function navItem(id) {
   const on = route === id;
   const [name, glyph] = views[id];
   return `<button class="nav ${on ? "active" : ""}" type="button" data-act="route" data-id="${id}" data-nav-id="${id}" title="${name}" ${on ? 'aria-current="page"' : ""}>
-    ${icon(glyph)}<span class="nav-text">${name}</span>${id === "today" ? '<span class="nav-count" data-today-count hidden></span>' : ""}
+    ${icon(glyph)}<span class="nav-text">${name}</span>${id === "today" ? '<span class="nav-count" data-today-count hidden></span>' : ""}${id === "settings" ? '<span class="nav-count update-badge" data-update-badge hidden>新</span>' : ""}
   </button>`;
 }
 
@@ -112,6 +112,7 @@ export function ensureShell() {
         </div>
         <div class="topbar-line" data-topbar-line aria-hidden="true"></div>
       </header>
+      <div class="update-banner" data-update-banner hidden></div>
       <main class="content" id="workplace"></main>
     </div>
   </div>`;
@@ -143,6 +144,7 @@ export function syncShell() {
   syncSidebarConversations();
   syncTodayBadge();
   syncConnectionIndicator();
+  syncUpdateUi();
 }
 
 export function syncSidebarConversations() {
@@ -180,6 +182,115 @@ export function syncConnectionIndicator() {
   const indicator = root.querySelector("[data-connection-state]");
   if (!indicator) return;
   indicator.hidden = navigator.onLine;
+}
+
+export function syncUpdateUi() {
+  const info = state.update;
+  const nativeUpdater = typeof window.officeDesktop?.checkUpdate === "function";
+  const hasActionable = Boolean(
+    info && (
+      ["available", "downloading", "verifying", "ready", "installing"].includes(info.status) ||
+      (!nativeUpdater && info.hasUpdate && info.full?.url)
+    )
+  );
+
+  const navBadge = root.querySelector("[data-update-badge]");
+  if (navBadge) {
+    navBadge.hidden = !hasActionable;
+    navBadge.textContent = info?.status === "ready" ? "待装" : "新";
+  }
+
+  const panel = root.querySelector("[data-update-panel]");
+  if (panel) {
+    panel.innerHTML = renderUpdatePanelBody();
+  }
+
+  const banner = root.querySelector("[data-update-banner]");
+  if (!banner) return;
+  if (!hasActionable || state.updateBannerDismissed) {
+    banner.hidden = true;
+    banner.innerHTML = "";
+    return;
+  }
+
+  const rawVer = String(info?.latestVersion || "").trim();
+  const ver = rawVer ? (/^v/i.test(rawVer) ? rawVer : `v${rawVer}`) : "";
+  const isDelta = info?.mode === "delta";
+
+  if (!nativeUpdater && info?.full?.url) {
+    banner.hidden = false;
+    banner.innerHTML = `<div class="update-banner-inner">
+      <div class="update-banner-copy">
+        <span class="update-banner-dot" aria-hidden="true"></span>
+        <strong>发现新版本 ${e(ver)}</strong>
+        <span>升级后支持应用内增量更新（${e(formatBytes(info.full.size))}）</span>
+      </div>
+      <div class="update-banner-actions">
+        <a class="button sm primary" href="${e(info.full.url)}" download>${icon("download")}下载安装包</a>
+        <button type="button" class="icon-button sm" data-act="update-dismiss" aria-label="稍后提醒" title="稍后提醒">${icon("x")}</button>
+      </div>
+    </div>`;
+    return;
+  }
+
+  if (info.status === "downloading" || info.status === "verifying") {
+    const pct = Math.max(0, Math.min(100, Number(info.percent) || 0));
+    const speed = info.bytesPerSecond > 0 ? ` · ${formatBytes(info.bytesPerSecond)}/s` : "";
+    banner.hidden = false;
+    banner.innerHTML = `<div class="update-banner-inner">
+      <div class="update-banner-copy">
+        <span class="update-banner-dot is-pulse" aria-hidden="true"></span>
+        <strong>${info.status === "verifying" ? `正在校验 ${e(ver)}` : `正在下载 ${e(ver)}（${pct}%）`}</strong>
+        <span>${info.status === "verifying" ? "校验文件完整性…" : `${e(isDelta ? "增量更新" : "完整包")}${e(speed)}`}</span>
+        <span class="update-banner-bar"><i style="width:${pct}%"></i></span>
+      </div>
+      <div class="update-banner-actions">
+        ${info.status === "downloading" ? '<button type="button" class="text-button" data-act="update-cancel">取消</button>' : ""}
+      </div>
+    </div>`;
+    return;
+  }
+
+  if (info.status === "ready") {
+    banner.hidden = false;
+    banner.innerHTML = `<div class="update-banner-inner">
+      <div class="update-banner-copy">
+        <span class="update-banner-dot is-ready" aria-hidden="true"></span>
+        <strong>${e(ver)} 已下载完成</strong>
+        <span>点击即可安装并自动重启，会话与文件不会丢失</span>
+      </div>
+      <div class="update-banner-actions">
+        <button type="button" class="button sm primary" data-act="update-install">${icon("refresh")}立即安装并重启</button>
+        <button type="button" class="icon-button sm" data-act="update-dismiss" aria-label="稍后安装" title="稍后安装">${icon("x")}</button>
+      </div>
+    </div>`;
+    return;
+  }
+
+  if (info.status === "installing") {
+    banner.hidden = false;
+    banner.innerHTML = `<div class="update-banner-inner">
+      <div class="update-banner-copy">
+        <span class="update-banner-dot is-pulse" aria-hidden="true"></span>
+        <strong>正在应用 ${e(ver)} 并重启…</strong>
+      </div>
+    </div>`;
+    return;
+  }
+
+  banner.hidden = false;
+  banner.innerHTML = `<div class="update-banner-inner">
+    <div class="update-banner-copy">
+      <span class="update-banner-dot" aria-hidden="true"></span>
+      <strong>发现新版本 ${e(ver)}</strong>
+      <span>${e(isDelta ? `增量补丁仅 ${formatBytes(info.size)}` : `完整包 ${formatBytes(info.size)}`)}</span>
+    </div>
+    <div class="update-banner-actions">
+      <button type="button" class="button sm primary" data-act="update-download">${icon("download")}立即更新</button>
+      <button type="button" class="text-button" data-act="route" data-id="settings">详情</button>
+      <button type="button" class="icon-button sm" data-act="update-dismiss" aria-label="稍后提醒" title="稍后提醒">${icon("x")}</button>
+    </div>
+  </div>`;
 }
 
 export function triggerViewEnter() {

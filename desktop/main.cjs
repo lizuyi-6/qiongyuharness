@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { startLoopbackCallback } = require("./lib/desktop-login.cjs");
+const { createDesktopUpdater } = require("./lib/updater.cjs");
 const { createDesktopAgent } = require("./agent.cjs");
 
 app.setName("穹驭办公");
@@ -15,6 +16,8 @@ let tray;
 let origin;
 let loginInProgress = false;
 let desktopAgent;
+let desktopUpdater;
+let updateCheckTimer;
 let isQuitting = false;
 let trayHintShown = false;
 const appIconPath = path.join(__dirname, "office.ico");
@@ -43,13 +46,26 @@ function showMainWindow(routeHash = "") {
 
 function quitApplication() {
   isQuitting = true;
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer);
+    updateCheckTimer = undefined;
+  }
   try { desktopAgent?.cancelAgent(); } catch {}
+  try { desktopUpdater?.cancelDownload(); } catch {}
   app.quit();
 }
 
 function buildTrayMenu() {
   const version = app.getVersion();
   const visible = Boolean(window && !window.isDestroyed() && window.isVisible() && !window.isMinimized());
+  const updateState = desktopUpdater?.getState?.();
+  const updateReady = updateState?.status === "ready";
+  const updateAvailable = updateState?.status === "available";
+  const updateLabel = updateReady && updateState?.latestVersion
+    ? `安装新版本 v${updateState.latestVersion}…`
+    : updateAvailable && updateState?.latestVersion
+      ? `发现新版本 v${updateState.latestVersion}…`
+      : "检查更新…";
   return Menu.buildFromTemplate([
     {
       label: visible ? "隐藏到托盘" : "打开穹驭办公",
@@ -80,6 +96,14 @@ function buildTrayMenu() {
       label: "停止当前 AI 执行",
       click: () => {
         try { desktopAgent?.cancelAgent(); } catch {}
+      }
+    },
+    {
+      label: updateLabel,
+      enabled: Boolean(origin),
+      click: () => {
+        showMainWindow("#settings");
+        if (!updateReady) void desktopUpdater?.checkForUpdates({ silent: false });
       }
     },
     {
@@ -256,6 +280,36 @@ ipcMain.handle("qo:cancel-agent", (event) => {
   return desktopAgent.cancelAgent();
 });
 
+ipcMain.handle("qo:update-state", (event) => {
+  if (!trusted(event)) throw new Error("页面无权读取更新状态");
+  return desktopUpdater?.getState() || null;
+});
+
+ipcMain.handle("qo:update-check", async (event) => {
+  if (!trusted(event)) throw new Error("页面无权检查更新");
+  return desktopUpdater.checkForUpdates({ silent: false });
+});
+
+ipcMain.handle("qo:update-download", async (event, options) => {
+  if (!trusted(event)) throw new Error("页面无权下载更新");
+  return desktopUpdater.downloadUpdate(options || {});
+});
+
+ipcMain.handle("qo:update-cancel", (event) => {
+  if (!trusted(event)) throw new Error("页面无权取消下载");
+  return desktopUpdater.cancelDownload();
+});
+
+ipcMain.handle("qo:update-install", async (event) => {
+  if (!trusted(event)) throw new Error("页面无权安装更新");
+  return desktopUpdater.installUpdate();
+});
+
+ipcMain.handle("qo:update-clear-notice", (event) => {
+  if (!trusted(event)) throw new Error("页面无权更新提示状态");
+  return desktopUpdater.clearAppliedNotice();
+});
+
 ipcMain.handle("qo:open-connect", async (event) => {
   if (!trusted(event)) throw new Error("页面无权打开连接设置");
   desktopAgent?.cancelAgent();
@@ -313,7 +367,28 @@ app.whenReady().then(() => {
       if (window && !window.isDestroyed()) window.webContents.send("qo:agent-event", value);
     }
   });
+  desktopUpdater = createDesktopUpdater({
+    app,
+    getWindow: () => window,
+    getOrigin: () => origin,
+    quitApplication,
+    emit: (value) => {
+      if (window && !window.isDestroyed()) window.webContents.send("qo:update-event", value);
+    }
+  });
   const content = window.webContents;
+  content.on("did-finish-load", () => {
+    if (!origin) return;
+    try {
+      if (new URL(content.getURL()).origin === origin) {
+        setTimeout(() => { void desktopUpdater?.checkForUpdates({ silent: true }); }, 4_000);
+      }
+    } catch {}
+  });
+  updateCheckTimer = setInterval(() => {
+    if (origin) void desktopUpdater?.checkForUpdates({ silent: true });
+  }, 4 * 60 * 60 * 1000);
+  updateCheckTimer.unref?.();
   content.session.cookies.on("changed", (_event, cookie, _cause, removed) => {
     if (cookie.name === "qo_session" && removed) void desktopAgent.clearCredentialsForOrigin(origin);
   });

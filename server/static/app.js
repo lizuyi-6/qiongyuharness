@@ -1,9 +1,9 @@
 import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, errorIn, fileMarkup, getTheme, go, icon, isManager, isReview, modal,
   post, readDraft, roles, root, saveDraft, state, toastMessage, toggleTheme, uploadSelected, uuid } from "./ui.js";
-import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pageHead, planSection,
+import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, historyView, loginView, pageHead, planSection,
   renderFilesList, settingsView, taskDetail, views } from "./views.js";
 import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator, syncShell,
-  syncSidebarConversations, syncThemeToggle, syncTodayBadge, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
+  syncSidebarConversations, syncThemeToggle, syncTodayBadge, syncUpdateUi, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { abortOrphanTurn, applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeComposerPickers,
@@ -24,7 +24,76 @@ let navigation = 0;
 let currentMode = "";
 let timerBusy = false;
 let agentDesktopModels = {};
+let updateListenerAttached = false;
 const historySize = 20;
+
+function applyDesktopUpdateState(next) {
+  if (!next || typeof next !== "object") return;
+  const prevStatus = state.update?.status;
+  state.update = next;
+  if (["available", "downloading", "ready"].includes(next.status) && next.status !== prevStatus) {
+    state.updateBannerDismissed = false;
+  }
+  syncUpdateUi();
+  if (next.appliedNotice?.version) {
+    const modeLabel = next.appliedNotice.mode === "full" ? "完整更新" : "增量更新";
+    toastMessage(`已通过${modeLabel}升级至 v${next.appliedNotice.version}`, "success");
+    void window.officeDesktop?.clearUpdateNotice?.().catch(() => {});
+  }
+}
+
+async function checkUpdateFallback({ silent = false } = {}) {
+  const current = detectDesktopVersion();
+  if (!silent) {
+    state.update = { ...(state.update || {}), status: "checking" };
+    syncUpdateUi();
+  }
+  try {
+    const query = current ? `?current=${encodeURIComponent(current)}` : "";
+    const data = await api("/updates/latest" + query);
+    state.update = {
+      status: data?.has_update ? "available" : "up-to-date",
+      hasUpdate: Boolean(data?.has_update),
+      latestVersion: data?.latest_version || "",
+      mode: data?.update_mode || "none",
+      notes: data?.notes || "",
+      publishedAt: data?.published_at || "",
+      delta: data?.delta || null,
+      full: data?.full || null,
+      size: data?.full?.size || data?.delta?.size || 0,
+      fullSize: data?.full?.size || 0
+    };
+    if (data?.has_update) state.updateBannerDismissed = false;
+    syncUpdateUi();
+    if (!silent) {
+      toastMessage(data?.has_update ? `发现新版本 v${data.latest_version}` : "当前已是最新版本", data?.has_update ? "info" : "success");
+    }
+  } catch (error) {
+    if (!silent) {
+      state.update = { ...(state.update || {}), status: "error", error: error.message || "检查更新失败" };
+      syncUpdateUi();
+      toastMessage(error.message || "检查更新失败", "error");
+    }
+  }
+}
+
+async function initDesktopUpdater() {
+  const desktop = window.officeDesktop;
+  if (typeof desktop?.getUpdateState === "function") {
+    if (!updateListenerAttached && typeof desktop.onUpdateEvent === "function") {
+      updateListenerAttached = true;
+      desktop.onUpdateEvent((next) => applyDesktopUpdateState(next));
+    }
+    try {
+      const snapshot = await desktop.getUpdateState();
+      if (snapshot) applyDesktopUpdateState(snapshot);
+    } catch {}
+    return;
+  }
+  if (typeof desktop?.runAgent === "function") {
+    void checkUpdateFallback({ silent: true });
+  }
+}
 
 function homeRoute() {
   const role = state.me.role;
@@ -138,6 +207,7 @@ async function startup() {
     }
     state.engine = await api("/engine");
     void preloadSidebarData();
+    void initDesktopUpdater();
     if (!location.hash) go(homeRoute());
     else await render();
   } catch (error) {
@@ -608,6 +678,53 @@ async function onClick(event) {
       }
       break;
     }
+    case "update-check": {
+      if (typeof window.officeDesktop?.checkUpdate === "function") {
+        const result = await window.officeDesktop.checkUpdate();
+        applyDesktopUpdateState(result);
+        if (result?.status === "up-to-date") toastMessage("当前已是最新版本", "success");
+        else if (result?.status === "available") toastMessage(`发现新版本 v${result.latestVersion}`, "info");
+        else if (result?.status === "error") toastMessage(result.error || "检查更新失败", "error");
+      } else {
+        await checkUpdateFallback({ silent: false });
+      }
+      break;
+    }
+    case "update-download": {
+      if (typeof window.officeDesktop?.downloadUpdate !== "function") break;
+      state.updateBannerDismissed = false;
+      const result = await window.officeDesktop.downloadUpdate();
+      applyDesktopUpdateState(result);
+      if (result?.status === "ready") toastMessage(`v${result.latestVersion} 已下载完成，可立即安装并重启`, "success");
+      else if (result?.status === "error") toastMessage(result.error || "下载更新失败", "error");
+      break;
+    }
+    case "update-download-full": {
+      if (typeof window.officeDesktop?.downloadUpdate !== "function") break;
+      state.updateBannerDismissed = false;
+      const result = await window.officeDesktop.downloadUpdate({ mode: "full" });
+      applyDesktopUpdateState(result);
+      if (result?.status === "ready") toastMessage(`v${result.latestVersion} 完整安装包已下载完成`, "success");
+      else if (result?.status === "error") toastMessage(result.error || "下载更新失败", "error");
+      break;
+    }
+    case "update-cancel": {
+      if (typeof window.officeDesktop?.cancelUpdate === "function") {
+        await window.officeDesktop.cancelUpdate();
+        toastMessage("已取消下载");
+      }
+      break;
+    }
+    case "update-install": {
+      if (typeof window.officeDesktop?.installUpdate !== "function") break;
+      const result = await window.officeDesktop.installUpdate();
+      applyDesktopUpdateState(result);
+      break;
+    }
+    case "update-dismiss":
+      state.updateBannerDismissed = true;
+      syncUpdateUi();
+      break;
     case "search":
       openCommandPalette();
       break;

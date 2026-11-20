@@ -15,11 +15,23 @@ contextBridge.exposeInMainWorld("officeDesktop", {
   generateImage: (request) => ipcRenderer.invoke("qo:generate-image", request),
   cancelAgent: () => ipcRenderer.invoke("qo:cancel-agent"),
   openConnect: () => ipcRenderer.invoke("qo:open-connect"),
+  getUpdateState: () => ipcRenderer.invoke("qo:update-state"),
+  checkUpdate: () => ipcRenderer.invoke("qo:update-check"),
+  downloadUpdate: (options) => ipcRenderer.invoke("qo:update-download", options),
+  cancelUpdate: () => ipcRenderer.invoke("qo:update-cancel"),
+  installUpdate: () => ipcRenderer.invoke("qo:update-install"),
+  clearUpdateNotice: () => ipcRenderer.invoke("qo:update-clear-notice"),
   onAgentEvent: (callback) => {
     if (typeof callback !== "function") throw new TypeError("callback must be a function");
     const listener = (_event, value) => callback(value);
     ipcRenderer.on("qo:agent-event", listener);
     return () => ipcRenderer.removeListener("qo:agent-event", listener);
+  },
+  onUpdateEvent: (callback) => {
+    if (typeof callback !== "function") throw new TypeError("callback must be a function");
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on("qo:update-event", listener);
+    return () => ipcRenderer.removeListener("qo:update-event", listener);
   }
 });
 

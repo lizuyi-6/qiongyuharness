@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import conversations, files, gateway, identity, pipeline, presentation, projects, sub2api, tasks
+from . import conversations, files, gateway, identity, pipeline, presentation, projects, sub2api, tasks, updates
 from .store import DEMO, ZONE, initialize
 
 STATIC = Path(__file__).parent / "static"
@@ -90,7 +90,7 @@ async def lifespan(_):
             pass
 
 
-app = FastAPI(title="穹驭办公 API", version="0.2.8", lifespan=lifespan,
+app = FastAPI(title="穹驭办公 API", version="0.2.9", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url="/openapi.json" if DEMO else None)
 app.add_middleware(RequestLimits)
 if not DEMO:
@@ -104,6 +104,7 @@ app.include_router(conversations.router)
 app.include_router(projects.router)
 app.include_router(presentation.router)
 app.include_router(sub2api.router)
+app.include_router(updates.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
