@@ -17,11 +17,14 @@ async function startServer(handler) {
   };
 }
 
-function sseResponse(response, { text = "fake model response", finishReason = "stop", usage = { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 } } = {}) {
+function sseResponse(response, { text = "fake model response", finishReason = "stop", toolCalls,
+  usage = { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 } } = {}) {
   response.writeHead(200, { "Content-Type": "text/event-stream" });
+  const delta = toolCalls?.length ? { role: "assistant", tool_calls: toolCalls } : { role: "assistant", content: text };
+  const finalReason = toolCalls?.length ? "tool_calls" : finishReason;
   const events = [
-    { id: "chatcmpl-test", object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }] },
-    { id: "chatcmpl-test", object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta: {}, finish_reason: finishReason }] },
+    { id: "chatcmpl-test", object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta, finish_reason: null }] },
+    { id: "chatcmpl-test", object: "chat.completion.chunk", model: "mock-model", choices: [{ index: 0, delta: {}, finish_reason: finalReason }] },
     { id: "chatcmpl-test", choices: [], usage }
   ];
   for (const event of events) response.write(`data: ${JSON.stringify(event)}\n\n`);

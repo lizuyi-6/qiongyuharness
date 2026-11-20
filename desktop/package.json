@@ -1,6 +1,6 @@
 {
   "name": "qiongyu-office-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Qiongyu Office employee desktop",
   "author": "Qiongyu Technology",
   "main": "main.cjs",
@@ -30,7 +30,9 @@
       {
         "from": "runtime-stage/qo-runtime",
         "to": "qo-runtime",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {

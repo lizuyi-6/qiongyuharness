@@ -5,12 +5,34 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
 <title>连接穹驭办公</title>
 <style>
-*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;background:#eef2f9;color:#182849;font:15px "Microsoft YaHei",sans-serif}main{width:min(500px,90vw);padding:42px;background:#fff;border:1px solid #dce4f2;border-radius:20px;box-shadow:0 14px 40px #172a5010}h1{margin:12px 0 8px}p{color:#586987;line-height:1.65}label{display:block;font-weight:700;margin:26px 0 8px}input,button{width:100%;padding:13px;border-radius:8px;font:inherit}input{border:1px solid #aab9d7}button{margin-top:14px;border:0;background:#3154d4;color:white;font-weight:700;cursor:pointer}.brand{color:#3154d4;font-weight:bold;letter-spacing:2px}.notice{min-height:24px;margin-bottom:0}
+:root{--ink:#252a25;--muted:#565c53;--line:#e3e2da;--control-line:#c9cdc2;--wash:#f6f5f0;--paper:#fffefa;--accent:#365748;--accent-hover:#2b483b;--alert:#962f2d;--radius:5px}
+*{box-sizing:border-box}
+body{min-height:100vh;margin:0;display:grid;place-items:center;background:var(--wash);color:var(--ink);font:14px/1.6 "Segoe UI","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif}
+main{width:min(440px,90vw);padding:34px 32px;background:var(--paper);border:1px solid var(--line);border-radius:7px;box-shadow:0 12px 34px #26282012}
+.brand{display:flex;align-items:center;gap:9px;margin-bottom:18px}
+.brand-mark{display:grid;place-items:center;width:29px;height:29px;border-radius:var(--radius);background:var(--accent);color:var(--paper)}
+.brand-mark svg{width:21px;height:21px}
+.brand-name{font-size:16px;font-weight:700;color:var(--ink)}
+h1{margin:0 0 8px;font-size:22px;font-weight:680;line-height:1.3}
+p{margin:0;color:var(--muted);line-height:1.65}
+label{display:block;font-weight:625;font-size:13px;margin:22px 0 6px}
+input,button{width:100%;padding:9px 11px;border-radius:var(--radius);font:inherit}
+input{border:1px solid var(--control-line);background:var(--paper);color:var(--ink)}
+input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
+button{margin-top:14px;min-height:38px;border:1px solid var(--accent);background:var(--accent);color:#fff;font-weight:620;cursor:pointer}
+button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.55;cursor:default}
+.notice{min-height:22px;margin-top:12px;font-size:13px;color:var(--muted)}
+.notice.error{color:var(--alert)}
 </style>
 </head>
 <body><main>
-<div class="brand">穹驭办公</div><h1>连接企业工作台</h1>
-<p>输入公司提供的服务地址，连接后可以登录并处理每日任务。</p>
+<div class="brand">
+  <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 5h10l8 8v6h-6v-4l-5-5H3z"/><path d="M4 13h5l5 5v4H4z" opacity=".65"/></svg></span>
+  <span class="brand-name">穹驭办公</span>
+</div>
+<h1>连接企业工作台</h1>
+<p>输入公司提供的服务地址，连接后可登录并处理每日任务与办公会话。</p>
 <form id="connection">
 <label for="server">工作台服务地址</label><input id="server" type="url" value="https://office.aethernettech.dev" placeholder="https://office.example.com" required>
 <button type="submit">连接工作台</button>

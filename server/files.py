@@ -116,6 +116,21 @@ def download(key: str, user: User):
     })
 
 
+@router.get("/files/{key}/image")
+def image(key: str, user: User):
+    with database(write=True) as db:
+        row = file_for(db, user, key)
+        if row["owner_id"] != user["id"]:
+            fail(404, "图片不存在")
+        if row["extension"] != "png":
+            fail(404, "图片不存在")
+        audit(db, "file.image", user["id"], row["assignment_id"], row["template_id"], artifact_id=key)
+    return Response(bytes(row["data"]), media_type="image/png", headers={
+        "Content-Disposition": "inline",
+        "Cache-Control": "private, max-age=0",
+    })
+
+
 @router.get("/files/{key}/preview")
 def preview(key: str, user: User):
     with database(write=True) as db:

@@ -104,7 +104,8 @@ function runPipeline({
   runStage,
   emit = () => {},
   now = Date.now,
-  startedAt = now()
+  startedAt = now(),
+  signal
 }) {
   return (async () => {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" ||
@@ -112,6 +113,10 @@ function runPipeline({
         typeof runStage !== "function" || typeof now !== "function") {
       throw new Error("智能分工运行参数无效");
     }
+    const ensureNotAborted = () => {
+      if (signal?.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+    };
+    ensureNotAborted();
 
     const roles = config.roles;
     for (const role of ["understand", "execute", "accept"]) {
@@ -157,17 +162,20 @@ function runPipeline({
     async function callValidatedStage({ role, model, system, prompt, withContext, parser }) {
       let currentPrompt = prompt;
       for (let attempt = 0; attempt < 2; attempt += 1) {
+        ensureNotAborted();
         if (!canStartStage()) return { stopped: true, stopReason };
         const timeoutMs = Math.min(STAGE_TIMEOUT_MS, remainingMs());
         calls += 1;
         let result;
         try {
-          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, timeoutMs });
+          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, timeoutMs, signal });
         } catch (error) {
+          if (error?.code === "ABORTED" || signal?.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
           if (error?.quota_error) throw error;
           if (error?.code === "STAGE_TIMEOUT") return { timeout: true };
           throw error;
         }
+        ensureNotAborted();
 
         const usage = isObject(result?.usage) ? result.usage : {};
         try {

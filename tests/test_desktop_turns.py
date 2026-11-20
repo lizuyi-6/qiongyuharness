@@ -3,6 +3,9 @@ import os
 import tempfile
 import unittest
 import asyncio
+import base64
+import hashlib
+import struct
 from uuid import uuid4
 from io import BytesIO
 from unittest.mock import patch
@@ -389,6 +392,225 @@ class DesktopTurnTest(unittest.TestCase):
             self.gateway.validate()
         finally:
             self.gateway.URL, self.gateway.KEY = previous
+
+    def image_png(self, width=1024, height=1024, trailing=b""):
+        header = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height)
+        return header + trailing
+
+    def image_payload(self, *, width=1024, height=1024, model="gpt-image-2.6-flare", size="1024x1024",
+                      quality="medium", prompt="蓝色山峦插图", png=None):
+        return {"png_base64": base64.b64encode(png if png is not None else self.image_png(width, height)).decode(),
+                "width": width, "height": height, "model": model, "size": size, "quality": quality,
+                "prompt": prompt, "usage": {"input_tokens": 7, "output_tokens": 9,
+                    "input_tokens_details": {"image_tokens": 3, "private": 5}, "private": "drop"}}
+
+    def prepare_image(self, key, actor="lin", **overrides):
+        body = {"prompt": "蓝色山峦插图", "model": "gpt-image-2.6-flare", "size": "1024x1024", "quality": "medium"}
+        body.update(overrides)
+        return self.clients[actor].post(f"/api/v1/conversations/{key}/images/prepare", json=body)
+
+    def test_image_button_prepare_strictly_validates_and_checks_owner_and_mode(self):
+        key = self.conversation()
+        invalid = [
+            {"prompt": " ", "model": "gpt-image-2.6-flare", "size": "1024x1024", "quality": "medium"},
+            {"prompt": "x", "model": "chat-model", "size": "1024x1024", "quality": "medium"},
+            {"prompt": "x", "model": "gpt-image-2.6-flare", "size": "512x512", "quality": "medium"},
+            {"prompt": "x", "model": "gpt-image-2.6-flare", "size": "1024x1024", "quality": "ultra"},
+            {"prompt": "x", "model": "gpt-image-2.6-flare", "size": "1024x1024", "quality": "medium", "extra": True},
+        ]
+        invalid_fields = ["prompt", "model", "size", "quality", "extra"]
+        for body, field in zip(invalid, invalid_fields):
+            response = self.clients["lin"].post(f"/api/v1/conversations/{key}/images/prepare", json=body)
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertTrue(any(item.get("loc", [])[-1:] == [field] for item in response.json()["detail"]), response.text)
+        other = self.prepare_image(key, actor="chen")
+        self.assertEqual(other.status_code, 404, other.text)
+        self.assertEqual(other.json()["detail"], "会话不存在")
+        previous = self.gateway.MODE
+        try:
+            self.gateway.MODE = "demo"
+            disabled = self.prepare_image(key)
+            self.assertEqual(disabled.status_code, 409, disabled.text)
+            self.assertEqual(disabled.json()["detail"], "桌面执行模式未启用")
+        finally:
+            self.gateway.MODE = previous
+
+    def test_button_image_complete_checks_png_params_and_persists_digest_and_rejects_repeat(self):
+        from server.store import database, unpack
+        key = self.conversation()
+        prepared = self.prepare_image(key).json()
+        path = f"/api/v1/conversations/{key}/images/{prepared['run_id']}/complete"
+        wrong_model_payload = self.image_payload(model="gpt-image-2.6-sunburst")
+        wrong_model_payload.pop("prompt")
+        wrong_model = self.clients["lin"].post(path, json=wrong_model_payload)
+        self.assertEqual(wrong_model.status_code, 422, wrong_model.text)
+        self.assertEqual(wrong_model.json()["detail"], "生图参数与准备请求不一致")
+        mismatch_payload = self.image_payload(width=1536, height=1024,
+            size="1536x1024", png=self.image_png(1024, 1024))
+        mismatch_payload.pop("prompt")
+        mismatch = self.clients["lin"].post(path, json=mismatch_payload)
+        self.assertEqual(mismatch.status_code, 422, mismatch.text)
+        self.assertEqual(mismatch.json()["detail"], "生图返回内容无效")
+        non_png_payload = self.image_payload(png=b"not a PNG")
+        non_png_payload.pop("prompt")
+        non_png = self.clients["lin"].post(path, json=non_png_payload)
+        self.assertEqual(non_png.status_code, 422, non_png.text)
+        self.assertEqual(non_png.json()["detail"], "生图返回内容无效")
+        oversized_png = self.image_png() + b"x" * (10 * 1024 * 1024)
+        oversized_payload = self.image_payload(png=oversized_png)
+        oversized_payload.pop("prompt")
+        too_large = self.clients["lin"].post(path, json=oversized_payload)
+        self.assertEqual(too_large.status_code, 422, too_large.text)
+        self.assertTrue(any(item.get("loc", [])[-1:] == ["png_base64"] for item in too_large.json()["detail"]),
+                        too_large.text)
+        valid = self.image_payload()
+        result = self.clients["lin"].post(path, json={key: value for key, value in valid.items() if key != "prompt"})
+        self.assertEqual(result.status_code, 200, result.text)
+        turn = result.json()
+        self.assertEqual(turn["status"], "completed")
+        self.assertEqual(len(turn["images"]), 1)
+        stored_image = turn["images"][0]
+        self.assertEqual(stored_image["source"], "user")
+        self.assertEqual(stored_image["prompt"], "蓝色山峦插图")
+        self.assertEqual(stored_image["usage"], {"input_tokens": 7, "output_tokens": 9,
+            "input_tokens_details": {"image_tokens": 3}})
+        file_id = stored_image["file"]["id"]
+        data = base64.b64decode(valid["png_base64"])
+        with database() as db:
+            artifact = db.one("SELECT extension,label,run_id,digest,data FROM artifacts WHERE id=?", (file_id,))
+            image_audit = db.one("SELECT type,payload FROM events WHERE type='image.generated' AND payload LIKE ?",
+                                 (f"%{prepared['run_id']}%",))
+            usage = unpack(db.one("SELECT usage FROM runs WHERE id=?", (prepared["run_id"],))["usage"])
+        self.assertEqual(artifact["extension"], "png")
+        self.assertEqual(artifact["label"], "image")
+        self.assertEqual(artifact["run_id"], prepared["run_id"])
+        self.assertEqual(artifact["digest"], hashlib.sha256(data).hexdigest())
+        self.assertEqual(bytes(artifact["data"]), data)
+        self.assertEqual(image_audit["type"], "image.generated")
+        self.assertNotIn("png_base64", image_audit["payload"])
+        self.assertEqual(usage["model"], "gpt-image-2.6-flare")
+        duplicate = self.clients["lin"].post(path, json={key: value for key, value in valid.items() if key != "prompt"})
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+        self.assertEqual(duplicate.json()["detail"], "本轮生图已结束")
+
+    def test_button_image_wrong_owner_and_fail_keep_lifecycle(self):
+        key = self.conversation()
+        prepared = self.prepare_image(key).json()
+        base = f"/api/v1/conversations/{key}/images/{prepared['run_id']}"
+        body = self.image_payload()
+        body.pop("prompt")
+        other = self.clients["chen"].post(base + "/complete", json=body)
+        self.assertEqual(other.status_code, 404, other.text)
+        self.assertEqual(other.json()["detail"], "会话不存在")
+        failed = self.clients["lin"].post(base + "/fail", json={"message": "生成中断"})
+        self.assertEqual(failed.status_code, 200, failed.text)
+        history = self.clients["lin"].get(f"/api/v1/conversations/{key}").json()["turns"][-1]
+        self.assertEqual(history["status"], "failed")
+        self.assertEqual(history["images"], [])
+        self.assertEqual(history["error"], "生成中断")
+        duplicate = self.clients["lin"].post(base + "/fail", json={"message": "再次失败"})
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+        self.assertEqual(duplicate.json()["detail"], "本轮生图已结束")
+
+    def test_ai_image_upload_limit_status_ownership_and_complete_preservation(self):
+        key = self.conversation()
+        prepared = self.prepare(key)
+        run_path = f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/images"
+        image_body = self.image_payload()
+        first = self.clients["lin"].post(run_path, json=image_body)
+        self.assertEqual(first.status_code, 200, first.text)
+        first_image = first.json()
+        self.assertEqual(first_image["source"], "ai")
+        self.assertEqual(first_image["prompt"], "蓝色山峦插图")
+        self.assertEqual(first_image["usage"], {"input_tokens": 7, "output_tokens": 9,
+            "input_tokens_details": {"image_tokens": 3}})
+        second_body = self.image_payload(prompt="另一张插图")
+        second = self.clients["lin"].post(run_path, json=second_body)
+        self.assertEqual(second.status_code, 200, second.text)
+        third = self.clients["lin"].post(run_path, json=image_body)
+        self.assertEqual(third.status_code, 409, third.text)
+        self.assertEqual(third.json()["detail"], "本轮生图次数已达上限（2 张）")
+        complete = self.complete(key, prepared)
+        self.assertEqual(complete.status_code, 200, complete.text)
+        final = complete.json()
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(len(final["images"]), 2)
+        self.assertEqual(final["images"][0]["file"]["id"], first_image["file"]["id"])
+        self.assertEqual(final["reply"], "已整理演示稿")
+        stale = self.prepare(key)
+        self.assertEqual(stale["kind"], "conversation")
+        self.assertEqual(stale["run_id"] != prepared["run_id"], True)
+
+    def test_ai_images_survive_failed_turn_and_nonrunning_and_nonowner_reject(self):
+        key = self.conversation()
+        prepared = self.prepare(key)
+        run_path = f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/images"
+        other = self.clients["chen"].post(run_path, json=self.image_payload())
+        self.assertEqual(other.status_code, 404, other.text)
+        self.assertEqual(other.json()["detail"], "会话不存在")
+        saved = self.clients["lin"].post(run_path, json=self.image_payload())
+        self.assertEqual(saved.status_code, 200, saved.text)
+        failed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/fail", json={"message": "模型后续失败"})
+        self.assertEqual(failed.status_code, 200, failed.text)
+        history = self.clients["lin"].get(f"/api/v1/conversations/{key}").json()["turns"][-1]
+        self.assertEqual(history["status"], "failed")
+        self.assertEqual(len(history["images"]), 1)
+        self.assertEqual(history["images"][0]["file"]["id"], saved.json()["file"]["id"])
+        after = self.clients["lin"].post(run_path, json=self.image_payload())
+        self.assertEqual(after.status_code, 409, after.text)
+        self.assertEqual(after.json()["detail"], "本轮执行已结束")
+
+    def test_image_view_is_owner_only_and_png_upload_remains_rejected(self):
+        key = self.conversation()
+        prepared = self.prepare_image(key).json()
+        payload = self.image_payload()
+        png_bytes = base64.b64decode(payload["png_base64"])
+        payload.pop("prompt")
+        completed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/images/{prepared['run_id']}/complete",
+            json={name: value for name, value in payload.items() if name != "prompt"})
+        self.assertEqual(completed.status_code, 200, completed.text)
+        image_id = completed.json()["images"][0]["file"]["id"]
+        shown = self.clients["lin"].get(f"/api/v1/files/{image_id}/image")
+        self.assertEqual(shown.status_code, 200, shown.text)
+        self.assertEqual(shown.content, png_bytes)
+        self.assertEqual(shown.headers["content-type"], "image/png")
+        self.assertEqual(shown.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(shown.headers["content-disposition"], "inline")
+        self.assertEqual(shown.headers["cache-control"], "private, max-age=0")
+        other = self.clients["chen"].get(f"/api/v1/files/{image_id}/image")
+        self.assertEqual(other.status_code, 404, other.text)
+        self.assertEqual(other.json()["detail"], "文件不存在或当前账号无权访问")
+        uploaded = self.clients["lin"].post("/api/v1/files", files={"file": ("upload.png", png_bytes, "image/png")})
+        self.assertEqual(uploaded.status_code, 422, uploaded.text)
+        self.assertEqual(uploaded.json()["detail"], "请选择支持的文档格式，单个文件最多 12 MB")
+        doc_turn = self.prepare(key)
+        document = self.complete(key, doc_turn)
+        self.assertEqual(document.status_code, 200, document.text)
+        non_image = self.clients["lin"].get(f"/api/v1/files/{document.json()['file']['id']}/image")
+        self.assertEqual(non_image.status_code, 404, non_image.text)
+        self.assertEqual(non_image.json()["detail"], "图片不存在")
+
+    def test_ai_image_upload_requires_desktop_mode_and_valid_payload(self):
+        key = self.conversation()
+        prepared = self.prepare(key)
+        path = f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/images"
+        invalid = self.image_payload(png=b"not PNG")
+        rejected = self.clients["lin"].post(path, json=invalid)
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(rejected.json()["detail"], "生图返回内容无效")
+        previous = self.gateway.MODE
+        try:
+            self.gateway.MODE = "demo"
+            disabled = self.clients["lin"].post(path, json=self.image_payload())
+            self.assertEqual(disabled.status_code, 409, disabled.text)
+            self.assertEqual(disabled.json()["detail"], "桌面执行模式未启用")
+        finally:
+            self.gateway.MODE = previous
+        failed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/fail", json={"message": "cleanup"})
+        self.assertEqual(failed.status_code, 200, failed.text)
 
 
 if __name__ == "__main__":

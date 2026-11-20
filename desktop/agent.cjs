@@ -10,6 +10,8 @@ const { listModelsWithRefresh, modelServiceError, parseModels } = require("./lib
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
 const { quotaExhaustionMessage, requestUsage, USAGE_TIMEOUT_MS } = require("./lib/usage.cjs");
+const { createImageGenerator } = require("./lib/image-gen.cjs");
+const { createImageBroker } = require("./lib/image-broker.cjs");
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -41,6 +43,7 @@ function responseError(payload, status, fallback) {
 const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
 const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
 const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
+const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：仅在用户明确需要图片时调用；每轮最多生成 2 张，按张计费；不要在回复中输出图片链接、Markdown 图片或 base64；用户没有要图片时不要调用。";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -87,6 +90,18 @@ function unavailableRole(config, models, role) {
 function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, dependencies = {} }) {
   const credentialRoot = path.join(app.getPath("userData"), "qo-model-credentials");
   const runtimePaths = resolveRuntimePaths(app.isPackaged ? process.resourcesPath : undefined, __dirname);
+  const activeRuns = new Set();
+
+  function cancelAgent() {
+    let cancelled = false;
+    for (const controller of activeRuns) {
+      if (!controller.signal.aborted) {
+        controller.abort();
+        cancelled = true;
+      }
+    }
+    return cancelled;
+  }
 
   function currentSession() {
     const window = getWindow();
@@ -216,6 +231,15 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
   const readUsage = dependencies.requestUsage || requestUsage;
   const clockNow = dependencies.now || Date.now;
   const getNodeExecutable = dependencies.nodeExecutable || nodeExecutable;
+  const generateImage = createImageGenerator({
+    getModels: readFreshModels,
+    getCredential: async () => (await getCredentialImpl(getOrigin())).credential,
+    fetchImpl: dependencies.imageFetch || ((url, options) => net.fetch(url, options)),
+    now: clockNow,
+    timeoutMs: dependencies.imageTimeoutMs || 180_000
+  });
+  const imageGenerateImpl = dependencies.imageGenerate || generateImage;
+  const createImageBrokerImpl = dependencies.createImageBroker || createImageBroker;
 
   async function loadPipelineConfig(origin) {
     const payload = await readSessionJson(origin, `${origin}/api/v1/me/pipeline`);
@@ -238,9 +262,10 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     try {
       const available = await readFreshModels();
       const pipeline = await pipelineStatus(getOrigin(), available);
-      return { models: available, pipeline };
+      const image_models = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
+      return { models: available.filter((model) => !model.startsWith("gpt-image-")), image_models, pipeline };
     } catch (error) {
-      return { models: [], error: error.message || "模型列表加载失败",
+      return { models: [], image_models: [], error: error.message || "模型列表加载失败",
         pipeline: { available: false, reason: "模型列表获取失败" } };
     }
   }
@@ -272,12 +297,20 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" || typeof job.model !== "string") {
       throw new Error("桌面执行请求无效");
     }
+    const controller = new AbortController();
+    const { signal } = controller;
+    activeRuns.add(controller);
+    const ensureNotAborted = () => {
+      if (signal.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+    };
     const startedAt = clockNow();
     const pipelineRequested = job.model === "qo:pipeline";
     const origin = getOrigin();
     const hasContext = job.context !== undefined && job.context !== null;
+    try {
     emit({ type: "step", label: hasContext ? "载入项目资料" : "准备执行环境" });
     const available = await readFreshModels();
+    ensureNotAborted();
     let config;
     if (pipelineRequested) {
       try {
@@ -292,15 +325,25 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       }
     } else if (!available.includes(job.model)) {
       throw new Error("该模型已不再对你开放，请重新选择");
+    } else if (job.model.startsWith("gpt-image-")) {
+      throw new Error("生图模型只能用于生图");
     }
+    const imageModels = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
+    const imageToolEnabled = job.image_tool === true && !pipelineRequested && imageModels.length > 0;
+    const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
+    ensureNotAborted();
     const { credential } = await getCredentialImpl(origin);
+    ensureNotAborted();
+    let imageBroker;
 
     async function runStage(stage) {
+      ensureNotAborted();
       const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
       let gateway;
       try {
         let contextPath;
         let contextPatchPath;
+        const extraPatchPaths = [];
         if (stage.withContext && hasContext) {
           contextPath = path.join(place, "office-context.json");
           await fs.writeFile(contextPath, JSON.stringify(job.context), { encoding: "utf8", mode: 0o600 });
@@ -309,12 +352,23 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             `- insert:\n    - id: office-context\n      name: ${JSON.stringify(runtimePaths.contextPlugin)}\n`,
             { encoding: "utf8", mode: 0o600 });
         }
+        if (imageToolEnabled && imageBroker) {
+          const imagePatchPath = path.join(place, "office-image.patch.yml");
+          const pluginPath = path.join(runtimePaths.harnessRoot, "office-image.mjs").replaceAll("\\", "/");
+          await fs.writeFile(imagePatchPath,
+            `- insert:\n    - id: office-image\n      name: ${JSON.stringify(pluginPath)}\n`,
+            { encoding: "utf8", mode: 0o600 });
+          extraPatchPaths.push(imagePatchPath);
+        }
 
         gateway = await makeGateway({
           baseUrl: credential.baseUrl,
           apiKey: credential.apiKey,
           model: stage.model,
-          allowedTools: contextPath ? ["office_context_read"] : [],
+          allowedTools: [
+            ...(contextPath ? ["office_context_read"] : []),
+            ...(imageToolEnabled && imageBroker ? ["office_image_generate"] : [])
+          ],
           stickyQuotaError: pipelineRequested,
           fetchImpl: (url, options) => net.fetch(url, options)
         });
@@ -327,6 +381,10 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           model: stage.model,
           system: stage.system,
           contextPath,
+          ...(imageToolEnabled && imageBroker ? {
+            imageBrokerUrl: imageBroker.url,
+            imageBrokerKey: imageBroker.key
+          } : {}),
           dshBin: runtimePaths.dshBin
         });
         const node = getNodeExecutable();
@@ -337,11 +395,13 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           dshBin: runtimePaths.dshBin,
           patchPath: runtimePaths.patchPath,
           contextPatchPath,
+          ...(extraPatchPaths.length ? { extraPatchPaths } : {}),
           cwd: place,
           env,
           model: stage.model,
           prompt: stage.prompt,
           timeoutMs: stage.timeoutMs,
+          signal,
           onEvent: (event) => {
             if (event?.type === "step" && typeof event.label === "string") emit(event);
           }
@@ -361,6 +421,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           }
         };
       } catch (error) {
+        if (error?.code === "ABORTED" || signal.aborted) {
+          throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
+        }
         if (gateway?.quota_error) {
           let usageSnapshot;
           try {
@@ -381,6 +444,15 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     }
 
     try {
+      if (imageToolEnabled) {
+        imageBroker = await createImageBrokerImpl({
+          generate: (request, options) => imageGenerateImpl(request, options),
+          model: imageModel,
+          maxImages: 2,
+          deadlineAt: startedAt + 240_000,
+          now: clockNow
+        });
+      }
       if (pipelineRequested) {
         return await runPipeline({
           job,
@@ -389,16 +461,17 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           runStage,
           emit,
           now: clockNow,
-          startedAt
+          startedAt,
+          signal
         });
       }
       const result = await runStage({
         role: "execute",
         model: job.model,
-        system: job.system,
+        system: imageBroker ? `${job.system}\n\n${IMAGE_TOOL_INSTRUCTIONS}` : job.system,
         prompt: job.prompt,
         withContext: hasContext,
-        timeoutMs: 95_000
+        timeoutMs: imageBroker ? 240_000 : 95_000
       });
       emit({ type: "step", label: "处理完成" });
       return {
@@ -407,19 +480,30 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         model: job.model,
         max_tokens_clamped: result.usage.max_tokens_clamped,
         finish_reasons: result.usage.finish_reasons,
-        truncated: result.usage.truncated
+        truncated: result.usage.truncated,
+        ...(imageBroker ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
       };
     } catch (error) {
+      if (imageBroker?.images.length) {
+        error.message = `${error.message || "桌面执行失败"}（本轮已生成 ${imageBroker.images.length} 张图片并已计费，因执行失败未能保存）`;
+      }
       emit({ type: "step", label: error.message || "桌面执行失败" });
       throw error;
+    } finally {
+      await imageBroker?.close().catch(() => {});
+    }
+    } finally {
+      activeRuns.delete(controller);
     }
   }
 
   return {
+    cancelAgent,
     clearAllCredentials,
     clearCredentialsForOrigin,
     models,
     usage,
+    generateImage,
     prefetchAfterLogin,
     runAgent
   };

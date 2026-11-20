@@ -53,8 +53,9 @@ class RequestLimits:
                     (b"x-content-type-options", b"nosniff"),
                     (b"referrer-policy", b"no-referrer"),
                     (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
-                    (b"cache-control", b"no-store"),
                 ])
+                if not any(name.lower() == b"cache-control" for name, _ in response_headers):
+                    response_headers.append((b"cache-control", b"no-store"))
                 if identity.SECURE:
                     response_headers.append((b"strict-transport-security", b"max-age=31536000"))
             await send(message)

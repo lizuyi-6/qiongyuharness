@@ -4,9 +4,11 @@ import { agentSetup, dashboard, demoUsers, filesView, historyView, loginView, pa
   shell, taskDetail, views } from "./views.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
-import { attachFiles, chooseSources, loadDesktopModelState, loadEarlier, loadWorkspace, removeSource, runDesktopAgent,
-  refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel, toggleDesktopUsage,
-  scrollToLatest, selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView } from "./chat.js";
+import { attachFiles, cancelActiveChat, chooseSources, conversationNav, copyReply, loadDesktopModelState, loadEarlier,
+  loadWorkspace, removeSource, runDesktopAgent, refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel,
+  syncChatSubmit, syncDesktopUsagePanel, toggleDesktopUsage, scrollToLatest, selectChatModel, sendMessage,
+  showConversationHistory, showSources, useExample, workspaceView,
+  generateImageFromComposer, saveImageAutoPreference } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -34,6 +36,21 @@ function adminReset() {
   state.admin = {offset:0,department:"",status:"",date:""};
 }
 
+async function preloadConversations() {
+  const me = state.me;
+  if (!me) return;
+  try {
+    const conversations = await api("/conversations");
+    if (state.me !== me) return;
+    state.conversations = conversations;
+    if (state.chatWorkspace) state.chatWorkspace.conversations = conversations;
+    const nav = root.querySelector(".workspace-nav");
+    if (nav && state.route[0] !== "chat") {
+      nav.outerHTML = conversationNav({ conversations });
+    }
+  } catch {}
+}
+
 async function login(user) {
   await post("/auth/demo", {user_id:user});
   clearDrafts();
@@ -42,12 +59,16 @@ async function login(user) {
   state.agent=null;
   agentDesktopModels={};
   state.chatWorkspace=null;
+  state.conversations=[];
+  state.usageOpen=false;
+  state.usageState=null;
   state.filter="all";
   state.today=[];
   adminReset();
   historyOffset=0;
   dialog.close();
   [state.me,state.engine] = await Promise.all([api("/me"),api("/engine")]);
+  void preloadConversations();
   go(homeRoute());
 }
 
@@ -60,6 +81,9 @@ async function logout() {
   state.agent=null;
   agentDesktopModels={};
   state.chatWorkspace=null;
+  state.conversations=[];
+  state.usageOpen=false;
+  state.usageState=null;
   state.today=[];
   agentFiles=[];
   agentTask=null;
@@ -82,10 +106,13 @@ async function startup() {
     }
     if (!state.me) { root.innerHTML=loginView(); return; }
     state.engine=await api("/engine");
+    void preloadConversations();
     if (!location.hash) go(homeRoute());
     else await render();
   } catch (error) {
-    root.innerHTML=`<section class="splash"><div class="brand-mark">${icon("mark")}</div><h1>连接工作台</h1><p class="error">${e(error.message)}</p>${button("重试","boot")}</section>`;
+    const switchServer = typeof window.officeDesktop?.openConnect === "function"
+      ? button("切换工作台地址", "desktop-connect", { icon: "link" }) : "";
+    root.innerHTML=`<section class="splash"><div class="brand-mark">${icon("mark")}</div><h1>连接工作台</h1><p class="error">${e(error.message)}</p><div class="actions">${button("重试","boot")}${switchServer}</div></section>`;
   }
 }
 
@@ -102,9 +129,16 @@ function viewSignature() {
 function display(content, ticket, keepScroll = false) {
   if (ticket!==navigation) return;
   const y=window.scrollY;
+  const navScroll = root.querySelector(".sidebar nav")?.scrollTop || 0;
+  const sessionsScroll = root.querySelector(".recent-sessions")?.scrollTop || 0;
   root.innerHTML=shell(content);
+  const nav = root.querySelector(".sidebar nav");
+  if (nav) nav.scrollTop = navScroll;
+  const sessions = root.querySelector(".recent-sessions");
+  if (sessions) sessions.scrollTop = sessionsScroll;
   window.scrollTo(0, keepScroll ? y : 0);
   if (state.route[0]==="chat") {
+    syncDesktopUsagePanel();
     scrollToLatest();
     mountDeck();
   }
@@ -126,7 +160,7 @@ async function fetchAgent(parts, force = false) {
       };
     }
   }
-  agentDesktopModels=await loadDesktopModelState();
+  agentDesktopModels=await loadDesktopModelState({ allowPipeline: false, draftKey: "agent/last-model" });
   return agentSetup(state.agent,agentTask,agentFiles,agentDesktopModels);
 }
 
@@ -236,7 +270,7 @@ async function executeDesktopPlan(task, data, form) {
     },result=>{
       updateAgentRunStatus(form,"正在保存大纲…");
       phase="complete";
-      return post(base+"/"+encodeURIComponent(prepared.run_id)+"/complete",{
+      return post(base+"/complete",{
         run_id:prepared.run_id,text:result.text,
         usage:{...(result.usage || {}),max_tokens_clamped:result.max_tokens_clamped,
           finish_reasons:result.finish_reasons,truncated:result.truncated},model:result.model || model
@@ -310,10 +344,14 @@ async function onClick(event) {
     case "open-task": dialog.close(); go("task/"+encodeURIComponent(id)); break;
     case "agent-task": go("chat/task/"+encodeURIComponent(id)); break;
     case "chat-example": useExample(id); break;
+    case "chat-generate-image": await generateImageFromComposer(target,render); break;
     case "chat-remove-source": removeSource(id); break;
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
+    case "chat-cancel": await cancelActiveChat(); break;
+    case "copy-reply": await copyReply(id); break;
+    case "desktop-connect": await window.officeDesktop?.openConnect?.(); break;
     case "usage-toggle": await toggleDesktopUsage(target); break;
     case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace, target.closest("[data-usage-panel]")); break;
     case "slides-clear": clearSelection(); break;
@@ -435,10 +473,25 @@ async function onClick(event) {
       saveAgent();
       break;
     }
-    case "check-engine":
+    case "check-engine": {
       state.engine=await api("/engine");
-      toastMessage(state.engine.configured?"配置已加载，生成大纲时会调用已配置引擎":"尚未配置模型连接");
+      if (state.engine.client_execution) {
+        if (typeof window.officeDesktop?.models !== "function") {
+          toastMessage("当前为浏览器访问，AI 办理请在穹驭办公桌面客户端中使用");
+          break;
+        }
+        const info = await loadDesktopModelState();
+        if (info.models?.length) {
+          const suffix = info.pipelineAvailable ? "（支持智能分工）" : "";
+          toastMessage(`桌面连接正常，当前可用 ${info.models.length} 个模型${suffix}`);
+        } else {
+          toastMessage(info.modelNotice || "暂无可用模型，请联系管理员开通");
+        }
+      } else {
+        toastMessage(state.engine.configured?"配置已加载，生成大纲时会调用已配置引擎":"尚未配置模型连接");
+      }
       break;
+    }
     case "search":
       modal("搜索任务",'<form class="stack" data-form="search"><label class="field">任务标题关键词<input name="query" maxlength="130" required autofocus></label><div class="actions"><button class="button primary" type="submit">搜索</button></div><div data-results class="stack"></div></form>');
       break;
@@ -574,13 +627,17 @@ async function handleForm(event) {
     errorIn(form,error);
   } finally {
     delete form.dataset.busy;
-    controls.forEach(node=>{
-      if (form.dataset.form==="generate") {
-        node.textContent="AI 起草大纲";
-        node.disabled=state.engine?.client_execution===true && (typeof window.officeDesktop?.runAgent!=="function" ||
-          !agentDesktopModels.models?.includes(agentDesktopModels.selectedModel));
-      } else node.disabled=false;
-    });
+    if (form.dataset.form==="conversation") {
+      syncChatSubmit(form, state.chatWorkspace);
+    } else {
+      controls.forEach(node=>{
+        if (form.dataset.form==="generate") {
+          node.textContent="AI 起草大纲";
+          node.disabled=state.engine?.client_execution===true && (typeof window.officeDesktop?.runAgent!=="function" ||
+            !agentDesktopModels.models?.includes(agentDesktopModels.selectedModel));
+        } else node.disabled=false;
+      });
+    }
   }
 }
 
@@ -615,12 +672,16 @@ document.addEventListener("input",event=>{
   }
 });
 document.addEventListener("change",event=>{
+  if (event.target.matches("[name=allow_ai_images]")) {
+    saveImageAutoPreference(event.target.checked);
+    return;
+  }
   if (event.target.matches("[data-chat-model]")) {
     selectChatModel(event.target);
     return;
   }
   if (event.target.matches("[data-agent-model]")) {
-    selectDesktopModel(event.target,agentDesktopModels,"[data-agent-model-status]");
+    selectDesktopModel(event.target,agentDesktopModels,"[data-agent-model-status]","agent/last-model");
     return;
   }
   if (!event.target.matches("[data-upload]")) return;
@@ -663,7 +724,10 @@ setInterval(async ()=>{
   try {
     const previous=viewSignature();
     await loadToday();
-    if (state.me===me && state.route[0]==="today" && viewSignature()!==previous) root.innerHTML=shell(dashboard());
+    if (state.me===me && state.route[0]==="today" && viewSignature()!==previous) {
+      const workplace = root.querySelector("#workplace");
+      if (workplace) workplace.innerHTML = dashboard();
+    }
   } catch { /* The last displayed task list is retained during connection interruptions. */ }
   finally { timerBusy=false; }
 },4000);
