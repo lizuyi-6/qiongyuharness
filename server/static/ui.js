@@ -1,13 +1,31 @@
 export const root = document.querySelector("#app");
 export const dialog = document.querySelector("#dialog");
 const toast = document.querySelector("#toast");
+
 export const state = {
-  config: null, me: null, engine: null, route: [], today: [], filter: "all", focused: null,
-  agent: null, chatWorkspace: null, conversations: [], usageOpen: false, usageState: null,
-  admin: { offset: 0, department: "", status: "", date: "" }, auditOffset: 0
+  config: null,
+  me: null,
+  engine: null,
+  route: [],
+  today: [],
+  filter: "all",
+  focused: null,
+  agent: null,
+  chatWorkspace: null,
+  conversations: [],
+  usageOpen: false,
+  usageState: null,
+  contextOpen: false,
+  studioTab: "context",
+  filesCache: [],
+  filesFilter: "all",
+  filesQuery: "",
+  admin: { offset: 0, department: "", status: "", date: "" },
+  auditOffset: 0
 };
+
 const paths = {
-  mark: '<path d="M3 5h10l8 8v6h-6v-4l-5-5H3z" fill="currentColor" stroke="none"/><path d="M4 13h5l5 5v4H4z" fill="currentColor" opacity=".65" stroke="none"/>',
+  mark: '<path class="logo-outer" d="M13 18H6V6h12v7" stroke-width="2"/><path class="logo-inner" d="M9.6 13.4V9.6h3.8" stroke-width="1.45"/><path class="logo-axis" d="M12.6 12.6L18.8 18.8" stroke-width="2"/>',
   message: '<path d="M5 4h14a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4V6a2 2 0 0 1 1-2Z"/><path d="M8 9h9m-9 4h6"/>',
   today: '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4m8-4v4M3 9h18m-13 6 2 2 5-5"/>',
   folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
@@ -16,13 +34,16 @@ const paths = {
   tasks: '<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M8 10h8m-8 4h8m-8 4h5"/>',
   users: '<circle cx="9" cy="8" r="3"/><path d="M2 20v-2a4 4 0 0 1 4-4h6a4 4 0 0 1 4 4v2m1-15a3 3 0 0 1 0 6m5 9v-2a4 4 0 0 0-4-4"/>',
   audit: '<path d="M12 22s7-4 7-11V5l-7-3-7 3v6c0 7 7 11 7 11Z"/><path d="m9 11 2 2 4-4"/>',
-  right: '<path d="m9 5 7 7-7 7"/>', down:'<path d="m5 9 7 7 7-7"/>', left:'<path d="m15 5-7 7 7 7"/>',
+  right: '<path d="m9 5 7 7-7 7"/>',
+  down: '<path d="m5 9 7 7 7-7"/>',
+  left: '<path d="m15 5-7 7 7 7"/>',
   arrow: '<path d="M5 12h14m-6-6 6 6-6 6"/>',
   search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4 4"/>',
   refresh: '<path d="M20 11a8 8 0 1 0-1.3 5m1.3-9v4h-4"/>',
   calendar: '<rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4m8-4v4M3 9h18"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+  checkPlain: '<path d="m5 12 5 5 9-10"/>',
   alert: '<path d="M10.3 4.5a2 2 0 0 1 3.4 0l7.5 13A2 2 0 0 1 19.4 20H4.6a2 2 0 0 1-1.8-2.5zM12 9v4m0 3h.01"/>',
   docx: '<path d="M6 3h8l4 4v14H6zM14 3v5h4m-9 4h6m-6 4h6"/>',
   pptx: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M12 17v4m-3 0h6M8 13v-3m4 3V8m4 5v-2"/>',
@@ -30,15 +51,47 @@ const paths = {
   upload: '<path d="M12 16V4m-5 5 5-5 5 5M4 15v5h16v-5"/>',
   download: '<path d="M12 4v12m-5-5 5 5 5-5M4 16v4h16v-4"/>',
   edit: '<path d="m4 16-1 5 5-1L20 8l-4-4ZM14 6l4 4"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>', x:'<path d="m6 6 12 12M6 18 18 6"/>',
-  logout:'<path d="M11 4H4v16h7m5-13 5 5-5 5m5-5H8"/>',
-  link:'<path d="M13 5h6v6m0-6-8 8M9 5H5v14h14v-4"/>',
-  clip:'<path d="m9 11 5-5a3 3 0 1 1 4 4l-8 8a4 4 0 1 1-6-6l8-8"/>',
-  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
-  stop:'<rect x="6" y="6" width="12" height="12" rx="2"/>'
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  x: '<path d="m6 6 12 12M6 18 18 6"/>',
+  logout: '<path d="M11 4H4v16h7m5-13 5 5-5 5m5-5H8"/>',
+  link: '<path d="M13 5h6v6m0-6-8 8M9 5H5v14h14v-4"/>',
+  clip: '<path d="m9 11 5-5a3 3 0 1 1 4 4l-8 8a4 4 0 1 1-6-6l8-8"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  sidebar: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  panelRight: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>',
+  menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
+  sparkles: '<path d="m12 3 1.7 4.3L18 9l-4.3 1.7L12 15l-1.7-4.3L6 9l4.3-1.7L12 3Zm6 11 .9 2.1L21 17l-2.1.9L18 20l-.9-2.1L15 17l2.1-.9L18 14Z"/>',
+  inbox: '<path d="M3 13V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v7l-3 7H6l-3-7Z"/><path d="M3 13h5l2 3h4l2-3h5"/>',
+  layers: '<path d="m12 3 9 4.5-9 4.5-9-4.5L12 3Zm-9 9 9 4.5 9-4.5M3 16.5 12 21l9-4.5"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.4-11.4 1.4-1.4"/>',
+  moon: '<path d="M20 14.5A8 8 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5Z"/>'
 };
+
+const THEME_KEY = "qo-theme";
+
+export function getTheme() {
+  try {
+    const saved = localStorage.getItem(THEME_KEY);
+    if (saved === "light" || saved === "dark") return saved;
+  } catch {}
+  return "light";
+}
+
+export function applyTheme(mode = getTheme()) {
+  const next = mode === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem(THEME_KEY, next); } catch {}
+  return next;
+}
+
+export function toggleTheme() {
+  return applyTheme(getTheme() === "dark" ? "light" : "dark");
+}
+
 export function icon(name) {
-  return `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.docx}</svg>`;
+  const isMark = name === "mark";
+  return `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${isMark ? "2" : "1.5"}" stroke-linecap="${isMark ? "butt" : "round"}" stroke-linejoin="${isMark ? "miter" : "round"}">${paths[name] || paths.docx}</svg>`;
 }
 
 export function e(value) {
@@ -64,9 +117,11 @@ export function uuid() {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return Array.from(bytes, (v) => v.toString(16).padStart(2, "0")).join("");
 }
+
 export const isManager = () => ["admin", "manager"].includes(state.me?.role);
 export const isReview = () => isManager() || state.me?.role === "reviewer";
 export const active = (status) => ["pending", "in_progress", "paused", "returned"].includes(status);
+
 export const statuses = {
   pending:"待开始",in_progress:"进行中",paused:"已暂停",returned:"退回修改",submitted:"待审核",
   approved:"已验收",closed:"已关闭",revoked:"已撤销",scheduled:"待发布",
@@ -125,23 +180,54 @@ export function fromLocal(value) {
 }
 
 export function fileIcon(kind) {
-  return `<span class="task-icon ${e(kind)}">${icon(kind)}</span>`;
+  return `<span class="task-icon ${e(kind || "other")}">${icon(kind)}</span>`;
 }
 
 export function button(label, action, opts = {}) {
-  return `<button type="button" class="button ${opts.cls || ""}" data-act="${e(action)}" ${opts.id ? 'data-id="'+e(opts.id)+'"' : ""} ${opts.disabled ? "disabled" : ""}>${opts.icon ? icon(opts.icon) : ""}${e(label)}</button>`;
+  return `<button type="button" class="button ${opts.cls || ""}" data-act="${e(action)}" ${opts.id ? 'data-id="'+e(opts.id)+'"' : ""} ${opts.title ? 'title="'+e(opts.title)+'"' : ""} ${opts.disabled ? "disabled" : ""}>${opts.icon ? icon(opts.icon) : ""}${e(label)}</button>`;
 }
 
-export function toastMessage(message) {
+export function emptyState(title, copy = "", glyph = "inbox", action = "") {
+  return `<div class="empty-state">${icon(glyph)}<strong>${e(title)}</strong>${copy ? `<p>${e(copy)}</p>` : ""}${action}</div>`;
+}
+
+export function toastMessage(message, tone = "info") {
   toast.textContent = message;
+  toast.classList.remove("toast-error", "toast-success");
+  if (tone === "error") toast.classList.add("toast-error");
+  if (tone === "success") toast.classList.add("toast-success");
   toast.classList.add("show");
   clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => toast.classList.remove("show"), 3800);
+  toast.timer = setTimeout(() => toast.classList.remove("show"), 3600);
 }
+
+export async function copyText(text, okMessage = "已复制到剪贴板") {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.className = "sr-only";
+      document.body.append(area);
+      area.select();
+      document.execCommand("copy");
+      area.remove();
+    }
+    toastMessage(okMessage, "success");
+    return true;
+  } catch {
+    toastMessage("复制失败，请手动选择文本复制", "error");
+    return false;
+  }
+}
+
 export function modal(title, html) {
   dialog.innerHTML = `<header class="dialog-title"><h2>${e(title)}</h2><button class="icon-button" type="button" data-act="close-dialog" aria-label="关闭">${icon("x")}</button></header><div class="dialog-body">${html}</div>`;
   if (!dialog.open) dialog.showModal();
 }
+
 export function errorIn(node, error) {
   let target = node.querySelector(".error");
   if (!target) {
@@ -187,10 +273,12 @@ export function fileMarkup(file, opts = {}) {
   const size = file.size === undefined ? "" : file.size > 1048576 ? `${(file.size/1048576).toFixed(1)} MB` : `${Math.ceil(file.size/1024)} KB`;
   return `<div class="file">${opts.check ? `<input type="checkbox" name="${e(opts.check)}" value="${e(file.id)}" aria-label="${e(file.name)}" ${opts.checked ? "checked" : ""}>` : ""}${fileIcon(file.extension)}
     <span class="file-meta"><strong>${e(file.name)}</strong><small>${e(labels[file.extension] || file.extension)}${size ? " · " + size : ""}${file.parent_id ? " · 历史版本保留" : ""}</small></span>
-    <button class="text-button" type="button" data-act="preview" data-id="${e(file.id)}">预览</button>
-    <a class="text-button" href="/api/v1/files/${encodeURIComponent(file.id)}/download" download>下载</a>
-    ${opts.edit && ["docx","pptx"].includes(file.extension) ? `<button class="text-button" type="button" data-act="edit-file" data-id="${e(file.id)}">修改</button>` : ""}
-    ${opts.copy ? `<button class="text-button" type="button" data-act="copy-file" data-id="${e(file.id)}">关联</button>` : ""}
+    <span class="file-actions">
+      <button class="text-button" type="button" data-act="preview" data-id="${e(file.id)}">预览</button>
+      <a class="text-button" href="/api/v1/files/${encodeURIComponent(file.id)}/download" download>下载</a>
+      ${opts.edit && ["docx","pptx"].includes(file.extension) ? `<button class="text-button" type="button" data-act="edit-file" data-id="${e(file.id)}">修改</button>` : ""}
+      ${opts.copy ? `<button class="text-button" type="button" data-act="copy-file" data-id="${e(file.id)}">关联</button>` : ""}
+    </span>
   </div>`;
 }
 
