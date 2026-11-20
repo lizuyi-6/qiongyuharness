@@ -7,10 +7,10 @@ import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator,
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { attachFiles, cancelActiveChat, chooseSources, copyReply, loadDesktopModelState, loadEarlier,
-  loadWorkspace, removeSource, runDesktopAgent, refreshDesktopUsage, saveWorkspaceInput, selectDesktopModel,
-  syncChatSubmit, syncDesktopUsagePanel, toggleDesktopUsage, toggleWorkspaceContext, scrollToLatest,
-  selectChatModel, sendMessage, showConversationHistory, showSources, useExample, workspaceView,
-  generateImageFromComposer, saveImageAutoPreference } from "./chat.js";
+  loadWorkspace, openDeckInStudio, removeSource, runDesktopAgent, refreshDesktopUsage, saveWorkspaceInput,
+  selectDesktopModel, switchStudioTab, syncChatSubmit, syncDesktopUsagePanel, toggleDesktopUsage,
+  toggleWorkspaceContext, scrollToLatest, selectChatModel, sendMessage, showConversationHistory,
+  showSources, useExample, workspaceView, generateImageFromComposer, saveImageAutoPreference } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
@@ -72,7 +72,9 @@ async function login(user) {
   state.conversations = [];
   state.usageOpen = false;
   state.usageState = null;
-  state.contextOpen = true;
+  state.contextOpen = false;
+  state.studioTab = "context";
+  state._lastStudioKey = "";
   state.filesCache = [];
   state.filesFilter = "all";
   state.filesQuery = "";
@@ -408,6 +410,8 @@ async function onClick(event) {
     case "open-mobile-nav": setMobileNav(true); break;
     case "close-mobile-nav": setMobileNav(false); break;
     case "toggle-context": toggleWorkspaceContext(target); break;
+    case "studio-tab": switchStudioTab(id); break;
+    case "deck-open": openDeckInStudio(id); break;
     case "boot": await startup(); break;
     case "open-task": dialog.close(); setMobileNav(false); go("task/" + encodeURIComponent(id)); break;
     case "agent-task": go("chat/task/" + encodeURIComponent(id)); break;

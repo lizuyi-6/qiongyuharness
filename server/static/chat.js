@@ -1,6 +1,6 @@
 import { active, api, badge, button, copyText, deadline, e, fileMarkup, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
-import { deckFiles, deckPanel, selectionChip } from "./slides.js";
+import { deckFiles, deckPanel, selectDeckFile, selectionChip } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
@@ -206,15 +206,61 @@ export async function toggleDesktopUsage(triggerButton) {
   if (opening) await refreshDesktopUsage(state.chatWorkspace, panel);
 }
 
+function syncStudioDom() {
+  const workspaceEl = document.querySelector(".agent-workspace");
+  if (!workspaceEl) return;
+  const open = Boolean(state.contextOpen);
+  const tab = state.studioTab === "deck" && workspaceEl.dataset.hasDeck === "1" ? "deck" : "context";
+  state.studioTab = tab;
+  workspaceEl.classList.toggle("studio-open", open);
+  workspaceEl.classList.toggle("studio-deck", open && tab === "deck");
+
+  for (const pane of workspaceEl.querySelectorAll("[data-studio-pane]")) {
+    pane.hidden = pane.dataset.studioPane !== tab;
+  }
+  for (const btn of workspaceEl.querySelectorAll("[data-act=studio-tab]")) {
+    const activeTab = btn.dataset.id === tab;
+    btn.classList.toggle("active", activeTab);
+    btn.setAttribute("aria-selected", String(activeTab));
+  }
+  for (const toggleBtn of workspaceEl.querySelectorAll("[data-act=toggle-context]")) {
+    const targetTab = toggleBtn.dataset.id || "context";
+    const isOn = open && tab === targetTab;
+    toggleBtn.classList.toggle("active", isOn);
+    toggleBtn.setAttribute("aria-expanded", String(isOn));
+  }
+}
+
 export function toggleWorkspaceContext(triggerButton) {
   const workspaceEl = document.querySelector(".agent-workspace");
   if (!workspaceEl) return;
-  state.contextOpen = !state.contextOpen;
-  workspaceEl.classList.toggle("context-hidden", !state.contextOpen);
-  if (triggerButton) {
-    triggerButton.setAttribute("aria-expanded", String(state.contextOpen));
-    triggerButton.title = state.contextOpen ? "收起右侧上下文" : "展开右侧上下文";
+  const requestedTab = triggerButton?.dataset?.id || "";
+  if (requestedTab === "close") {
+    state.contextOpen = false;
+  } else if (requestedTab && (requestedTab === "deck" || requestedTab === "context")) {
+    if (state.contextOpen && state.studioTab === requestedTab) {
+      state.contextOpen = false;
+    } else {
+      state.contextOpen = true;
+      state.studioTab = requestedTab;
+    }
+  } else {
+    state.contextOpen = !state.contextOpen;
   }
+  syncStudioDom();
+}
+
+export function switchStudioTab(tab) {
+  state.contextOpen = true;
+  state.studioTab = tab === "deck" ? "deck" : "context";
+  syncStudioDom();
+}
+
+export function openDeckInStudio(fileId) {
+  state.contextOpen = true;
+  state.studioTab = "deck";
+  syncStudioDom();
+  if (fileId) selectDeckFile(fileId);
 }
 
 export async function loadDesktopModelState({ allowPipeline = true, draftKey = modelDraftKey } = {}) {
@@ -364,7 +410,7 @@ function turnView(turn, index) {
           `<ul class="pipeline-issues">${pipeline.issues.map((issue) => `<li>${e(issue)}</li>`).join("")}</ul>` : ""}
       </div>` : ""}
       ${outputWarnings(turn.output_telemetry)}
-      ${turn.file ? `<div class="session-file">${fileMarkup(turn.file, { edit: true })}</div>` : ""}
+      ${turn.file ? `<div class="session-file">${fileMarkup(turn.file, { edit: true })}${turn.file.extension === "pptx" ? `<div class="session-file-extra"><button type="button" class="text-button" data-act="deck-open" data-id="${e(turn.file.id)}">${icon("panelRight")}在画布中预览</button></div>` : ""}</div>` : ""}
       ${images.length ? `<div class="turn-images">${images.map((image) => {
         const file = image.file || {};
         const id = typeof file.id === "string" ? file.id : "";
@@ -402,27 +448,68 @@ function welcome(workspace) {
     ? task.title
     : project
       ? "当前会话已关联项目共享资料，可直接交代工作要求。"
-      : "交代要做的工作，或从右侧关联一项今日任务。";
+      : "交代要做的工作，支持拖拽附件或直接关联一项今日待办。";
+
+  const quickTasks = !task && !project && workspace.tasks?.length
+    ? `<section class="welcome-tasks" aria-label="今日待办任务">
+        <div class="between">
+          <span class="context-label">直接办理今日任务</span>
+          <button type="button" class="text-button" data-act="route" data-id="today">全部任务${icon("right")}</button>
+        </div>
+        <div class="welcome-task-grid">${workspace.tasks.slice(0, 4).map((item) => `
+          <button type="button" class="welcome-task-item" data-act="route" data-id="chat/task/${encodeURIComponent(item.id)}">
+            <strong>${e(item.title)}</strong>
+            <span class="${item.overdue ? "late" : ""}">${e(deadline(item.due_at))}${item.overdue ? " · 逾期" : ""}</span>
+          </button>`).join("")}
+        </div>
+      </section>`
+    : "";
 
   return `<div class="workspace-empty">
     <h1>${e(heading)}</h1>
     <p class="welcome-sub">${e(subtitle)}</p>
     <div class="prompt-examples">${examples.map(([label, value]) =>
       button(label, "chat-example", { id: value })).join("")}</div>
+    ${quickTasks}
   </div>`;
 }
 
-function contextView(workspace) {
+function contextAnchorBar(workspace) {
+  const { task, project } = workspace;
+  if (!task && !project) return "";
+  if (task) {
+    return `<div class="context-anchor">
+      <div class="context-anchor-main">
+        <span class="context-anchor-tag">关联任务</span>
+        <strong title="${e(task.title)}">${e(task.title)}</strong>
+        ${badge(task.status)}
+        <span class="hint mono">${e(deadline(task.due_at))}</span>
+      </div>
+      <div class="context-anchor-actions">
+        <button type="button" class="text-button" data-act="toggle-context" data-id="context">任务要求</button>
+        <button type="button" class="text-button" data-act="open-task" data-id="${e(task.id)}">${active(task.status) ? "去交付" : "详情"}${icon("right")}</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="context-anchor">
+    <div class="context-anchor-main">
+      <span class="context-anchor-tag">项目空间</span>
+      <strong title="${e(project.name)}">${e(project.name)}</strong>
+      <span class="hint">${project.context.length} 份共享资料</span>
+    </div>
+    <div class="context-anchor-actions">
+      <button type="button" class="text-button" data-act="toggle-context" data-id="context">共享资料</button>
+      <button type="button" class="text-button" data-act="route" data-id="projects/${e(project.id)}">打开项目${icon("right")}</button>
+    </div>
+  </div>`;
+}
+
+function contextBody(workspace) {
   const task = workspace.task;
   const project = workspace.project;
-  return `<aside class="workspace-context" aria-label="办公上下文">
-    ${deckPanel(workspace)}
-    <div class="context-head">
-      <h2>办公上下文</h2>
-      <button type="button" class="icon-button" data-act="toggle-context" aria-label="收起办公上下文" title="收起侧栏">${icon("x")}</button>
-    </div>
+  return `<div class="studio-context-body">
     ${project ? `<section class="context-group"><p class="context-label">项目共享资料</p><h3>${e(project.name)}</h3>
-      ${project.context.length ? `<ul class="context-files">${project.context.slice(0, 6).map((item) => `<li>${icon("clip")}<span>${e(item.title)}</span></li>`).join("")}</ul>` : '<p class="hint">暂无共享资料</p>'}
+      ${project.context.length ? `<ul class="context-files">${project.context.slice(0, 8).map((item) => `<li>${icon("clip")}<span>${e(item.title)}</span></li>`).join("")}</ul>` : '<p class="hint">暂无共享资料</p>'}
       ${button("打开项目空间", "route", { id: "projects/" + project.id, icon: "right", cls: "sm" })}</section>` : ""}
     ${task ? `<section class="context-group">
       <p class="context-label">关联任务</p>
@@ -441,6 +528,22 @@ function contextView(workspace) {
     </section>`}
     ${task?.materials.length ? `<section class="context-group"><p class="context-label">任务资料</p><ul class="context-files">
       ${task.materials.map((file) => `<li>${icon("clip")}<span>${e(file.name)}</span></li>`).join("")}</ul></section>` : ""}
+  </div>`;
+}
+
+function studioPane(workspace, hasDeck, activeTab) {
+  return `<aside class="studio-pane" aria-label="工作台右侧面板">
+    <header class="studio-pane-head">
+      <div class="studio-tabs" role="tablist">
+        ${hasDeck ? `<button type="button" role="tab" class="studio-tab ${activeTab === "deck" ? "active" : ""}" data-act="studio-tab" data-id="deck" aria-selected="${activeTab === "deck"}">PPT 预览</button>` : ""}
+        <button type="button" role="tab" class="studio-tab ${activeTab === "context" ? "active" : ""}" data-act="studio-tab" data-id="context" aria-selected="${activeTab === "context"}">办公上下文</button>
+      </div>
+      <button type="button" class="icon-button" data-act="toggle-context" data-id="close" aria-label="关闭右侧面板" title="收起右侧面板">${icon("x")}</button>
+    </header>
+    <div class="studio-pane-content">
+      ${hasDeck ? `<div class="studio-view" data-studio-pane="deck" ${activeTab === "deck" ? "" : "hidden"}>${deckPanel(workspace)}</div>` : ""}
+      <div class="studio-view" data-studio-pane="context" ${activeTab === "context" ? "" : "hidden"}>${contextBody(workspace)}</div>
+    </div>
   </aside>`;
 }
 
@@ -513,9 +616,19 @@ export function workspaceView(workspace) {
   const title = session?.title || (task ? task.title : project ? project.name : "新会话");
   const showUsage = desktopUsageEnabled();
   const hasDeck = deckFiles(session).length > 0;
-  if (hasDeck) state.contextOpen = true;
 
-  return `<div class="agent-workspace ${hasDeck ? "has-deck" : ""} ${state.contextOpen ? "" : "context-hidden"}">
+  // 智能默认分屏策略：有 PPT 产物时默认进入「画布分屏」，无 PPT 时默认「居中单栏沉浸」
+  if (workspace.draftKey !== state._lastStudioKey) {
+    state._lastStudioKey = workspace.draftKey;
+    state.contextOpen = hasDeck;
+    state.studioTab = hasDeck ? "deck" : "context";
+  } else if (!hasDeck && state.studioTab === "deck") {
+    state.studioTab = "context";
+  }
+  const activeTab = hasDeck && state.studioTab === "deck" ? "deck" : "context";
+  const open = Boolean(state.contextOpen);
+
+  return `<div class="agent-workspace ${open ? "studio-open" : ""} ${open && activeTab === "deck" ? "studio-deck" : ""}" data-has-deck="${hasDeck ? "1" : "0"}">
     <section class="agent-thread" aria-label="办公会话">
       <header class="thread-header">
         <div class="thread-title">
@@ -526,9 +639,11 @@ export function workspaceView(workspace) {
           ${state.engine?.engine === "demo" ? '<span class="thread-engine">本地演示</span>' :
             state.engine?.model ? `<span class="thread-engine mono">${e(state.engine.model)}</span>` : ""}
           ${showUsage ? `<button class="button sm usage-toggle" type="button" data-act="usage-toggle" aria-expanded="${state.usageOpen ? "true" : "false"}">模型额度</button>` : ""}
-          <button class="icon-button" type="button" data-act="toggle-context" aria-expanded="${state.contextOpen ? "true" : "false"}" aria-label="切换右侧上下文" title="${state.contextOpen ? "收起办公上下文" : "展开办公上下文"}">${icon("panelRight")}</button>
+          ${hasDeck ? `<button class="button sm ghost studio-trigger ${open && activeTab === "deck" ? "active" : ""}" type="button" data-act="toggle-context" data-id="deck" aria-expanded="${open && activeTab === "deck" ? "true" : "false"}">${icon("pptx")}画布</button>` : ""}
+          <button class="button sm ghost studio-trigger ${open && activeTab === "context" ? "active" : ""}" type="button" data-act="toggle-context" data-id="context" aria-expanded="${open && activeTab === "context" ? "true" : "false"}">${icon("panelRight")}上下文</button>
         </div>
       </header>
+      ${contextAnchorBar(workspace)}
       ${showUsage ? `<section class="usage-panel" data-usage-panel aria-label="模型额度" ${state.usageOpen ? "" : "hidden"}>
         <div class="usage-panel-heading"><h2>模型额度</h2>
           <button class="button sm" type="button" data-act="usage-refresh">${icon("refresh")}刷新</button></div>
@@ -540,7 +655,7 @@ export function workspaceView(workspace) {
       </div>
       ${composer(workspace)}
     </section>
-    ${contextView(workspace)}
+    ${studioPane(workspace, hasDeck, activeTab)}
   </div>`;
 }
 
@@ -1016,7 +1131,11 @@ export async function sendMessage(form, rerender) {
     writeDraft(workspace, null, { message: "", newId: null, pending: null, selection: null });
     const deck = completed.file?.extension === "pptx" ? { fileId: completed.file.id, page: draft.selection?.slide || 1 } : draft.deck;
     saveDraft("chat/" + threadId, { selected, mode: payload.mode, deck });
-    if (completed.file?.extension === "pptx") state.contextOpen = true;
+    if (completed.file?.extension === "pptx") {
+      state.contextOpen = true;
+      state.studioTab = "deck";
+      state._lastStudioKey = "chat/" + threadId;
+    }
     if (completed.file && workspace.task) {
       const key = "submit/" + workspace.task.id;
       const submission = readDraft(key) || {};
