@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 
 const resolve = createRequire(process.env.QO_DSH_EXECUTABLE || import.meta.url);
 const { defineTool } = await import(pathToFileURL(resolve.resolve("@deepseek-ai/dsh-tools")).href);
-const ALLOWED_TOOLS = new Set(["office_context_read", "office_image_generate"]);
+const ALLOWED_TOOLS = new Set(["office_context_read", "office_image_generate", "office_ppt_check"]);
 const SIZES = ["1024x1024", "1536x1024", "1024x1536", "1536x864"];
 const QUALITIES = ["low", "medium", "high"];
 

@@ -550,6 +550,47 @@
   animation: pulse-dot 1.1s ease-in-out infinite;
 }
 
+/* 实时思维链折叠面板 */
+.live-thinking {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  overflow: hidden;
+}
+.live-thinking[hidden] { display: none; }
+.live-thinking summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 560;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+.live-thinking summary::-webkit-details-marker { display: none; }
+.live-thinking summary:hover { background: var(--bg-hover); color: var(--ink); }
+.live-thinking .thinking-meta {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.live-thinking-body {
+  margin: 0;
+  padding: 8px 12px 10px;
+  max-height: 190px;
+  overflow-y: auto;
+  border-top: 1px dashed var(--line);
+  font: 11.5px/1.6 var(--font-mono);
+  color: var(--ink-3);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* 运行中状态栏 */
 .running-bar {
   position: relative;

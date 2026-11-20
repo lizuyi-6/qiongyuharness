@@ -1005,6 +1005,8 @@ function liveTurnMarkup(live) {
   const stepsHtml = steps.map((step, idx) =>
     `<li class="${idx === steps.length - 1 ? "active" : "done"}"><span class="step-dot" aria-hidden="true"></span><span>${e(step)}</span></li>`
   ).join("");
+  const thinkingText = typeof live.thinking === "string" ? live.thinking : "";
+  const hasThinking = Boolean(thinkingText.trim());
   const canStop = live.canCancel && live.phase !== "complete";
   return `<section class="conversation-turn pending-turn" data-live-thread="${e(live.threadId)}">
     <div class="request-entry"><p>${selectionHtml}${e(live.message)}</p></div>
@@ -1013,6 +1015,10 @@ function liveTurnMarkup(live) {
         <p class="response-byline"><span class="response-mark is-working">${icon("mark")}</span><strong>穹驭</strong></p>
       </div>
       <ol class="live-steps" data-progress-trace ${steps.length ? "" : "hidden"}>${stepsHtml}</ol>
+      <details class="live-thinking" data-live-thinking ${hasThinking ? "open" : "hidden"}>
+        <summary><span class="thinking-label">思考过程</span><span class="thinking-meta" data-thinking-meta>${hasThinking ? `${thinkingText.length} 字` : ""}</span></summary>
+        <pre class="live-thinking-body" data-thinking-body>${e(thinkingText)}</pre>
+      </details>
       <div class="running-bar">
         <span class="running-pulse" aria-hidden="true"></span>
         <p class="running-note" ${live.kind === "image" ? "data-image-progress" : ""} role="status">${e(live.statusText || "正在思考…")}</p>
@@ -1876,7 +1882,61 @@ function appendProgressStep(progress, label) {
   scrollToLatest();
 }
 
-export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result) => result) {
+const THINKING_STAGE_LABELS = {
+  understand: "理解需求",
+  execute: "方案执行",
+  accept: "独立验收",
+  review: "高级复核",
+  light: "轻量处理"
+};
+
+function appendLiveThinking(live, text, stage = "", model = "") {
+  if (typeof text !== "string" || !text) return;
+  const stageKey = `${stage || ""}|${model || ""}`;
+  let chunk = text;
+  if (stageKey && stageKey !== live.thinkingStage) {
+    live.thinkingStage = stageKey;
+    const title = [THINKING_STAGE_LABELS[stage] || "", model || ""].filter(Boolean).join(" · ");
+    if (title) {
+      chunk = `${live.thinking ? "\n\n" : ""}── ${title} ──\n${text}`;
+    }
+  }
+  live.thinking = `${live.thinking || ""}${chunk}`;
+  if (live.thinking.length > 24000) {
+    live.thinking = "…（已省略更早思考）\n" + live.thinking.slice(-20000);
+  }
+  live.thinkingChars = (live.thinkingChars || 0) + text.length;
+  live.statusText = `模型深度思考中（已思考 ${live.thinkingChars} 字）…`;
+  if (!isViewingThread(live.threadId, live.userId)) return;
+  const node = findLiveProgress(live.threadId);
+  if (!node) return;
+  const box = node.querySelector("[data-live-thinking]");
+  const body = node.querySelector("[data-thinking-body]");
+  const meta = node.querySelector("[data-thinking-meta]");
+  const note = node.querySelector(".running-note");
+  if (box && box.hidden) {
+    box.hidden = false;
+    box.open = true;
+  }
+  if (body) {
+    body.textContent = live.thinking;
+    body.scrollTop = body.scrollHeight;
+  }
+  if (meta) meta.textContent = `${live.thinkingChars} 字`;
+  if (note) note.textContent = live.statusText;
+}
+
+function updateLiveProgress(live, chars, stage = "") {
+  if (!Number.isFinite(chars) || chars <= 0) return;
+  const label = THINKING_STAGE_LABELS[stage] || "方案";
+  live.statusText = `正在生成${label}（已输出 ${chars} 字）…`;
+  if (!isViewingThread(live.threadId, live.userId)) return;
+  const node = findLiveProgress(live.threadId);
+  const note = node?.querySelector(".running-note");
+  if (note) note.textContent = live.statusText;
+}
+
+export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result) => result, onEvent = () => {}) {
   const desktop = window.officeDesktop;
   if (typeof desktop?.runAgent !== "function") throw new Error("请在桌面客户端中使用 AI 办理");
   let unsubscribe = () => {};
@@ -1884,6 +1944,7 @@ export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result
     try {
       const stop = desktop.onAgentEvent?.((event) => {
         if (event?.type === "step") onStep(event.label);
+        else if (event) onEvent(event);
       });
       if (typeof stop === "function") unsubscribe = stop;
     } catch {}
@@ -1926,6 +1987,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
     const enableImageTool = Boolean(workspace.image_models?.length) && (usePptImages || allowImageTool === true);
     const job = {
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
+      ...(prepared.wants_pptx ? { ppt_check: true } : {}),
       ...(enableImageTool ? { image_tool: true, max_images: usePptImages ? 3 : 2 } : {})
     };
     return await runDesktopAgent(job, (label) => {
@@ -1959,6 +2021,9 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
       });
       if (imageSaveFailures) completed.image_save_failures = imageSaveFailures;
       return completed;
+    }, (event) => {
+      if (event.type === "thinking") appendLiveThinking(live, event.text, event.stage, event.model);
+      else if (event.type === "progress") updateLiveProgress(live, event.chars, event.stage);
     });
   } catch (error) {
     if ((cancelled || error?.name === "AbortError") && !String(error?.message || "").startsWith("已停止生成")) {

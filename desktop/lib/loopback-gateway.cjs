@@ -1,10 +1,11 @@
 const http = require("node:http");
 const { randomBytes, timingSafeEqual } = require("node:crypto");
+const { StringDecoder } = require("node:string_decoder");
 const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
 const RESPONSE_LIMIT = 3 * 1024 * 1024;
-const MAX_CALLS = 4;
+const MAX_CALLS = 12;
 // 不再自设输出上限：表内模型按其官方单次输出上限下发 max_tokens（2026-11-20 查官方/公开文档，
 // 并在线上以该值实测上游返回 200）；表外模型不下发 max_tokens，由上游默认值决定。
 // 显式下发而不是省略，是因为 sub2api 转 Anthropic 协议上游时，缺省会补 8192。
@@ -188,6 +189,36 @@ function quotaErrorDetails(upstream, body) {
   return details;
 }
 
+function extractDeltaSignals(payload, seenTools, onStreamEvent) {
+  if (!payload || typeof payload !== "object") return;
+  for (const choice of Array.isArray(payload.choices) ? payload.choices : []) {
+    const delta = choice?.delta || choice?.message;
+    if (!delta || typeof delta !== "object") continue;
+    const thinking = typeof delta.reasoning_content === "string"
+      ? delta.reasoning_content
+      : typeof delta.reasoning === "string"
+        ? delta.reasoning
+        : typeof delta.thinking === "string"
+          ? delta.thinking
+          : "";
+    if (thinking) onStreamEvent({ type: "thinking", text: thinking });
+    if (Array.isArray(delta.tool_calls)) {
+      for (const call of delta.tool_calls) {
+        const name = call?.function?.name;
+        const idx = call?.index ?? call?.id ?? name;
+        const key = `${idx}:${name}`;
+        if (typeof name === "string" && name && !seenTools.has(key)) {
+          seenTools.add(key);
+          onStreamEvent({ type: "tool", name });
+        }
+      }
+    }
+    if (typeof delta.content === "string" && delta.content) {
+      onStreamEvent({ type: "content", chars: delta.content.length });
+    }
+  }
+}
+
 async function pipeResponse(upstream, response, state) {
   const contentType = upstream.headers.get("content-type") || "application/json";
   if (upstream.ok && !state.sticky_quota_error) state.quota_error = null;
@@ -215,6 +246,18 @@ async function pipeResponse(upstream, response, state) {
   const reader = upstream.body.getReader();
   const chunks = [];
   let total = 0;
+  const isSse = contentType.includes("text/event-stream");
+  const decoder = isSse ? new StringDecoder("utf8") : null;
+  const seenTools = new Set();
+  let sseBuffer = "";
+  const parseSseLine = (line) => {
+    if (!line.startsWith("data:")) return;
+    const raw = line.slice(5).trim();
+    if (!raw || raw === "[DONE]") return;
+    try {
+      extractDeltaSignals(JSON.parse(raw), seenTools, state.onStreamEvent);
+    } catch {}
+  };
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -227,10 +270,29 @@ async function pipeResponse(upstream, response, state) {
       }
       const chunk = Buffer.from(value);
       chunks.push(chunk);
+      if (isSse && typeof state.onStreamEvent === "function") {
+        sseBuffer += decoder.write(chunk);
+        let nl;
+        while ((nl = sseBuffer.indexOf("\n")) >= 0) {
+          const line = sseBuffer.slice(0, nl).replace(/\r$/, "");
+          sseBuffer = sseBuffer.slice(nl + 1);
+          parseSseLine(line);
+        }
+      }
       if (!response.write(chunk)) await new Promise((resolve) => response.once("drain", resolve));
     }
+    if (isSse && typeof state.onStreamEvent === "function") {
+      sseBuffer += decoder.end();
+      if (sseBuffer.trim()) parseSseLine(sseBuffer.replace(/\r$/, ""));
+    }
     response.end();
-    const details = responseDetails(contentType, Buffer.concat(chunks, total));
+    const fullBody = Buffer.concat(chunks, total);
+    if (!isSse && typeof state.onStreamEvent === "function") {
+      try {
+        extractDeltaSignals(JSON.parse(fullBody.toString("utf8")), seenTools, state.onStreamEvent);
+      } catch {}
+    }
+    const details = responseDetails(contentType, fullBody);
     addUsage(state.usage, details.usage);
     for (const reason of details.finishReasons) {
       if (state.finish_reasons.length < MAX_CALLS) state.finish_reasons.push(reason);
@@ -243,7 +305,7 @@ async function pipeResponse(upstream, response, state) {
 }
 
 async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = [], stickyQuotaError = false,
-  fetchImpl = globalThis.fetch }) {
+  fetchImpl = globalThis.fetch, onStreamEvent = null }) {
   if (typeof baseUrl !== "string" || !baseUrl.startsWith("https://") && !baseUrl.startsWith("http://127.0.0.1:")) {
     throw new Error("模型服务地址无效");
   }
@@ -260,7 +322,8 @@ async function createLoopbackGateway({ baseUrl, apiKey, model, allowedTools = []
     finish_reasons: [],
     truncated: false,
     quota_error: null,
-    sticky_quota_error: stickyQuotaError === true
+    sticky_quota_error: stickyQuotaError === true,
+    onStreamEvent: typeof onStreamEvent === "function" ? onStreamEvent : null
   };
   const upstreamUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
   const server = http.createServer(async (request, response) => {

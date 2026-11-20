@@ -342,6 +342,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     }
     const imageModels = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
     const imageToolEnabled = job.image_tool === true && imageModels.length > 0;
+    const pptCheckEnabled = job.ppt_check === true;
     const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 && job.max_images <= 3 ? job.max_images : 2;
     const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
     ensureNotAborted();
@@ -349,11 +350,32 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     ensureNotAborted();
     let imageBroker;
 
+    const toolDisplayNames = {
+      office_context_read: "读取授权项目资料",
+      office_image_generate: "生成专属配图",
+      office_ppt_check: "校验 PPT 自由画布排版"
+    };
+
     async function runStage(stage) {
       ensureNotAborted();
       const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
       let gateway;
       const stageImageEnabled = Boolean(imageToolEnabled && imageBroker && stage.withImages !== false);
+      const stagePptCheckEnabled = Boolean(pptCheckEnabled && stage.withImages !== false);
+      let thinkingBuffer = "";
+      let thinkingTimer = null;
+      let contentChars = 0;
+      let lastProgressAt = 0;
+      const flushThinking = () => {
+        if (thinkingTimer) {
+          clearTimeout(thinkingTimer);
+          thinkingTimer = null;
+        }
+        if (!thinkingBuffer) return;
+        const text = thinkingBuffer;
+        thinkingBuffer = "";
+        emit({ type: "thinking", text, stage: stage.role, model: stage.model });
+      };
       try {
         let contextPath;
         let contextPatchPath;
@@ -374,6 +396,14 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             { encoding: "utf8", mode: 0o600 });
           extraPatchPaths.push(imagePatchPath);
         }
+        if (stagePptCheckEnabled) {
+          const checkPatchPath = path.join(place, "office-ppt-check.patch.yml");
+          const checkPluginPath = path.join(runtimePaths.harnessRoot, "office-ppt-check.mjs").replaceAll("\\", "/");
+          await fs.writeFile(checkPatchPath,
+            `- insert:\n    - id: office-ppt-check\n      name: ${JSON.stringify(checkPluginPath)}\n`,
+            { encoding: "utf8", mode: 0o600 });
+          extraPatchPaths.push(checkPatchPath);
+        }
 
         gateway = await makeGateway({
           baseUrl: credential.baseUrl,
@@ -381,10 +411,35 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           model: stage.model,
           allowedTools: [
             ...(contextPath ? ["office_context_read"] : []),
-            ...(stageImageEnabled ? ["office_image_generate"] : [])
+            ...(stageImageEnabled ? ["office_image_generate"] : []),
+            ...(stagePptCheckEnabled ? ["office_ppt_check"] : [])
           ],
           stickyQuotaError: pipelineRequested,
-          fetchImpl: (url, options) => net.fetch(url, options)
+          fetchImpl: (url, options) => net.fetch(url, options),
+          onStreamEvent: (streamEvent) => {
+            if (!streamEvent) return;
+            if (streamEvent.type === "thinking" && typeof streamEvent.text === "string" && streamEvent.text) {
+              thinkingBuffer += streamEvent.text;
+              if (thinkingBuffer.length >= 160) {
+                flushThinking();
+              } else if (!thinkingTimer) {
+                thinkingTimer = setTimeout(flushThinking, 120);
+                thinkingTimer.unref?.();
+              }
+            } else if (streamEvent.type === "tool" && typeof streamEvent.name === "string") {
+              flushThinking();
+              const label = toolDisplayNames[streamEvent.name] || streamEvent.name;
+              emit({ type: "step", label: `调用工具：${label}` });
+            } else if (streamEvent.type === "content" && Number.isFinite(streamEvent.chars)) {
+              flushThinking();
+              contentChars += streamEvent.chars;
+              const nowMs = Date.now();
+              if (contentChars > 0 && (lastProgressAt === 0 || nowMs - lastProgressAt >= 550)) {
+                lastProgressAt = nowMs;
+                emit({ type: "progress", chars: contentChars, stage: stage.role, model: stage.model });
+              }
+            }
+          }
         });
 
         const env = buildRuntimeEnv({
@@ -452,6 +507,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         if (/桌面 Harness 调用超时/.test(error?.message || "")) error.code = "STAGE_TIMEOUT";
         throw error;
       } finally {
+        flushThinking();
         if (gateway) await gateway.close().catch(() => {});
         await fs.rm(place, { recursive: true, force: true });
       }

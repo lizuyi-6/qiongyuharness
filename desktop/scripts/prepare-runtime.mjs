@@ -38,7 +38,7 @@ assertInside(runtimeRoot, runtimeStage);
 await rm(runtimeRoot, { recursive: true, force: true });
 
 // 运行时只带这些文件；agent.cjs 会按需生成 patch 加载其中的 .mjs 插件。
-const HARNESS_FILES = ["package.json", "package-lock.json", "office.patch.yml", "office-context.mjs", "office-image.mjs"];
+const HARNESS_FILES = ["package.json", "package-lock.json", "office.patch.yml", "office-context.mjs", "office-image.mjs", "office-ppt-check.mjs"];
 // 漏带插件会让对应功能在安装包里整轮失败，所以 harness/ 下任何 .mjs 不在清单里就直接中止打包。
 const missingPlugins = (await readdir(sourceHarness)).filter((name) => name.endsWith(".mjs") && !HARNESS_FILES.includes(name));
 if (missingPlugins.length) throw new Error(`harness 插件未列入运行时清单：${missingPlugins.join(", ")}`);
