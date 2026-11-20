@@ -156,6 +156,22 @@ function textLines(ctx, text, maxWidth) {
   });
 }
 
+function traceShapePath(ctx, shape, left, top, width, height) {
+  ctx.beginPath();
+  if (shape.shape === "ellipse") {
+    ctx.ellipse(left + width / 2, top + height / 2, Math.max(0.5, width / 2), Math.max(0.5, height / 2), 0, 0, Math.PI * 2);
+  } else if (shape.shape === "round_rect") {
+    const r = Math.min(12, width * 0.12, height * 0.12);
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(left, top, width, height, r);
+    } else {
+      ctx.rect(left, top, width, height);
+    }
+  } else {
+    ctx.rect(left, top, width, height);
+  }
+}
+
 async function art(canvas, scene, selected) {
   const scale = 1.6;
   canvas.width = Math.round(scene.width * scale);
@@ -172,11 +188,36 @@ async function art(canvas, scene, selected) {
   ctx.fillRect(0, 0, scene.width, scene.height);
   for (const [index, shape] of scene.objects.entries()) {
     const { left, top, width, height } = shape;
-    if (shape.fill) {
-      ctx.fillStyle = shape.fill;
-      ctx.fillRect(left, top, width, height);
+    if (shape.fill || shape.border) {
+      ctx.save();
+      if (typeof shape.opacity === "number" && shape.opacity < 1) ctx.globalAlpha = Math.max(0, Math.min(1, shape.opacity));
+      traceShapePath(ctx, shape, left, top, width, height);
+      if (shape.fill) {
+        ctx.fillStyle = shape.fill;
+        ctx.fill();
+      }
+      if (shape.border) {
+        ctx.strokeStyle = shape.border;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      ctx.restore();
     }
-    if (images[index]) ctx.drawImage(images[index], left, top, width, height);
+    if (images[index]) {
+      const img = images[index];
+      // 按 cover 等比绘制预览，避免拉伸变形
+      const ir = img.naturalWidth / Math.max(1, img.naturalHeight);
+      const br = width / Math.max(1, height);
+      let sx = 0, sy = 0, sw = img.naturalWidth, sh = img.naturalHeight;
+      if (ir > br) {
+        sw = img.naturalHeight * br;
+        sx = (img.naturalWidth - sw) / 2;
+      } else if (ir < br) {
+        sh = img.naturalWidth / br;
+        sy = (img.naturalHeight - sh) / 2;
+      }
+      ctx.drawImage(img, sx, sy, sw, sh, left, top, width, height);
+    }
     if (shape.text) {
       ctx.save();
       ctx.beginPath();
@@ -185,8 +226,18 @@ async function art(canvas, scene, selected) {
       ctx.font = `${shape.bold ? "700 " : ""}${Math.max(7, shape.size)}px "Microsoft YaHei","Noto Sans CJK SC",sans-serif`;
       ctx.fillStyle = shape.color;
       ctx.textBaseline = "top";
-      textLines(ctx, shape.text, width - 3).slice(0, 100)
-        .forEach((line, lineIndex) => ctx.fillText(line, left + 1, top + 2 + lineIndex * shape.size * 1.21));
+      const align = shape.align === "center" ? "center" : shape.align === "right" ? "right" : "left";
+      ctx.textAlign = align;
+      const lines = textLines(ctx, shape.text, Math.max(10, width - 4)).slice(0, 100);
+      const lineH = shape.size * 1.24;
+      const totalH = lines.length * lineH;
+      const startY = shape.valign === "middle"
+        ? top + Math.max(1, (height - totalH) / 2)
+        : shape.valign === "bottom"
+          ? top + Math.max(1, height - totalH - 2)
+          : top + 2;
+      const drawX = align === "center" ? left + width / 2 : align === "right" ? left + width - 2 : left + 2;
+      lines.forEach((line, lineIndex) => ctx.fillText(line, drawX, startY + lineIndex * lineH));
       ctx.restore();
     }
     if (shape.id === selected) {

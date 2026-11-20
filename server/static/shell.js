@@ -1,6 +1,6 @@
 import { active, api, dialog, e, getTheme, go, icon, isManager, isReview, modal, roles, root, state } from "./ui.js";
 import { views } from "./views.js";
-import { conversationNav } from "./chat.js";
+import { conversationNav, runningConversationIds, syncDesktopUsagePanel } from "./chat.js";
 
 const SIDEBAR_KEY = "qo-sidebar-collapsed";
 let mountedUserId = null;
@@ -75,6 +75,7 @@ export function ensureShell() {
           ${isManager() ? navItem("admin") : ""}${navItem("review")}${person.role === "admin" ? navItem("audit") : ""}
         </div>` : ""}
       </nav>
+      <div class="sidebar-quota-slot" data-sidebar-quota hidden></div>
       <div class="sidebar-foot">
         ${navItem("settings")}
         <button type="button" class="identity" data-act="profile" aria-label="账户与身份" title="${e(person.name)}">
@@ -116,6 +117,7 @@ export function ensureShell() {
   </div>`;
 
   syncShell();
+  syncDesktopUsagePanel();
   return root.querySelector("#workplace");
 }
 
@@ -148,7 +150,8 @@ export function syncSidebarConversations() {
   if (!slot) return;
   const conversations = state.chatWorkspace?.conversations || state.conversations || [];
   const activeId = state.route[0] === "chat" ? (state.route[1] || "") : "";
-  const sig = JSON.stringify([activeId, conversations.map((c) => [c.id, c.title])]);
+  const running = runningConversationIds();
+  const sig = JSON.stringify([activeId, running, conversations.map((c) => [c.id, c.title])]);
   if (sig === lastConversationsSig) return;
   lastConversationsSig = sig;
 

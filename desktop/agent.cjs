@@ -5,7 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { createLoopbackGateway } = require("./lib/loopback-gateway.cjs");
 const { runDsh } = require("./lib/dsh-bridge.cjs");
-const { STAGE_TIMEOUT_MS, runPipeline } = require("./lib/pipeline.cjs");
+const { DEADLINE_MS, STAGE_TIMEOUT_MS, runPipeline } = require("./lib/pipeline.cjs");
 const { listModelsWithRefresh, modelServiceCode, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
@@ -44,7 +44,7 @@ function responseError(payload, status) {
 const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
 const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
 const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
-const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：仅在用户明确需要图片时调用；每轮最多生成 2 张，按张计费；不要在回复中输出图片链接、Markdown 图片或 base64；用户没有要图片时不要调用。";
+const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：当制作 PPT 需要封面主视觉或关键配图，或用户明确需要图片时调用 office_image_generate（按张计费，遵守本轮张数上限）；制作 PPT 时提示词强调画面无文字，并用返回的 image_index 填入 deck.slides 的 bg_image 或 image 元素；不要在 reply 文字中输出图片链接、Markdown 图片或 base64；纯文字问答不要调用。";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -341,7 +341,8 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       throw new Error("生图模型只能用于生图");
     }
     const imageModels = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
-    const imageToolEnabled = job.image_tool === true && !pipelineRequested && imageModels.length > 0;
+    const imageToolEnabled = job.image_tool === true && imageModels.length > 0;
+    const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 && job.max_images <= 3 ? job.max_images : 2;
     const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
     ensureNotAborted();
     const { credential } = await getCredentialImpl(origin);
@@ -352,6 +353,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       ensureNotAborted();
       const place = await fs.mkdtemp(path.join(os.tmpdir(), "qo-office-agent-"));
       let gateway;
+      const stageImageEnabled = Boolean(imageToolEnabled && imageBroker && stage.withImages !== false);
       try {
         let contextPath;
         let contextPatchPath;
@@ -364,7 +366,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             `- insert:\n    - id: office-context\n      name: ${JSON.stringify(runtimePaths.contextPlugin)}\n`,
             { encoding: "utf8", mode: 0o600 });
         }
-        if (imageToolEnabled && imageBroker) {
+        if (stageImageEnabled) {
           const imagePatchPath = path.join(place, "office-image.patch.yml");
           const pluginPath = path.join(runtimePaths.harnessRoot, "office-image.mjs").replaceAll("\\", "/");
           await fs.writeFile(imagePatchPath,
@@ -379,7 +381,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           model: stage.model,
           allowedTools: [
             ...(contextPath ? ["office_context_read"] : []),
-            ...(imageToolEnabled && imageBroker ? ["office_image_generate"] : [])
+            ...(stageImageEnabled ? ["office_image_generate"] : [])
           ],
           stickyQuotaError: pipelineRequested,
           fetchImpl: (url, options) => net.fetch(url, options)
@@ -393,7 +395,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           model: stage.model,
           system: stage.system,
           contextPath,
-          ...(imageToolEnabled && imageBroker ? {
+          ...(stageImageEnabled ? {
             imageBrokerUrl: imageBroker.url,
             imageBrokerKey: imageBroker.key
           } : {}),
@@ -460,14 +462,17 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         imageBroker = await createImageBrokerImpl({
           generate: (request, options) => imageGenerateImpl(request, options),
           model: imageModel,
-          maxImages: 2,
-          deadlineAt: startedAt + 240_000,
+          maxImages,
+          deadlineAt: startedAt + (pipelineRequested ? DEADLINE_MS : 600_000),
           now: clockNow
         });
       }
       if (pipelineRequested) {
-        return await runPipeline({
-          job,
+        const pipelineJob = imageBroker
+          ? { ...job, system: `${job.system}\n\n${IMAGE_TOOL_INSTRUCTIONS}` }
+          : job;
+        const pipelineResult = await runPipeline({
+          job: pipelineJob,
           config,
           availableModels: available,
           runStage,
@@ -476,6 +481,10 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           startedAt,
           signal
         });
+        return {
+          ...pipelineResult,
+          ...(imageBroker?.images.length ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
+        };
       }
       const result = await runStage({
         role: "execute",

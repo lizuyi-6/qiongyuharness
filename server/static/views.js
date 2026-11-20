@@ -305,16 +305,32 @@ export function filesView(items) {
   </section>`;
 }
 
+function detectDesktopVersion() {
+  const direct = typeof window.officeDesktop?.version === "string" ? window.officeDesktop.version.trim() : "";
+  if (direct) return direct;
+  const ua = typeof navigator !== "undefined" ? String(navigator.userAgent || "") : "";
+  const match = ua.match(/(?:qiongyu-office-desktop|QiongyuOffice)\/([0-9]+\.[0-9]+\.[0-9A-Za-z._-]*)/i);
+  return match ? match[1] : "";
+}
+
+function formatVersion(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return /^v/i.test(raw) ? raw : `v${raw}`;
+}
+
 export function settingsView() {
   const isDesktopApp = typeof window.officeDesktop?.runAgent === "function";
   const engine = state.engine?.engine;
   const engineLabel = engine === "demo"
-    ? "本地演示模板"
+    ? "本地演示模式"
     : engine === "desktop"
-      ? (isDesktopApp ? "桌面客户端本地执行（员工专属密钥直连模型服务）" : "桌面客户端本地执行（当前为浏览器访问，AI 办理请使用桌面客户端）")
+      ? (isDesktopApp ? "本机直连 · 独立凭证" : "需在桌面客户端中使用")
       : engine === "dsh"
-        ? "DeepSeek Harness · 公司模型网关"
-        : "公司模型网关";
+        ? "企业统一网关 · DeepSeek Harness"
+        : "企业统一网关";
+  const desktopVersion = isDesktopApp ? formatVersion(detectDesktopVersion()) : "";
+  const serverVersion = formatVersion(state.config?.version);
   return `${pageHead("设置")}
    <div class="settings-grid">
      <section class="panel pad stack">
@@ -339,13 +355,15 @@ export function settingsView() {
        </div>
      </section>
      <section class="panel pad stack">
-       <h2 class="section-title">模型连接</h2>
+       <h2 class="section-title">AI 服务与客户端</h2>
        <div>
-         <div class="engine-card-row"><span>执行模式</span><strong>${e(engineLabel)}</strong></div>
+         <div class="engine-card-row"><span>运行方式</span><strong>${e(engineLabel)}</strong></div>
          ${state.engine?.model ? `<div class="engine-card-row"><span>默认模型</span><strong class="mono">${e(state.engine.model)}</strong></div>` : ""}
-         <div class="engine-card-row"><span>客户端环境</span><strong>${isDesktopApp ? "穹驭办公桌面端" : "网页浏览器"}</strong></div>
+         <div class="engine-card-row"><span>当前环境</span><strong>${isDesktopApp ? "穹驭办公桌面端" : "网页端"}</strong></div>
+         ${isDesktopApp ? `<div class="engine-card-row"><span>客户端版本</span><strong class="mono">${e(desktopVersion || "桌面版")}</strong></div>` : ""}
+         ${serverVersion ? `<div class="engine-card-row"><span>工作台版本</span><strong class="mono">${e(serverVersion)}</strong></div>` : ""}
        </div>
-       <div class="actions">${button("检查连接", "check-engine", { icon: "refresh" })}</div>
+       <div class="actions">${button("检测服务状态", "check-engine", { icon: "refresh" })}</div>
      </section>
    </div>`;
 }

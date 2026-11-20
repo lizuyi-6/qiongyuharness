@@ -30,12 +30,17 @@ PRINCIPLES = """
 CONVERSATION_PROTOCOL = """
 # 输出协议（必须严格遵守）
 只输出一个 JSON 对象。不要输出代码围栏、解释或 JSON 之外的任何文字。字符串里的换行写成 \\n，双引号写成 \\"。
-- 纯回复：{"action":"reply","reply":"给员工的答复"}
-- 导出文件：{"action":"export","reply":"一两句话说明生成了什么、有哪些待补充项","kind":"docx 或 pptx","plan":{"title":"标题","subtitle":"副标题，可为空字符串","sections":[{"heading":"节标题","points":["要点或段落"],"conclusion":"本节结论，可为空字符串","notes":"PPT 演讲备注，可为空字符串"}]}}
-  需要对比时，section 里可以加 "table":{"columns":["对比项","A","B"],"rows":[["指标","…","…"]]}。
-何时导出：员工要可下载的文件、要 Word / PPT，或要修改之前导出的文件时才导出；只是讨论、问答、看大纲、改几句话时直接回复。导出时由系统生成文件，reply 里不要重复全文。
-硬性限制：reply 不超过 3000 字；title 不超过 60 字；heading 不超过 40 字；sections 1–18 项；每项 points 0–8 条（没有 table 时至少 1 条）；Word 每条不超过 300 字，PPT 每条不超过 120 字；conclusion 不超过 60 字；notes 不超过 400 字；table 2–5 列、最多 7 行、每格不超过 30 字，每行格数与 columns 相同。
-篇幅预算：一次输出的总量控制在约 4500 字以内。员工要求的篇幅超过一次能写完的量时，先完成完整结构和最重要的部分，在 reply 里说明还可以继续生成哪些部分，不要写到一半中断。
+- 纯回复（默认优先）：{"action":"reply","reply":"给员工的 Markdown 答复"}
+- 导出 Word：{"action":"export","reply":"一两句话说明生成了什么、有哪些待补充项","kind":"docx","plan":{"title":"标题","subtitle":"副标题，可为空字符串","sections":[{"heading":"节标题","points":["要点或段落"],"conclusion":"本节结论，可为空字符串","notes":""}]}}
+  需要对比时，section 里可加 "table":{"columns":["对比项","A","B"],"rows":[["指标","…","…"]]}。
+- 导出 PPT（自由画布，无固定模板）：{"action":"export","reply":"一两句话说明设计风格、页数与待补充项","kind":"pptx","deck":{"title":"标题","subtitle":"副标题","design":{"concept":"本套视觉概念","palette":{"bg":"#...","surface":"#...","primary":"#...","accent":"#...","text":"#...","muted":"#...","border":"#..."},"font":"Microsoft YaHei"},"slides":[{"title":"本页标题","bg":"#...","bg_image":1,"bg_overlay":{"color":"#...","opacity":0.55},"notes":"演讲备注","elements":[...]}]}}
+
+## 交付形式判定（极其重要，严禁越权生成文件）
+1. 默认直接文字回复（action="reply"）：问答、介绍项目/公司/技术、总结资料、分析问题、看大纲、润色几段话等没有明确要文件的请求，一律用结构化 Markdown 直接回复，不要导出文件。
+2. 仅当员工明确提到"文档""Word""docx""报告文件""方案文件""导出文件""生成一份可下载的…"或修改本会话已有 Word 时，才导出 docx。
+3. 仅当员工明确提到"PPT""幻灯片""演示文稿""课件""路演""slides"，或本轮输出方式指定为 pptx，或正在修改本会话已有 PPT，或关联任务交付物为 PPT 且要求生成初稿时，才导出 pptx。只说"介绍项目""总结一下"时严禁生成 PPT。
+
+硬性限制：reply 不超过 4000 字；Word 的 title 不超过 60 字、sections 1–18 项、每项 points 0–8 条（无 table 时至少 1 条）、每条不超过 300 字；PPT 的 slides 1–30 页，每页 elements 不超过 120 项。导出时由系统生成文件，reply 里不要重复全文。
 """.strip()
 
 PLAN_PROTOCOL = """
@@ -69,39 +74,54 @@ DOCX_GUIDE = """
 """.strip()
 
 PPTX_GUIDE = """
-## PPT 导出规则（plan 字段）
-- 系统自动生成封面（title + subtitle），不要再写封面页；sections 的每一项就是一页正文。
-- 页数：员工说"N 页"指整份 PPT 共 N 页（含封面），sections 写 N-1 项；请求数据里有"页数要求"时严格照做。没说页数时写 6–10 项。
-- 先定主线：按听众最关心的问题排顺序，每一页回答一个问题（例如"市场有多大""痛点是什么""怎么解决""比别人强在哪""怎么赚钱"）。先总后分：先用 1 页讲清整体，再分页展开细节。
-- 每一页写这几个字段：
-  1. heading：本页主题或结论，20 字以内，例如"V3 用 MoE 把训练成本压到约 558 万美元"好于"技术亮点"。
-  2. points：3–6 条，每条写成"小标题：具体说明"。小标题 4–12 字；说明 30–90 字，写出具体的名称、时间、数字、参数、做法或例子。
-  3. conclusion：本页结论，一句话 20–50 字，尽量带数字，例如"国内市场 2025 年规模约 300 亿元，年增速 25%"。系统把它放在页面底部的结论条里，不要写"结论："前缀。
-  4. notes：演讲备注 100–250 字，讲这一页时可以照着说的话，补充 points 放不下的背景、原因和例子。
-  5. table（可选）：竞品对比、方案对比、版本对比、排期等适合对照的内容用表格，2–5 列、最多 7 行，每格 30 字以内；有表格的页 points 最多 2 条，写对表格的解读。
-- 用数据说话、给出结论：能量化的一律给数字（规模、增速、成本、参数、金额、时间、数量）；不写"显著提升""全面领先""效果突出"这类没有信息量的话。
-- 员工要"详细"时：每页 5–6 条、说明 60–90 字，notes 200 字左右；员工要"简洁 / 精简"时：每页 3 条、说明 30 字左右，notes 可为空字符串。
-- 版式由系统按内容自动排：2–4 条排成卡片，5–6 条排成"小标题 | 说明"两栏列表，有 table 时排成表格。超过 6 条会被拆成"（续）"页、打乱页数，所以每页不要超过 6 条。
-- 文字里不要换行，不出现 Markdown 符号；数字带单位和口径。
-- 常见结构，按内容取舍，不要生搬硬套：
-  · 工作汇报：背景 / 目标 → 现状 / 数据 → 问题 / 分析 → 方案 / 举措 → 计划 / 分工 → 风险 / 需要的支持。
-  · 主题介绍：是什么 → 来龙去脉 → 核心内容 → 关键技术或做法 → 数据与对比 → 应用场景 → 局限与风险 → 总结。
-  · 项目路演 / 比赛：项目背景 → 痛点 → 解决方案 → 应用场景 → 竞品分析 → 商业模式 → 团队 → 成果 → 财务与融资 → 愿景。
-  最后一页写结论或下一步，员工要求时才加"谢谢"页。
-- subtitle 写汇报人、部门或日期；不知道时写汇报主题，不要编造人名和日期。
+## PPT 自由画布设计工作流（deck 字段，彻底无模板）
+系统不提供任何预设模板，所有视觉风格、配色、页面构图与配图全部由你从零设计，最终由系统按坐标原样渲染成 16:9（13.333 × 7.5 英寸）可编辑 PPTX。
+
+### 工作流（严格按三步思考和执行）
+1. **先做本套专属视觉系统（design 母版）**：
+   - 按主题气质定制独一无二的视觉语言，严禁千篇一律的蓝白卡片：
+     · 科技 / 安全 / AI：深空暗色（如 #0B1020 + #141B33 卡片 + #38BDF8/#22D3EE 强调色）或极简冷灰白配电光色；
+     · 商业路演 / 战略汇报：杂志感大字留白（如暖白 #FAF9F6 + 炭黑 #141413 + 陶土红/琥珀金强调色）；
+     · 政务 / 金融 / 咨询：沉稳深靛或象牙白 + 墨绿/香槟金 + 精细线条网格。
+   - 保持高对比度可读性：深底配浅字（#F8FAFC / #CBD5E1），浅底配深字（#111827 / #475569）。
+2. **善用生图工具生成专属视觉资产（如本轮开放了 office_image_generate）**：
+   - 在输出 JSON 前，主动调用 1–3 次 `office_image_generate` 生成本套 PPT 专属配图（每次调用返回 1-based `image_index`）：
+     · 第 1 张（强烈建议）：封面主视觉/氛围底图，用 `size: "1536x864"`，提示词要求构图大气、留白干净、**画面中绝对不要生成文字/字母**（文字由原生可编辑文本框叠放）。
+     · 第 2–3 张（按需）：核心场景、产品概念或架构意象配图，用 `1536x1024` 或 `1024x1024`，用于左图右文 / 右图左文 / 章节过渡页。
+   - 若本轮未开放生图工具或生图失败，不写 `bg_image` / `image` 元素，纯用色块、圆角卡片、线条、超大数字与留白做出杂志级几何排版。
+3. **逐页自由构图（deck.slides，拒绝所有页面长一个样）**：
+   - 封面是 `slides[0]`，总页数 = `len(slides)`。没说页数时设计 7–10 页；员工要求 N 页时 `slides` 必须恰好 N 项。
+   - 刻意拉开版式节奏（连续两页不要用同一种构图）：
+     · 封面页：全屏 `bg_image: 1` + `bg_overlay`（opacity 0.50–0.68）+ 强调装饰条 + 38–46pt 主标题 + 副标题；
+     · 数据冲击页：深色反转底 + 2–3 个超大 KPI 数字（40–52pt bold 强调色）配简洁说明；
+     · 图文混排页：左侧或右侧放生图 `image`（如 x:0.7, w:5.2, h:5.1），另一侧放结论与分点；
+     · 架构/流程/时间线页：用 `round_rect` 节点 + `ellipse` 圆形序号徽章 + `line` 连接线搭出清晰逻辑流；
+     · 对比/排期页：用 `table` 元素（配色与本套 `palette` 一致）+ 顶部洞察结论。
+
+### 自由画布元素原语（坐标单位：英寸，画布 13.333 × 7.5）
+- `rect` / `round_rect` / `ellipse` / `line`：`{type, x, y, w, h, fill, opacity?, border?, border_width?, radius?}`
+- `text`：`{type:"text", x, y, w, h, text, size, bold?, italic?, color, align?("left"|"center"|"right"), valign?("top"|"middle"|"bottom"), line_spacing?}`
+- `image`：`{type:"image", x, y, w, h, image_index, fit?("cover"|"contain")}`
+- `table`：`{type:"table", x, y, w, h, columns:[...], rows:[[...]], header_fill?, header_color?, row_fill?, alt_fill?, text_color?, border_color?}`
+
+### 排版与防重叠铁律
+- 安全边距：正文元素 `x >= 0.65`，`x + w <= 12.68`，`y >= 0.45`，`y + h <= 7.05`（全出血背景装饰/封面侧图除外）。
+- 元素按绘制顺序叠放：先画背景色块/卡片底框（`rect`/`round_rect`），再画里面的文字（`text`），否则底框会盖住文字！
+- 文字框之间严禁坐标重叠：标题区建议 `y: 0.5–1.35`（24–28pt），主内容区 `y: 1.55–6.35`（卡片标题 15–17pt、正文 12–14pt），底部结论或页脚 `y: 6.55–7.1`。
+- 文本精炼带具体事实和数字，不要大段堆砌；每个文本框不写 Markdown 符号；单段文本框不要加多余换行（保留画布点选改字能力）；每页附 80–200 字 `notes` 演讲备注。
 """.strip()
 
 MODE_HELP = {
     "reply": "本轮只作文字回复，action 必须是 reply。",
     "docx": "如需导出，只能导出 Word（kind 为 docx）。",
-    "pptx": "如需导出，只能导出 PowerPoint（kind 为 pptx）。",
-    "auto": "从当前请求判断是否需要文件。",
+    "pptx": "本轮目标是制作或修改 PPT（kind 为 pptx），请按 PPT 自由画布工作流输出 deck。",
+    "auto": "默认直接用 Markdown 回复（action 为 reply）。仅当员工明确要求文档/Word 时导出 docx；仅当员工明确要求 PPT/幻灯片/演示文稿/路演或修改已有 PPT 时才导出 pptx。",
 }
 FORMAT_GUIDES = {
     "reply": (REPLY_GUIDE,),
     "docx": (REPLY_GUIDE, DOCX_GUIDE),
     "pptx": (REPLY_GUIDE, PPTX_GUIDE),
-    "auto": (REPLY_GUIDE, DOCX_GUIDE, PPTX_GUIDE),
+    "auto": (REPLY_GUIDE, DOCX_GUIDE),
 }
 
 CONVERSATION_BASE = (
@@ -175,7 +195,25 @@ def route(message, task=None, latest_title="", recent_requests=()):
 
 _PAGES = re.compile(r"(\d{1,2}|[一二两三四五六七八九十]{1,3})\s*(?:页|张)")
 _DECK = re.compile(r"pptx?|幻灯|演示文稿|课件|路演|slides?", re.IGNORECASE)
+_PPT_REVISE = re.compile(r"改|补|调整|重新|上一|这一|每页|第\s*\d+\s*页|排版|配色|换.*风格|加.*页|删.*页")
+_EXPORT_HINT = re.compile(r"生成|制作|起草|导出|做一|做个|写一|初稿|成稿")
 _DIGITS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def wants_pptx(message, mode, task=None, latest_kind=None):
+    """判断本轮是否存在明确的 PPT 需求，避免无关问答被长篇 PPT 规则误导。"""
+    if mode == "pptx":
+        return True
+    if mode in {"reply", "docx"}:
+        return False
+    text = message or ""
+    if _DECK.search(text):
+        return True
+    if latest_kind == "pptx" and _PPT_REVISE.search(text):
+        return True
+    if task and task.get("kind") == "pptx" and _EXPORT_HINT.search(text):
+        return True
+    return False
 
 
 def _count(text):
@@ -188,18 +226,16 @@ def _count(text):
 
 
 def page_rule(message, mode, latest_kind=None):
-    """员工写了"N 页"且本轮会出 PPT 时，把页数算好直接给模型，免得它把封面算错。"""
+    """员工写了"N 页"且本轮会出 PPT 时，把页数明确告诉模型（含封面，slides 共 N 项）。"""
     match = _PAGES.search(message or "")
     if not match or mode not in {"auto", "pptx"}:
         return None
     if mode == "auto" and not (_DECK.search(message) or latest_kind == "pptx"):
         return None
-    total = min(20, _count(match[1]))
+    total = min(25, _count(match[1]))
     if total < 1:
         return None
-    if total == 1:
-        return "员工只要 1 页：sections 恰好写 1 项（系统另外生成封面）。"
-    return f"整份 PPT 共 {total} 页 = 系统生成的封面 1 页 + 正文 {total - 1} 页，所以 sections 必须恰好 {total - 1} 项。"
+    return f"整份 PPT 共 {total} 页（第 1 页为封面），deck.slides 数组必须恰好包含 {total} 项。"
 
 
 def picked(operation, genre):
@@ -222,15 +258,24 @@ def checklist(operation, genre):
     return {"类型": "、".join(preset.name for preset in presets), "最低分级": tier, "验收要点": points}
 
 
-def conversation_system(mode, operation=None, genre=None):
-    parts = [CONVERSATION_BASE, "## 本轮输出方式\n" + MODE_HELP[mode], *FORMAT_GUIDES[mode]]
+def conversation_system(mode, operation=None, genre=None, *, include_pptx=None):
+    guides = list(FORMAT_GUIDES[mode])
+    if mode == "auto" and include_pptx:
+        guides.append(PPTX_GUIDE)
+    parts = [CONVERSATION_BASE, "## 本轮输出方式\n" + MODE_HELP[mode], *guides]
     parts += [preset_section(preset) for preset in picked(operation, genre)]
     parts.append(FINAL_CHECK)
     return "\n\n".join(parts)
 
 
+PLAN_PPTX_GUIDE = """
+## PPT 大纲规划规则（plan 字段）
+- 系统自动生成封面（title + subtitle），sections 的每一项是一页正文大纲，每页写清 heading（20 字内）、3–6 条带具体事实或数字的 points、conclusion 与 notes。
+""".strip()
+
+
 def plan_system(kind, operation=None, genre=None):
-    parts = [PLAN_BASE, DOCX_GUIDE if kind == "docx" else PPTX_GUIDE]
+    parts = [PLAN_BASE, DOCX_GUIDE if kind == "docx" else PLAN_PPTX_GUIDE]
     parts += [preset_section(preset) for preset in picked(operation, genre)]
     parts.append(FINAL_CHECK)
     return "\n\n".join(parts)

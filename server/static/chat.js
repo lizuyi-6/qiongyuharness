@@ -7,8 +7,84 @@ const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
 const PIPELINE_MODEL = "qo:pipeline";
 const imageAutoPreferenceKey = "qo/chat/allow-ai-images";
+const pptImageAutoPreferenceKey = "qo/chat/allow-ppt-images";
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 let usageRequestId = 0;
-let activeTurnCancel = null;
+
+// 按 threadId 跟踪正在运行的对话/生图任务，避免切换页面销毁 DOM 后丢失进度与锁定状态。
+const activeTurns = new Map();
+const modelCache = new Map();
+const modelInFlight = new Map();
+const sessionCache = new Map();
+const taskCache = new Map();
+const projectCache = new Map();
+
+export function runningConversationIds() {
+  const userId = state.me?.id;
+  if (!userId) return [];
+  const ids = [];
+  for (const [threadId, live] of activeTurns.entries()) {
+    if (live.userId === userId) ids.push(threadId);
+  }
+  return ids;
+}
+
+export function resetChatState() {
+  for (const live of activeTurns.values()) {
+    try { void live.cancel?.(); } catch {}
+  }
+  activeTurns.clear();
+  modelCache.clear();
+  modelInFlight.clear();
+  sessionCache.clear();
+  taskCache.clear();
+  projectCache.clear();
+}
+
+function activeTurnFor(threadId) {
+  if (!threadId) return null;
+  const live = activeTurns.get(threadId);
+  if (!live || live.userId !== state.me?.id) return null;
+  return live;
+}
+
+function otherActiveDesktopTurn(threadId) {
+  if (!clientExecutionRequired()) return null;
+  const userId = state.me?.id;
+  for (const live of activeTurns.values()) {
+    if (live.userId === userId && live.threadId !== threadId && live.kind === "turn") return live;
+  }
+  return null;
+}
+
+function isViewingThread(threadId, userId = state.me?.id) {
+  if (!threadId || !userId || state.me?.id !== userId || state.route[0] !== "chat") return false;
+  if (state.chatWorkspace?.session?.id === threadId) return true;
+  return state.route[1] === threadId;
+}
+
+function findLiveProgress(threadId) {
+  if (!threadId) return null;
+  for (const node of document.querySelectorAll("[data-live-thread]")) {
+    if (node.dataset?.liveThread === threadId) return node;
+  }
+  return null;
+}
+
+function emitConversationsUpdated() {
+  try { window.dispatchEvent(new CustomEvent("qo:conversations-updated")); } catch {}
+}
+
+function sessionSignature(session) {
+  if (!session) return "";
+  return JSON.stringify([
+    session.id,
+    session.title,
+    session.updated_at,
+    session.has_earlier,
+    (session.turns || []).map((t) => [t.id, t.status, t.reply?.length || 0, t.error || "", t.steps?.length || 0, t.file?.id || "", t.images?.length || 0])
+  ]);
+}
 
 // AI 自行生图按张计费：缺省关闭，由员工本人勾选开启；按账号分开记忆，避免共用电脑时沿用他人的选择。
 function imageAutoPreferenceStorageKey() {
@@ -31,11 +107,32 @@ export function saveImageAutoPreference(value) {
   } catch {}
 }
 
+function pptImageAutoPreferenceStorageKey() {
+  return state.me?.id ? `${pptImageAutoPreferenceKey}/${state.me.id}` : "";
+}
+
+// 制作 PPT 时默认开启自动配图（1-3 张，按张计费），员工可随时手动关闭。
+export function pptImageAutoPreference() {
+  try {
+    const key = pptImageAutoPreferenceStorageKey();
+    return !key || localStorage.getItem(key) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function savePptImageAutoPreference(value) {
+  try {
+    const key = pptImageAutoPreferenceStorageKey();
+    if (key) localStorage.setItem(key, value ? "true" : "false");
+  } catch {}
+}
+
 function clientExecutionRequired() {
   return state.engine?.client_execution === true;
 }
 
-function desktopUsageEnabled() {
+export function desktopUsageEnabled() {
   return clientExecutionRequired() && typeof window.officeDesktop?.usage === "function";
 }
 
@@ -55,27 +152,55 @@ function formatUsageAmount(value, unit = "USD") {
   }
 }
 
+function formatCompactAmount(value, unit = "USD") {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "—";
+  const symbol = unit === "USD" ? "$" : unit === "CNY" || unit === "RMB" ? "¥" : "";
+  const abs = Math.abs(num);
+  const digits = abs !== 0 && abs < 0.01 ? 4 : Number.isInteger(num) ? 0 : 2;
+  const formatted = num.toFixed(digits);
+  return symbol ? `${symbol}${formatted}` : `${formatted} ${unit}`;
+}
+
 function formatUsageTime(value) {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return "窗口未开始";
   return date.toLocaleString();
 }
 
+function formatCompactReset(value, fallback = "窗口未开始") {
+  if (!value) return fallback;
+  const date = new Date(value);
+  const ts = date.getTime();
+  if (!Number.isFinite(ts)) return fallback;
+  const diffMs = ts - Date.now();
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  if (diffMs <= 60_000) return "即将重置";
+  const mins = Math.ceil(diffMs / 60_000);
+  if (mins < 60) return `${mins} 分钟后重置`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours} 小时后重置 · ${hh}:${mm}`;
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  return `${month}/${day} ${hh}:${mm} 重置`;
+}
+
 function usageRows(usage) {
   const rows = [];
   if (usage.mode === "quota_limited") {
-    if (usage.quota && usage.quota.limit > 0) rows.push({
-      label: "总额度", used: usage.quota.used, limit: usage.quota.limit,
-      remaining: usage.quota.remaining, resetAt: "", resetFallback: "上游未提供重置时间"
-    });
     const labels = { "5h": "5 小时", "1d": "日", "7d": "周" };
     for (const item of usage.rate_limits || []) {
       if (item.limit <= 0) continue;
       rows.push({
-        label: `${labels[item.window]}额度`, used: item.used, limit: item.limit,
+        label: `${labels[item.window] || item.window}额度`, used: item.used, limit: item.limit,
         remaining: item.remaining, resetAt: item.reset_at || "", resetFallback: "窗口未开始"
       });
     }
+    if (usage.quota && usage.quota.limit > 0) rows.push({
+      label: "总额度", used: usage.quota.used, limit: usage.quota.limit,
+      remaining: usage.quota.remaining, resetAt: "", resetFallback: "长期有效"
+    });
   } else if (usage.subscription) {
     const subscription = usage.subscription;
     const plans = [
@@ -90,7 +215,7 @@ function usageRows(usage) {
       if (typeof limit === "number" && limit > 0 && typeof used === "number") {
         rows.push({
           label, used, limit, remaining: Math.max(0, limit - used), resetAt,
-          resetFallback: "上游未提供重置时间"
+          resetFallback: "周期重置"
         });
       }
     }
@@ -98,112 +223,203 @@ function usageRows(usage) {
   return rows;
 }
 
-function renderUsageResult(target, result) {
-  target.replaceChildren();
+function usageTone(ratio) {
+  if (ratio >= 92) return "danger";
+  if (ratio >= 75) return "warn";
+  return "normal";
+}
+
+function renderSidebarQuota(slot, result, { loading = false } = {}) {
+  if (!slot) return;
+  if (!desktopUsageEnabled()) {
+    slot.hidden = true;
+    slot.innerHTML = "";
+    return;
+  }
+  slot.hidden = false;
+  const ringCircumference = 91.11;
+
+  const refreshBtn = `<button type="button" class="quota-icon-btn ${loading ? "is-spinning" : ""}" data-act="usage-refresh" title="刷新模型额度" aria-label="刷新模型额度" ${loading ? "disabled" : ""}>${icon("refresh")}</button>`;
+
+  if (loading && !result) {
+    slot.innerHTML = `<section class="quota-dock is-loading" aria-label="模型额度">
+      <div class="quota-dock-full">
+        <div class="quota-dock-head">
+          <span class="quota-dock-title"><i class="quota-dot" aria-hidden="true"></i><span>模型额度</span></span>
+          <div class="quota-dock-tools">${refreshBtn}</div>
+        </div>
+        <div class="quota-skeleton-row"></div>
+        <div class="quota-track"><span class="quota-fill" style="width:32%"></span></div>
+      </div>
+      <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="正在获取模型额度…" aria-label="刷新模型额度" disabled>
+        <span class="quota-ring-label">…</span>
+      </button>
+    </section>`;
+    return;
+  }
+
   if (result?.state !== "available" || !result.usage) {
     const messages = {
-      unauthorized: "模型凭证无效，请重新登录后重试。",
-      unavailable: "暂时无法获取模型额度。",
-      invalid: "额度数据格式无效。"
+      unauthorized: "凭证已失效，请重新登录",
+      unavailable: "暂无法获取额度",
+      invalid: "额度数据异常"
     };
-    const notice = document.createElement("p");
-    notice.className = "hint";
-    notice.setAttribute("role", "status");
-    notice.textContent = messages[result?.state] || messages.unavailable;
-    target.append(notice);
+    const text = messages[result?.state] || messages.unavailable;
+    slot.innerHTML = `<section class="quota-dock is-muted" aria-label="模型额度">
+      <div class="quota-dock-full">
+        <div class="quota-dock-head">
+          <span class="quota-dock-title"><i class="quota-dot" aria-hidden="true"></i><span>模型额度</span></span>
+          <div class="quota-dock-tools">${refreshBtn}</div>
+        </div>
+        <p class="quota-dock-meta" role="status">${e(text)}</p>
+      </div>
+      <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="${e(text)}（点击重试）" aria-label="刷新模型额度">
+        <span class="quota-ring-label">—</span>
+      </button>
+    </section>`;
     return;
   }
 
   const usage = result.usage;
+  const unit = usage.unit || "USD";
+
   if (usage.balance !== undefined || usage.planName === "钱包余额") {
-    const balance = document.createElement("p");
-    balance.className = "usage-balance";
-    balance.textContent = `钱包余额：${formatUsageAmount(usage.balance ?? usage.remaining, usage.unit || "USD")}`;
-    target.append(balance);
+    const val = usage.balance ?? usage.remaining;
+    const compact = formatCompactAmount(val, unit);
+    const full = formatUsageAmount(val, unit);
+    slot.innerHTML = `<section class="quota-dock is-normal" aria-label="钱包余额">
+      <div class="quota-dock-full">
+        <div class="quota-dock-head">
+          <span class="quota-dock-title"><i class="quota-dot" aria-hidden="true"></i><span>钱包余额</span></span>
+          <div class="quota-dock-tools">${refreshBtn}</div>
+        </div>
+        <div class="quota-dock-metrics">
+          <strong class="quota-dock-rem" title="可用余额 ${e(full)}">${e(compact)}</strong>
+          <span class="quota-dock-pill">可用</span>
+        </div>
+      </div>
+      <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="钱包余额：${e(full)}（点击刷新）" aria-label="刷新模型额度">
+        <span class="quota-ring-label">${e(compact)}</span>
+      </button>
+    </section>`;
     return;
   }
 
   const rows = usageRows(usage);
   if (!rows.length) {
-    const unlimited = document.createElement("p");
-    unlimited.className = "usage-unlimited";
-    unlimited.textContent = "当前账户不限额";
-    target.append(unlimited);
+    slot.innerHTML = `<section class="quota-dock is-normal" aria-label="模型额度">
+      <div class="quota-dock-full">
+        <div class="quota-dock-head">
+          <span class="quota-dock-title"><i class="quota-dot" aria-hidden="true"></i><span>模型额度</span></span>
+          <div class="quota-dock-tools">${refreshBtn}</div>
+        </div>
+        <div class="quota-dock-metrics">
+          <strong class="quota-dock-rem">不限额</strong>
+          <span class="quota-dock-pill">正常</span>
+        </div>
+      </div>
+      <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="当前账户不限额（点击刷新）" aria-label="刷新模型额度">
+        <span class="quota-ring-label">∞</span>
+      </button>
+    </section>`;
     return;
   }
 
-  const list = document.createElement("div");
-  list.className = "usage-grid";
-  for (const row of rows) {
-    const card = document.createElement("article");
-    card.className = "usage-card";
-    const title = document.createElement("h3");
-    title.textContent = row.label;
-    const ratio = Math.max(0, Math.min(100, (row.used / row.limit) * 100));
-    const progress = document.createElement("progress");
-    progress.max = 100;
-    progress.value = ratio;
-    if (ratio >= 92) progress.className = "danger";
-    else if (ratio >= 75) progress.className = "warn";
-    progress.setAttribute("aria-label", `${row.label}使用比例`);
-    const amounts = document.createElement("p");
-    amounts.className = "usage-amounts";
-    amounts.textContent = `已用 ${formatUsageAmount(row.used, usage.unit || "USD")} / ${formatUsageAmount(row.limit, usage.unit || "USD")}`;
-    const remaining = document.createElement("p");
-    remaining.className = "usage-remaining";
-    remaining.textContent = row.remaining <= 0
-      ? `已用尽，${row.resetAt ? `${formatUsageTime(row.resetAt)}恢复` : row.resetFallback}`
-      : `剩余 ${formatUsageAmount(row.remaining, usage.unit || "USD")}`;
-    const reset = document.createElement("p");
-    reset.className = "usage-reset";
-    reset.textContent = row.resetAt ? `重置时间：${formatUsageTime(row.resetAt)}` : `重置时间：${row.resetFallback}`;
-    card.append(title, progress, amounts, remaining, reset);
-    list.append(card);
-  }
-  target.append(list);
+  const primary = rows[0];
+  const extras = rows.slice(1);
+  const ratio = Math.max(0, Math.min(100, (primary.used / primary.limit) * 100));
+  const remainPct = Math.max(0, Math.min(100, Math.round(100 - ratio)));
+  const tone = usageTone(ratio);
+  const dashOffset = (ringCircumference * (1 - remainPct / 100)).toFixed(2);
+  const expanded = Boolean(state.usageOpen && extras.length);
+  const remCompact = primary.remaining <= 0 ? "已用尽" : formatCompactAmount(primary.remaining, unit);
+  const usedSummary = `${formatCompactAmount(primary.used, unit)} / ${formatCompactAmount(primary.limit, unit)}`;
+  const resetCompact = formatCompactReset(primary.resetAt, primary.resetFallback);
+  const resetFull = primary.resetAt ? `重置时间：${formatUsageTime(primary.resetAt)}` : primary.resetFallback;
+  const fullTooltip = `${primary.label}：剩余 ${formatUsageAmount(primary.remaining, unit)}（已用 ${formatUsageAmount(primary.used, unit)} / ${formatUsageAmount(primary.limit, unit)}）\n${resetFull}`;
+
+  const extrasHtml = extras.length ? `<div class="quota-dock-extra" ${expanded ? "" : "hidden"}>
+    ${extras.map((row) => {
+      const r = Math.max(0, Math.min(100, (row.used / row.limit) * 100));
+      const t = usageTone(r);
+      const rTip = `${row.label}：剩余 ${formatUsageAmount(row.remaining, unit)}（已用 ${formatUsageAmount(row.used, unit)} / ${formatUsageAmount(row.limit, unit)}）`;
+      return `<div class="quota-mini-row is-${t}" title="${e(rTip)}">
+        <div class="quota-mini-top">
+          <span>${e(row.label)}</span>
+          <strong class="mono">${e(row.remaining <= 0 ? "已用尽" : formatCompactAmount(row.remaining, unit))}</strong>
+        </div>
+        <div class="quota-track"><span class="quota-fill" style="width:${r.toFixed(1)}%"></span></div>
+      </div>`;
+    }).join("")}
+  </div>` : "";
+
+  slot.innerHTML = `<section class="quota-dock is-${tone}" aria-label="模型额度">
+    <div class="quota-dock-full">
+      <div class="quota-dock-head">
+        <span class="quota-dock-title" title="${e(fullTooltip)}">
+          <i class="quota-dot" aria-hidden="true"></i>
+          <span>${e(primary.label)}</span>
+        </span>
+        <div class="quota-dock-tools">
+          ${extras.length ? `<button type="button" class="quota-icon-btn quota-expand-btn ${expanded ? "is-open" : ""}" data-act="usage-toggle" aria-expanded="${expanded ? "true" : "false"}" title="${expanded ? "收起其他周期" : `展开其余 ${extras.length} 项额度`}">
+            <span class="quota-more-count">+${extras.length}</span>${icon("down")}
+          </button>` : ""}
+          ${refreshBtn}
+        </div>
+      </div>
+      <div class="quota-dock-metrics" title="${e(fullTooltip)}">
+        <strong class="quota-dock-rem">${e(remCompact)}</strong>
+        <span class="quota-dock-used">${e(usedSummary)}</span>
+      </div>
+      <div class="quota-track" role="progressbar" aria-valuenow="${Math.round(ratio)}" aria-valuemin="0" aria-valuemax="100" aria-label="${e(primary.label)}使用比例">
+        <span class="quota-fill" style="width:${ratio.toFixed(1)}%"></span>
+      </div>
+      <p class="quota-dock-meta" title="${e(resetFull)}">${e(resetCompact)}</p>
+      ${extrasHtml}
+    </div>
+    <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="${e(fullTooltip)}&#10;点击刷新" aria-label="刷新模型额度">
+      <svg class="quota-ring" viewBox="0 0 36 36" aria-hidden="true">
+        <circle class="quota-ring-track" cx="18" cy="18" r="14.5"></circle>
+        <circle class="quota-ring-fill" cx="18" cy="18" r="14.5" stroke-dasharray="${ringCircumference}" stroke-dashoffset="${dashOffset}"></circle>
+      </svg>
+      <span class="quota-ring-label">${remainPct}%</span>
+    </button>
+  </section>`;
 }
 
-export async function refreshDesktopUsage(workspace = state.chatWorkspace, panel = document.querySelector("[data-usage-panel]")) {
+export async function refreshDesktopUsage(workspace = state.chatWorkspace, slot = document.querySelector("[data-sidebar-quota]")) {
   if (!desktopUsageEnabled()) return null;
   const requestId = ++usageRequestId;
-  const content = panel?.querySelector("[data-usage-content]");
-  if (content) {
-    content.replaceChildren();
-    const loading = document.createElement("p");
-    loading.className = "hint";
-    loading.setAttribute("role", "status");
-    loading.textContent = "正在获取模型额度…";
-    content.append(loading);
-  }
+  renderSidebarQuota(slot, state.usageState, { loading: true });
   let result;
   try { result = await window.officeDesktop.usage(); }
   catch { result = { state: "unavailable" }; }
   if (requestId !== usageRequestId) return result;
   state.usageState = result;
   if (workspace) workspace.usageState = result;
-  if (content?.isConnected) renderUsageResult(content, result);
+  const currentSlot = document.querySelector("[data-sidebar-quota]");
+  if (currentSlot) renderSidebarQuota(currentSlot, result, { loading: false });
   return result;
 }
 
 export function syncDesktopUsagePanel() {
-  if (!desktopUsageEnabled() || !state.usageOpen) return;
-  const panel = document.querySelector("[data-usage-panel]");
-  const content = panel?.querySelector("[data-usage-content]");
-  if (!panel || !content) return;
-  panel.hidden = false;
-  if (state.usageState) renderUsageResult(content, state.usageState);
-  else void refreshDesktopUsage(state.chatWorkspace, panel);
+  const slot = document.querySelector("[data-sidebar-quota]");
+  if (!slot) return;
+  if (!desktopUsageEnabled()) {
+    slot.hidden = true;
+    slot.innerHTML = "";
+    return;
+  }
+  if (state.usageState) {
+    renderSidebarQuota(slot, state.usageState, { loading: false });
+  } else {
+    void refreshDesktopUsage(state.chatWorkspace, slot);
+  }
 }
 
-export async function toggleDesktopUsage(triggerButton) {
-  const thread = triggerButton.closest(".agent-thread");
-  const panel = thread?.querySelector("[data-usage-panel]");
-  if (!panel) return;
-  const opening = panel.hidden;
-  state.usageOpen = opening;
-  panel.hidden = !opening;
-  triggerButton.setAttribute("aria-expanded", String(opening));
-  if (opening) await refreshDesktopUsage(state.chatWorkspace, panel);
+export async function toggleDesktopUsage() {
+  state.usageOpen = !state.usageOpen;
+  syncDesktopUsagePanel();
 }
 
 export function syncShellCanvasState() {
@@ -272,30 +488,261 @@ export function openDeckInStudio(fileId) {
   if (fileId) selectDeckFile(fileId);
 }
 
-export async function loadDesktopModelState({ allowPipeline = true, draftKey = modelDraftKey } = {}) {
+function desktopModelCacheKey(allowPipeline, draftKey) {
+  return `${state.me?.id || ""}|${allowPipeline ? 1 : 0}|${draftKey}`;
+}
+
+function buildDesktopModelState(raw, { allowPipeline = true, draftKey = modelDraftKey } = {}) {
+  const storedModel = readDraft(draftKey)?.model || "";
+  const models = [...new Set((Array.isArray(raw?.models) ? raw.models : [])
+    .filter((model) => typeof model === "string" && model.trim()).map((model) => model.trim()))];
+  const image_models = [...new Set((Array.isArray(raw?.image_models) ? raw.image_models : [])
+    .filter((model) => typeof model === "string" && /^gpt-image-/.test(model.trim())).map((model) => model.trim()))].sort();
+  const pipelineAvailable = allowPipeline && raw?.pipeline?.available === true;
+  const pipelineReason = allowPipeline && typeof raw?.pipeline?.reason === "string" ? raw.pipeline.reason : "";
+  const storedModelAvailable = storedModel === PIPELINE_MODEL ? pipelineAvailable : models.includes(storedModel);
+  const invalidated = Boolean(storedModel && !storedModelAvailable);
+  const selectedModel = invalidated ? "" : storedModel || (pipelineAvailable ? PIPELINE_MODEL : "");
+  if (invalidated) saveDraft(draftKey, { model: "" });
+  const modelNotice = invalidated ? "上次选择的模型已不可用，已清空，请重新选择。" :
+    raw?.error || (models.length || pipelineAvailable ? "" : "暂无可用模型，请联系管理员开通。");
+  return { models, image_models, selectedModel, modelNotice, pipelineAvailable, pipelineReason, modelsLoading: false };
+}
+
+function cachedDesktopModelState({ allowPipeline = true, draftKey = modelDraftKey } = {}) {
+  if (!clientExecutionRequired()) return { state: {}, fresh: true };
+  if (typeof window.officeDesktop?.runAgent !== "function") {
+    return { state: { models: [], image_models: [], selectedModel: "", modelNotice: "", modelsLoading: false }, fresh: true };
+  }
+  const entry = modelCache.get(desktopModelCacheKey(allowPipeline, draftKey));
+  if (!entry) return null;
+  const fresh = (Date.now() - entry.fetchedAt) < MODEL_CACHE_TTL_MS;
+  return { state: buildDesktopModelState(entry.raw, { allowPipeline, draftKey }), fresh };
+}
+
+export async function loadDesktopModelState({ allowPipeline = true, draftKey = modelDraftKey, force = false } = {}) {
   if (!clientExecutionRequired()) return {};
   if (typeof window.officeDesktop?.runAgent !== "function") return { models: [], image_models: [], selectedModel: "", modelNotice: "" };
 
-  const storedModel = readDraft(draftKey)?.model || "";
-  try {
-    if (typeof window.officeDesktop.models !== "function") throw new Error("当前桌面客户端不支持模型列表");
-    const result = await window.officeDesktop.models();
-    const models = [...new Set((Array.isArray(result?.models) ? result.models : [])
-      .filter((model) => typeof model === "string" && model.trim()).map((model) => model.trim()))];
-    const image_models = [...new Set((Array.isArray(result?.image_models) ? result.image_models : [])
-      .filter((model) => typeof model === "string" && /^gpt-image-/.test(model.trim())).map((model) => model.trim()))].sort();
-    const pipelineAvailable = allowPipeline && result?.pipeline?.available === true;
-    const pipelineReason = allowPipeline && typeof result?.pipeline?.reason === "string" ? result.pipeline.reason : "";
-    const storedModelAvailable = storedModel === PIPELINE_MODEL ? pipelineAvailable : models.includes(storedModel);
-    const invalidated = Boolean(storedModel && !storedModelAvailable);
-    const selectedModel = invalidated ? "" : storedModel || (pipelineAvailable ? PIPELINE_MODEL : "");
-    if (invalidated) saveDraft(draftKey, { model: "" });
-    const modelNotice = invalidated ? "上次选择的模型已不可用，已清空，请重新选择。" :
-      result?.error || (models.length || pipelineAvailable ? "" : "暂无可用模型，请联系管理员开通。");
-    return { models, image_models, selectedModel, modelNotice, pipelineAvailable, pipelineReason };
-  } catch (error) {
-    return { models: [], image_models: [], selectedModel: "", modelNotice: error.message || "模型列表获取失败，请重试。" };
+  const cacheKey = desktopModelCacheKey(allowPipeline, draftKey);
+  if (!force) {
+    const cached = cachedDesktopModelState({ allowPipeline, draftKey });
+    if (cached?.fresh) return cached.state;
   }
+  if (!force && modelInFlight.has(cacheKey)) {
+    return modelInFlight.get(cacheKey);
+  }
+  const job = (async () => {
+    try {
+      if (typeof window.officeDesktop.models !== "function") throw new Error("当前桌面客户端不支持模型列表");
+      const result = await window.officeDesktop.models();
+      const built = buildDesktopModelState(result, { allowPipeline, draftKey });
+      if (built.models.length || built.pipelineAvailable) {
+        modelCache.set(cacheKey, { raw: result, fetchedAt: Date.now() });
+      }
+      return built;
+    } catch (error) {
+      return { models: [], image_models: [], selectedModel: "", modelNotice: error.message || "模型列表获取失败，请重试。", modelsLoading: false };
+    } finally {
+      modelInFlight.delete(cacheKey);
+    }
+  })();
+  modelInFlight.set(cacheKey, job);
+  return job;
+}
+
+export function prefetchDesktopModels() {
+  if (!clientExecutionRequired() || typeof window.officeDesktop?.models !== "function") return;
+  void loadDesktopModelState().catch(() => {});
+}
+
+const MODE_OPTIONS = [
+  { id: "auto", label: "自动", hint: "按需回复或导出文件", glyph: "sparkles" },
+  { id: "reply", label: "仅回复", hint: "对话内直接 Markdown 回复", glyph: "message" },
+  { id: "docx", label: "Word", hint: "导出可编辑 Word 文档", glyph: "docx" },
+  { id: "pptx", label: "PPT", hint: "AI 自由画布设计演示文稿", glyph: "pptx" }
+];
+
+function modeOptionFor(value) {
+  return MODE_OPTIONS.find((item) => item.id === value) || MODE_OPTIONS[0];
+}
+
+function modePickerInner(currentMode, disabled = false) {
+  const activeMode = modeOptionFor(currentMode);
+  return `<input type="hidden" name="mode" value="${e(activeMode.id)}">
+    <button type="button" class="composer-picker-trigger" data-act="picker-toggle" data-id="mode" aria-haspopup="listbox" aria-expanded="false" title="输出方式：${e(activeMode.label)}" ${disabled ? "disabled" : ""}>
+      <span class="picker-glyph">${icon(activeMode.glyph)}</span>
+      <span class="picker-label">${e(activeMode.label)}</span>
+      <span class="picker-caret">${icon("down")}</span>
+    </button>
+    <div class="composer-picker-menu" data-picker-menu="mode" role="listbox" aria-label="输出方式" hidden>
+      ${MODE_OPTIONS.map((item) => {
+        const on = item.id === activeMode.id;
+        return `<button type="button" class="composer-picker-item ${on ? "active" : ""}" role="option" aria-selected="${on ? "true" : "false"}" data-act="picker-pick" data-picker="mode" data-id="${e(item.id)}">
+          <span class="picker-item-glyph">${icon(item.glyph)}</span>
+          <span class="picker-item-copy"><strong>${e(item.label)}</strong><small>${e(item.hint)}</small></span>
+          <span class="picker-item-check">${on ? icon("checkPlain") : ""}</span>
+        </button>`;
+      }).join("")}
+    </div>`;
+}
+
+function modelPickerInner(workspace, disabled = false) {
+  const models = workspace?.models || [];
+  const selected = workspace?.selectedModel || "";
+  const isPipeline = selected === PIPELINE_MODEL;
+  const hasAny = Boolean(models.length || workspace?.pipelineAvailable);
+  const label = isPipeline
+    ? "智能分工"
+    : selected
+      ? selected
+      : workspace?.modelsLoading
+        ? "加载模型…"
+        : models.length
+          ? "选择模型"
+          : "暂无模型";
+  const glyph = isPipeline ? "sparkles" : "sliders";
+  const triggerDisabled = disabled || !hasAny;
+  return `<button type="button" class="composer-picker-trigger model-picker-trigger ${isPipeline ? "is-pipeline" : ""}" data-chat-model data-act="picker-toggle" data-id="model" aria-haspopup="listbox" aria-expanded="false" title="执行模型：${e(label)}" ${triggerDisabled ? "disabled" : ""}>
+      <span class="picker-glyph">${icon(glyph)}</span>
+      <span class="picker-label ${!isPipeline && selected ? "mono" : ""}">${e(label)}</span>
+      <span class="picker-caret">${icon("down")}</span>
+    </button>
+    <div class="composer-picker-menu align-right" data-picker-menu="model" role="listbox" aria-label="选择执行模型" hidden>
+      <button type="button" class="composer-picker-item ${isPipeline ? "active" : ""}" role="option" aria-selected="${isPipeline ? "true" : "false"}" data-act="picker-pick" data-picker="model" data-id="${PIPELINE_MODEL}" ${workspace?.pipelineAvailable ? "" : "disabled"}>
+        <span class="picker-item-glyph">${icon("sparkles")}</span>
+        <span class="picker-item-copy"><strong>智能分工</strong><small>${e(workspace?.pipelineAvailable ? "理解 · 执行 · 验收协同" : (workspace?.pipelineReason || "暂不可用"))}</small></span>
+        <span class="picker-item-check">${isPipeline ? icon("checkPlain") : ""}</span>
+      </button>
+      ${models.length ? '<div class="composer-picker-divider" aria-hidden="true"></div>' : ""}
+      ${models.map((model) => {
+        const on = selected === model;
+        return `<button type="button" class="composer-picker-item ${on ? "active" : ""}" role="option" aria-selected="${on ? "true" : "false"}" data-act="picker-pick" data-picker="model" data-id="${e(model)}">
+          <span class="picker-item-glyph">${icon("sliders")}</span>
+          <span class="picker-item-copy"><strong class="mono">${e(model)}</strong></span>
+          <span class="picker-item-check">${on ? icon("checkPlain") : ""}</span>
+        </button>`;
+      }).join("")}
+    </div>`;
+}
+
+export function closeComposerPickers() {
+  for (const picker of document.querySelectorAll(".composer-picker.is-open")) {
+    picker.classList.remove("is-open");
+    picker.querySelector("[data-picker-menu]")?.setAttribute("hidden", "");
+    picker.querySelector("[data-act=picker-toggle]")?.setAttribute("aria-expanded", "false");
+  }
+}
+
+export function toggleComposerPicker(name) {
+  const form = chatForm();
+  if (!form || form.dataset.busy) return;
+  const picker = form.querySelector(`.composer-picker[data-picker="${name}"]`);
+  if (!picker) return;
+  const trigger = picker.querySelector("[data-act=picker-toggle]");
+  const menu = picker.querySelector("[data-picker-menu]");
+  if (!trigger || trigger.disabled || !menu) return;
+  const opening = menu.hidden;
+  closeSlashMenu();
+  closeComposerPickers();
+  if (opening) {
+    picker.classList.add("is-open");
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+  }
+}
+
+function syncModePickerDom(form) {
+  const picker = form?.querySelector('.composer-picker[data-picker="mode"]');
+  if (!picker) return;
+  const current = form.elements?.mode?.value || "auto";
+  picker.innerHTML = modePickerInner(current, Boolean(form.dataset.busy));
+}
+
+export function pickComposerOption(pickerName, value) {
+  const form = chatForm();
+  const workspace = state.chatWorkspace;
+  closeComposerPickers();
+  if (!form || !workspace || form.dataset.busy) return;
+  if (pickerName === "mode") {
+    const next = modeOptionFor(value).id;
+    if (form.elements.mode) form.elements.mode.value = next;
+    syncModePickerDom(form);
+    saveWorkspaceInput(form);
+    return;
+  }
+  if (pickerName === "model") {
+    const allowed = value === PIPELINE_MODEL ? workspace.pipelineAvailable === true : workspace.models?.includes(value);
+    if (!allowed) return;
+    workspace.selectedModel = value;
+    workspace.modelNotice = "";
+    saveDraft(modelDraftKey, { model: value });
+    syncComposerModelsDom(workspace);
+    const status = document.querySelector("[data-chat-model-status]");
+    if (status) {
+      status.textContent = workspace.pipelineReason || "";
+      status.hidden = !workspace.pipelineReason;
+    }
+  }
+}
+
+function syncComposerModelsDom(workspace) {
+  const form = chatForm();
+  if (!form || state.chatWorkspace !== workspace) return;
+  const modelPicker = form.querySelector('.composer-picker[data-picker="model"]');
+  if (modelPicker) {
+    modelPicker.innerHTML = modelPickerInner(workspace, Boolean(form.dataset.busy));
+  }
+  const statusText = [workspace.modelNotice, workspace.pipelineReason].filter(Boolean).join(" ");
+  let statusEl = form.querySelector("[data-chat-model-status]");
+  if (statusText) {
+    if (!statusEl) {
+      statusEl = document.createElement("p");
+      statusEl.className = "chat-model-status";
+      statusEl.dataset.chatModelStatus = "";
+      statusEl.setAttribute("role", "status");
+      form.append(statusEl);
+    }
+    statusEl.textContent = statusText;
+    statusEl.hidden = false;
+    statusEl.classList.toggle("error", !(workspace.models?.length || workspace.pipelineAvailable));
+  } else if (statusEl) {
+    statusEl.textContent = "";
+    statusEl.hidden = true;
+  }
+  const showImageControls = clientExecutionRequired() && typeof window.officeDesktop?.runAgent === "function" && (workspace.image_models?.length > 0);
+  if (showImageControls && !form.querySelector("[data-image-toggle]")) {
+    const imageAutoOn = imageAutoPreference() || pptImageAutoPreference();
+    const drawerOpen = Boolean(state.imageDrawerOpen);
+    const sep = form.querySelector(".composer-tools .composer-sep");
+    const btnHtml = `<button type="button" class="composer-tool ${drawerOpen ? "active" : ""} ${imageAutoOn ? "dot-active" : ""}" data-act="toggle-image-drawer" data-image-toggle aria-expanded="${drawerOpen ? "true" : "false"}" title="图片生成设置" aria-label="图片生成设置">${icon("image")}</button>`;
+    if (sep) sep.insertAdjacentHTML("beforebegin", btnHtml);
+    else form.querySelector(".composer-tools")?.insertAdjacentHTML("beforeend", btnHtml);
+    const drawerMarkup = `<div class="image-drawer ${drawerOpen ? "open" : ""}" data-image-drawer aria-label="图片生成设置">
+      <div class="image-drawer-inner">
+        <div class="composer-image">
+          <div class="image-controls">
+            <label><span>尺寸</span><select name="image_size" aria-label="生图尺寸">
+              <option value="1024x1024">方形 1024×1024</option><option value="1536x1024">横版 1536×1024</option>
+              <option value="1024x1536">竖版 1024×1536</option><option value="1536x864">16:9 1536×864</option>
+            </select></label>
+            <label><span>质量</span><select name="image_quality" aria-label="生图质量">
+              <option value="low">草稿</option><option value="medium" selected>标准</option><option value="high">精细</option>
+            </select></label>
+            ${button("生成图片", "chat-generate-image", { cls: "sm", icon: "image", disabled: Boolean(form.dataset.busy) })}
+          </div>
+          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ppt_images" ${pptImageAutoPreference() ? "checked" : ""}>
+            <span>制作 PPT 时自动配图（1–3 张，按张计费）</span></label>
+          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ai_images" ${imageAutoPreference() ? "checked" : ""}>
+            <span>普通对话允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>
+        </div>
+      </div>
+    </div>`;
+    if (statusEl) statusEl.insertAdjacentHTML("beforebegin", drawerMarkup);
+    else form.insertAdjacentHTML("beforeend", drawerMarkup);
+  }
+  syncImageAutoIndicator();
+  syncChatSubmit(form, workspace);
 }
 
 function selectedModelAvailable(workspace) {
@@ -330,28 +777,160 @@ function writeDraft(workspace, form, fields = {}) {
   saveDraft(workspace.draftKey, { ...previous, ...inputs, ...fields });
 }
 
+function updateContextDom(workspace) {
+  if (state.chatWorkspace !== workspace) return;
+  const thread = document.querySelector(".agent-thread");
+  if (thread) {
+    const existingAnchor = thread.querySelector(".context-anchor");
+    const anchorHtml = contextAnchorBar(workspace);
+    if (anchorHtml) {
+      if (existingAnchor) existingAnchor.outerHTML = anchorHtml;
+      else thread.querySelector(".thread-header")?.insertAdjacentHTML("afterend", anchorHtml);
+    } else {
+      existingAnchor?.remove();
+    }
+  }
+  const contextPane = document.querySelector('[data-studio-pane="context"]');
+  if (contextPane) contextPane.innerHTML = contextBody(workspace);
+}
+
 export async function loadWorkspace(parts) {
   const [, scope, assignment] = parts;
-  const [session, conversations, today, desktopModels] = await Promise.all([
-    scope && !["task", "project"].includes(scope) ? api("/conversations/" + encodeURIComponent(scope)) : null,
-    api("/conversations"),
-    api("/me/today"),
-    loadDesktopModelState()
-  ]);
+  const userId = state.me?.id;
+  const isSessionRoute = Boolean(scope && !["task", "project"].includes(scope));
+
+  // 1. 桌面模型列表：命中缓存直接瞬开，未命中/过期时非阻塞后台拉取，不再卡住页面切换。
+  const cachedModels = cachedDesktopModelState();
+  const desktopModels = cachedModels
+    ? cachedModels.state
+    : {
+        models: [],
+        image_models: [],
+        selectedModel: readDraft(modelDraftKey)?.model || "",
+        modelNotice: "",
+        pipelineAvailable: false,
+        pipelineReason: "",
+        modelsLoading: clientExecutionRequired() && typeof window.officeDesktop?.runAgent === "function"
+      };
+  const needModelRefresh = !cachedModels || !cachedModels.fresh;
+
+  // 2. 会话详情 / 关联任务 / 关联项目：优先使用内存缓存瞬开，再后台静默校准。
+  let session = isSessionRoute ? (sessionCache.get(scope) || null) : null;
+  let sessionFromCache = Boolean(session);
+  if (isSessionRoute && !session) {
+    session = await api("/conversations/" + encodeURIComponent(scope));
+    sessionCache.set(scope, session);
+  }
+
   const bound = session?.assignment_id || (scope === "task" ? assignment : null);
   const group = session?.project_id || (scope === "project" ? assignment : null);
-  const [task, project] = await Promise.all([
-    bound ? api("/assignments/" + encodeURIComponent(bound)) : null,
-    group ? api("/projects/" + encodeURIComponent(group)) : null
-  ]);
-  state.conversations = conversations;
-  state.today = today.items || [];
-  if (today.today && state.me) state.me.today = today.today;
-  return {
-    session, conversations, task, project, ...desktopModels,
-    tasks: (today.items || []).filter((item) => active(item.status)),
+  let task = bound ? (taskCache.get(bound) || null) : null;
+  let project = group ? (projectCache.get(group) || null) : null;
+  const taskFromCache = Boolean(task);
+  const projectFromCache = Boolean(project);
+
+  // 仅当直接进入新任务/项目会话且本地无缓存时才等待对应实体；已有会话切回时不阻塞。
+  const initialFetches = [];
+  if (scope === "task" && bound && !task) {
+    initialFetches.push(api("/assignments/" + encodeURIComponent(bound)).then((res) => { task = res; taskCache.set(bound, res); }));
+  }
+  if (scope === "project" && group && !project) {
+    initialFetches.push(api("/projects/" + encodeURIComponent(group)).then((res) => { project = res; projectCache.set(group, res); }));
+  }
+  if (initialFetches.length) await Promise.all(initialFetches);
+
+  const conversations = Array.isArray(state.conversations) ? state.conversations : [];
+  const todayItems = Array.isArray(state.today) ? state.today : [];
+
+  const workspace = {
+    session,
+    conversations,
+    task,
+    project,
+    ...desktopModels,
+    tasks: todayItems.filter((item) => active(item.status)),
     draftKey: "chat/" + (session?.id || (task ? "task/" + task.id : project ? "project/" + project.id : "new"))
   };
+
+  workspace._revalidate = () => {
+    if (workspace._revalidated) return;
+    workspace._revalidated = true;
+
+    if (needModelRefresh && clientExecutionRequired() && typeof window.officeDesktop?.runAgent === "function") {
+      void loadDesktopModelState({ force: Boolean(cachedModels && !cachedModels.fresh) }).then((freshModels) => {
+        if (state.me?.id !== userId || state.chatWorkspace !== workspace) return;
+        Object.assign(workspace, freshModels);
+        syncComposerModelsDom(workspace);
+      }).catch(() => {});
+    }
+
+    // 后台刷新当前会话（若前面用的是缓存，校验是否有最新回复或状态变更）
+    if (isSessionRoute && sessionFromCache) {
+      void api("/conversations/" + encodeURIComponent(scope)).then(async (freshSession) => {
+        if (state.me?.id !== userId) return;
+        sessionCache.set(scope, freshSession);
+        if (state.chatWorkspace !== workspace) return;
+        const changed = sessionSignature(workspace.session) !== sessionSignature(freshSession);
+        workspace.session = freshSession;
+        if (changed) {
+          const turnsEl = document.querySelector("[data-chat-turns]");
+          if (turnsEl) turnsEl.innerHTML = historyView(workspace);
+          const titleWrap = document.querySelector("[data-thread-title-wrap]");
+          if (titleWrap && freshSession?.title) {
+            titleWrap.classList.remove("muted");
+            titleWrap.innerHTML = `${icon("message")}<span class="thread-title-text" title="${e(freshSession.title)}">${e(freshSession.title)}</span>`;
+          }
+          if (freshSession?.turns?.length) leaveEmptyState();
+          const artifacts = studioArtifacts(freshSession);
+          if (state.contextOpen && state.studioTab === "deck" && artifacts.length) {
+            await refreshCanvasLive(workspace, { selectId: artifacts[0].id, flash: false });
+          }
+          syncActiveChatView({ skipRevalidate: true });
+        }
+      }).catch(() => {});
+    }
+
+    // 后台补齐或校准关联任务与项目
+    if (bound && (!task || taskFromCache)) {
+      void api("/assignments/" + encodeURIComponent(bound)).then((freshTask) => {
+        if (state.me?.id !== userId) return;
+        taskCache.set(bound, freshTask);
+        if (state.chatWorkspace !== workspace) return;
+        workspace.task = freshTask;
+        updateContextDom(workspace);
+        syncChatSubmit(chatForm(), workspace);
+      }).catch(() => {});
+    }
+    if (group && (!project || projectFromCache)) {
+      void api("/projects/" + encodeURIComponent(group)).then((freshProject) => {
+        if (state.me?.id !== userId) return;
+        projectCache.set(group, freshProject);
+        if (state.chatWorkspace !== workspace) return;
+        workspace.project = freshProject;
+        updateContextDom(workspace);
+      }).catch(() => {});
+    }
+
+    // 后台刷新侧栏会话列表与今日待办（不阻塞当前页切换）
+    void api("/conversations").then((freshList) => {
+      if (state.me?.id !== userId || !Array.isArray(freshList)) return;
+      state.conversations = freshList;
+      if (state.chatWorkspace === workspace) workspace.conversations = freshList;
+      emitConversationsUpdated();
+    }).catch(() => {});
+
+    void api("/me/today").then((freshToday) => {
+      if (state.me?.id !== userId || !freshToday?.items) return;
+      state.today = freshToday.items;
+      if (freshToday.today && state.me) state.me.today = freshToday.today;
+      if (state.chatWorkspace === workspace) {
+        workspace.tasks = freshToday.items.filter((item) => active(item.status));
+        if (!workspace.task && !workspace.project) updateContextDom(workspace);
+      }
+    }).catch(() => {});
+  };
+
+  return workspace;
 }
 
 export function conversationNav(workspace) {
@@ -364,9 +943,10 @@ export function conversationNav(workspace) {
       <button type="button" class="button ghost history-trigger" data-act="chat-history" title="最近会话" aria-label="最近会话">${icon("history")}</button>
       <div class="recent-sessions">${workspace.conversations.map((session) => {
         const selected = state.route[0] === "chat" && state.route[1] === session.id;
-        return `<button type="button" class="session-link ${selected ? "active" : ""}" data-act="route" data-id="chat/${e(session.id)}"
-          title="${e(session.title)}" ${selected ? 'aria-current="page"' : ""}>
-          ${icon("message")}<span>${e(session.title)}</span></button>`;
+        const running = Boolean(activeTurnFor(session.id));
+        return `<button type="button" class="session-link ${selected ? "active" : ""} ${running ? "is-running" : ""}" data-act="route" data-id="chat/${e(session.id)}"
+          title="${e(session.title)}${running ? "（正在执行）" : ""}" ${selected ? 'aria-current="page"' : ""}>
+          ${icon("message")}<span>${e(session.title)}</span>${running ? '<i class="session-running-dot" aria-label="正在执行"></i>' : ""}</button>`;
       }).join("")}</div>` : ""}
   </div>`;
 }
@@ -417,7 +997,33 @@ function artifactCard(file) {
   return `<div class="session-file">${fileMarkup(file, { edit: true })}</div>`;
 }
 
+function liveTurnMarkup(live) {
+  const selectionHtml = live.selection
+    ? `<small class="request-scope">第 ${live.selection.slide} 页${live.selection.shape_id ? " · 文本框" : " · 整页"}</small><br>`
+    : "";
+  const steps = Array.isArray(live.steps) ? live.steps : [];
+  const stepsHtml = steps.map((step, idx) =>
+    `<li class="${idx === steps.length - 1 ? "active" : "done"}"><span class="step-dot" aria-hidden="true"></span><span>${e(step)}</span></li>`
+  ).join("");
+  const canStop = live.canCancel && live.phase !== "complete";
+  return `<section class="conversation-turn pending-turn" data-live-thread="${e(live.threadId)}">
+    <div class="request-entry"><p>${selectionHtml}${e(live.message)}</p></div>
+    <div class="response-entry">
+      <div class="response-head">
+        <p class="response-byline"><span class="response-mark is-working">${icon("mark")}</span><strong>穹驭</strong></p>
+      </div>
+      <ol class="live-steps" data-progress-trace ${steps.length ? "" : "hidden"}>${stepsHtml}</ol>
+      <div class="running-bar">
+        <span class="running-pulse" aria-hidden="true"></span>
+        <p class="running-note" ${live.kind === "image" ? "data-image-progress" : ""} role="status">${e(live.statusText || "正在思考…")}</p>
+        ${canStop ? `<button type="button" class="button stop-button" data-act="chat-cancel" ${live.cancelling ? "disabled" : ""}>${live.cancelling ? "正在停止…" : `${icon("stop")}停止`}</button>` : ""}
+      </div>
+    </div>
+  </section>`;
+}
+
 function turnView(turn, index, canRetry = false) {
+  const isOrphanRunning = turn.status === "running" && !turn.reply && !turn.error;
   const reply = turn.reply || turn.error || (turn.status === "running" ? "正在执行…" : "");
   const images = Array.isArray(turn.images) ? turn.images : [];
   const pipeline = turn.pipeline;
@@ -436,7 +1042,12 @@ function turnView(turn, index, canRetry = false) {
       </div>
       ${turn.steps?.length ? `<details class="tool-trace"><summary>执行轨迹 · ${turn.steps.length} 步</summary>
         <ul>${turn.steps.map((step) => `<li>${icon("check")}<span>${e(step)}</span></li>`).join("")}</ul></details>` : ""}
-      ${turn.error ? `<p class="error">${e(reply)}</p>` : `<div class="response-copy md-body">${renderMarkdown(reply)}</div>`}
+      ${isOrphanRunning && clientExecutionRequired() && turn.id
+        ? `<div class="running-bar orphan-running-bar">
+            <p class="running-note" role="status">上一次桌面执行未正常结束，当前会话被锁定。</p>
+            <button type="button" class="button stop-button" data-act="chat-abort-orphan" data-id="${e(turn.id)}" data-kind="${e(turn.kind === "image" ? "image" : "turn")}">${icon("stop")}结束并解锁</button>
+          </div>`
+        : turn.error ? `<p class="error">${e(reply)}</p>` : `<div class="response-copy md-body">${renderMarkdown(reply)}</div>`}
       ${pipeline && pipelineLabel ? `<div class="pipeline-result">
         <div class="pipeline-result-status"><span class="pipeline-badge ${pipeline.verdict === "fail" ? "failed" : pipeline.verdict === "skipped" ? "skipped" : "passed"}">${e(pipelineLabel)}</span>
           <span class="pipeline-review">${e(reviewLabels[pipeline.review] || "复核：未知")}</span></div>
@@ -467,7 +1078,17 @@ function turnView(turn, index, canRetry = false) {
 function historyView(workspace) {
   const session = workspace.session;
   const canRetry = !(workspace.task && !active(workspace.task.status));
-  return `${session?.has_earlier ? `<div class="actions">${button("加载更早的消息", "chat-earlier", { icon: "history", cls: "sm" })}</div>` : ""}${(session?.turns || []).map((turn, i) => turnView(turn, i, canRetry)).join("")}`;
+  const activeLive = activeTurnFor(session?.id);
+  const turns = session?.turns || [];
+  let skippedRunning = false;
+  const turnsHtml = turns.map((turn, i) => {
+    if (activeLive && turn.status === "running" && !skippedRunning && (!activeLive.runId || turn.id === activeLive.runId)) {
+      skippedRunning = true;
+      return "";
+    }
+    return turnView(turn, i, canRetry);
+  }).join("");
+  return `${session?.has_earlier ? `<div class="actions">${button("加载更早的消息", "chat-earlier", { icon: "history", cls: "sm" })}</div>` : ""}${turnsHtml}${activeLive ? liveTurnMarkup(activeLive) : ""}`;
 }
 
 function welcomeHero(workspace) {
@@ -603,8 +1224,7 @@ function composer(workspace) {
   const modelRequired = desktopRequired && desktopAvailable;
   const imageModels = workspace.image_models || [];
   const showImageControls = desktopRequired && desktopAvailable && imageModels.length > 0;
-  const showImageAuto = showImageControls && workspace.selectedModel !== PIPELINE_MODEL;
-  const imageAutoOn = showImageAuto && imageAutoPreference();
+  const imageAutoOn = showImageControls && (imageAutoPreference() || pptImageAutoPreference());
   const drawerOpen = showImageControls && Boolean(state.imageDrawerOpen);
   const selectedCount = (draft.selected || []).length;
   const draftText = draft.message || "";
@@ -633,21 +1253,14 @@ function composer(workspace) {
         <button type="button" class="composer-tool" data-act="slash-trigger" title="快捷指令（/）" aria-label="快捷指令">
           ${icon("slash")}
         </button>
-        <span class="composer-sep" aria-hidden="true"></span>
-        <select class="composer-select" name="mode" aria-label="输出方式" title="输出方式">${Object.entries({ auto: "自动", reply: "仅回复", docx: "Word", pptx: "PPT" })
-          .map(([mode, label]) => `<option value="${mode}" ${draft.mode === mode ? "selected" : ""}>${label}</option>`).join("")}</select>
         ${showImageControls ? `<button type="button" class="composer-tool ${drawerOpen ? "active" : ""} ${imageAutoOn ? "dot-active" : ""}" data-act="toggle-image-drawer" data-image-toggle aria-expanded="${drawerOpen ? "true" : "false"}" title="图片生成设置" aria-label="图片生成设置">
           ${icon("image")}
         </button>` : ""}
+        <span class="composer-sep" aria-hidden="true"></span>
+        <div class="composer-picker" data-picker="mode">${modePickerInner(draft.mode || "auto", blocked)}</div>
       </div>
       <div class="composer-right">
-        ${modelRequired ? `<select class="composer-select model-select" data-chat-model aria-label="执行模型" title="选择执行模型"
-          ${workspace.models?.length ? "" : "disabled"}>
-          <option value="${PIPELINE_MODEL}" ${workspace.selectedModel === PIPELINE_MODEL ? "selected" : ""} ${workspace.pipelineAvailable ? "" : "disabled"}>智能分工</option>
-          <option value="" ${workspace.selectedModel ? "" : "selected"}>${workspace.models?.length ? "选择模型" : "暂无模型"}</option>
-          ${(workspace.models || []).map((model) => `<option value="${e(model)}" ${workspace.selectedModel === model ? "selected" : ""}>${e(model)}</option>`).join("")}
-        </select>` : ""}
-        <span class="composer-enter-hint" aria-hidden="true">↵</span>
+        ${modelRequired ? `<div class="composer-picker" data-picker="model">${modelPickerInner(workspace, blocked)}</div>` : ""}
         <button class="composer-send ${draftText.trim() ? "ready" : ""}" type="submit" aria-label="发送消息" title="发送（Enter）" ${blocked || (modelRequired && !modelSelected) ? "disabled" : ""}>${icon("arrowUp")}</button>
       </div>
     </div>
@@ -664,8 +1277,10 @@ function composer(workspace) {
             </select></label>
             ${button("生成图片", "chat-generate-image", { cls: "sm", icon: "image", disabled: blocked })}
           </div>
-          <label class="image-auto-option" data-image-auto-wrap ${showImageAuto ? "" : "hidden"}><input type="checkbox" name="allow_ai_images" ${imageAutoPreference() ? "checked" : ""}>
-            <span>允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>
+          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ppt_images" ${pptImageAutoPreference() ? "checked" : ""}>
+            <span>制作 PPT 时自动配图（1–3 张，按张计费）</span></label>
+          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ai_images" ${imageAutoPreference() ? "checked" : ""}>
+            <span>普通对话允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>
         </div>
       </div>
     </div>` : ""}
@@ -676,9 +1291,9 @@ function composer(workspace) {
 
 export function workspaceView(workspace) {
   const { session, task, project } = workspace;
-  const hasTurns = Boolean(session?.turns.length);
+  const activeLive = activeTurnFor(session?.id);
+  const hasTurns = Boolean(session?.turns?.length || activeLive);
   const title = session?.title || (task ? task.title : project ? project.name : "新会话");
-  const showUsage = desktopUsageEnabled();
   const hasArtifact = studioArtifacts(session).length > 0;
 
   // 智能默认分屏策略：有 PPT / Word / 图片成果时默认并排开启右侧实时画布，无成果时默认居中沉浸
@@ -706,17 +1321,11 @@ export function workspaceView(workspace) {
         <div class="thread-header-actions">
           ${state.engine?.engine === "demo" ? '<span class="thread-engine">本地演示</span>' :
             state.engine?.model ? `<span class="thread-engine mono">${e(state.engine.model)}</span>` : ""}
-          ${showUsage ? `<button class="button sm ghost usage-toggle" type="button" data-act="usage-toggle" aria-expanded="${state.usageOpen ? "true" : "false"}">额度</button>` : ""}
           <button class="button sm ghost studio-trigger ${open && activeTab === "deck" ? "active" : ""}" type="button" data-act="toggle-context" data-id="deck" aria-expanded="${open && activeTab === "deck" ? "true" : "false"}">${icon("pptx")}画布</button>
           <button class="button sm ghost studio-trigger ${open && activeTab === "context" ? "active" : ""}" type="button" data-act="toggle-context" data-id="context" aria-expanded="${open && activeTab === "context" ? "true" : "false"}">${icon("panelRight")}上下文</button>
         </div>
       </header>
       ${contextAnchorBar(workspace)}
-      ${showUsage ? `<section class="usage-panel" data-usage-panel aria-label="模型额度" ${state.usageOpen ? "" : "hidden"}>
-        <div class="usage-panel-heading"><h2>模型额度</h2>
-          <button class="button sm" type="button" data-act="usage-refresh">${icon("refresh")}刷新</button></div>
-        <div data-usage-content><p class="hint" role="status">打开面板后获取额度。</p></div>
-      </section>` : ""}
       <div class="thread-scroll">
         ${hasTurns ? "" : welcomeHero(workspace)}
         <div class="thread-content" data-chat-turns>${historyView(workspace)}</div>
@@ -766,9 +1375,9 @@ export function syncImageAutoIndicator() {
   const form = chatForm();
   const toggleBtn = form?.querySelector("[data-image-toggle]");
   const checkbox = form?.elements?.allow_ai_images;
-  const wrap = form?.querySelector("[data-image-auto-wrap]");
-  if (toggleBtn && checkbox) {
-    toggleBtn.classList.toggle("dot-active", Boolean(checkbox.checked) && !wrap?.hidden);
+  const pptCheckbox = form?.elements?.allow_ppt_images;
+  if (toggleBtn) {
+    toggleBtn.classList.toggle("dot-active", Boolean(checkbox?.checked || pptCheckbox?.checked));
   }
 }
 
@@ -874,6 +1483,7 @@ export async function applySlashCommand(id) {
     const modeMap = { ppt: "pptx", word: "docx", auto: "auto" };
     const nameMap = { ppt: "已切换为 PowerPoint 输出模式", word: "已切换为 Word 输出模式", auto: "已切换为自动判断模式" };
     form.elements.mode.value = modeMap[id];
+    syncModePickerDom(form);
     saveWorkspaceInput(form);
     pulseComposer();
     toastMessage(nameMap[id], "info");
@@ -941,11 +1551,7 @@ export function selectDesktopModel(select, workspace, statusSelector = "[data-ch
     status.textContent = workspace.pipelineReason || "";
     status.hidden = !workspace.pipelineReason;
   }
-  const autoWrap = select.form?.querySelector("[data-image-auto-wrap]");
-  if (autoWrap) {
-    autoWrap.hidden = select.value === PIPELINE_MODEL;
-    syncImageAutoIndicator();
-  }
+  syncImageAutoIndicator();
   return true;
 }
 
@@ -1087,52 +1693,171 @@ function leaveEmptyState() {
   document.querySelector(".welcome-below")?.remove();
 }
 
-function startProgress(form, message) {
+function startProgress(form, live) {
   closeSlashMenu();
   leaveEmptyState();
   const messages = document.querySelector("[data-chat-turns]");
-  const canCancel = !clientExecutionRequired() || typeof window.officeDesktop?.cancelAgent === "function";
-  messages.insertAdjacentHTML("beforeend", `<section class="conversation-turn pending-turn">
-    <div class="request-entry"><p>${e(message)}</p></div>
-    <div class="response-entry">
-      <div class="response-head">
-        <p class="response-byline"><span class="response-mark is-working">${icon("mark")}</span><strong>穹驭</strong></p>
-      </div>
-      <ol class="live-steps" data-progress-trace hidden></ol>
-      <div class="running-bar">
-        <span class="running-pulse" aria-hidden="true"></span>
-        <p class="running-note" role="status">正在思考…</p>
-        ${canCancel ? `<button type="button" class="button stop-button" data-act="chat-cancel">${icon("stop")}停止</button>` : ""}
-      </div>
-    </div></section>`);
-  form.elements.message.value = "";
-  syncComposerGrow(form.elements.message);
+  if (messages) {
+    findLiveProgress(live.threadId)?.remove();
+    messages.insertAdjacentHTML("beforeend", liveTurnMarkup(live));
+  }
+  if (form?.elements?.message) {
+    form.elements.message.value = "";
+    syncComposerGrow(form.elements.message);
+  }
   scrollToLatest();
-  return messages.lastElementChild;
+  return findLiveProgress(live.threadId);
 }
 
 function setComposerLocked(form, locked, workspace = state.chatWorkspace) {
   if (!form?.isConnected) return;
-  for (const field of form.querySelectorAll("textarea, select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source], button[data-act=slash-trigger]")) {
+  if (locked) closeComposerPickers();
+  for (const field of form.querySelectorAll("textarea, select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source], button[data-act=slash-trigger], button[data-act=chat-generate-image], button[data-act=picker-toggle]")) {
     field.disabled = locked;
   }
   if (!locked) {
     const modelSelect = form.querySelector("[data-chat-model]");
-    if (modelSelect) modelSelect.disabled = !workspace?.models?.length;
+    if (modelSelect) modelSelect.disabled = !(workspace?.models?.length || workspace?.pipelineAvailable);
+    const imgBtn = form.querySelector("[data-act=chat-generate-image]");
+    if (imgBtn) {
+      imgBtn.disabled = clientExecutionRequired() && typeof window.officeDesktop?.runAgent !== "function";
+      imgBtn.innerHTML = `${icon("image")}生成图片`;
+    }
+    syncChatSubmit(form, workspace);
+  } else {
+    syncChatSubmit(form, workspace);
+  }
+}
+
+function syncLiveCanvas(live) {
+  if (!isViewingThread(live.threadId, live.userId)) return;
+  if (live.liveKind || (state.contextOpen && state.studioTab === "deck")) {
+    setCanvasLiveState({
+      active: true,
+      kind: live.liveKind || "pptx",
+      label: live.statusText,
+      prompt: live.message,
+      steps: live.liveSteps,
+      targetPage: live.targetPage
+    });
+  }
+}
+
+function recordLiveStep(live, label, { updateStatus = false } = {}) {
+  if (typeof label !== "string" || !label) return;
+  const isNewStep = live.steps[live.steps.length - 1] !== label;
+  if (isNewStep) live.steps.push(label);
+  if (live.liveSteps[live.liveSteps.length - 1] !== label) live.liveSteps.push(label);
+  if (updateStatus) live.statusText = label;
+  if (!isViewingThread(live.threadId, live.userId)) return;
+  const node = findLiveProgress(live.threadId);
+  if (node) {
+    if (isNewStep) appendProgressStep(node, label);
+    if (updateStatus) {
+      const note = node.querySelector(".running-note");
+      if (note) note.textContent = label;
+    }
+  }
+  syncLiveCanvas(live);
+}
+
+function setLiveStatus(live, text, { removeCancel = false, canvasLabel = "" } = {}) {
+  if (typeof text === "string" && text) live.statusText = text;
+  if (canvasLabel && live.liveSteps[live.liveSteps.length - 1] !== canvasLabel) {
+    live.liveSteps.push(canvasLabel);
+  }
+  if (!isViewingThread(live.threadId, live.userId)) return;
+  const node = findLiveProgress(live.threadId);
+  if (node) {
+    const note = node.querySelector(".running-note");
+    if (note && text) note.textContent = text;
+    if (removeCancel) node.querySelector("[data-act=chat-cancel]")?.remove();
+  }
+  if (canvasLabel) syncLiveCanvas(live);
+}
+
+function ensureConversationListed(created, workspace) {
+  if (!created?.id) return;
+  if (!sessionCache.has(created.id)) {
+    sessionCache.set(created.id, { ...created, turns: created.turns || [] });
+  }
+  const list = Array.isArray(state.conversations) ? state.conversations : [];
+  if (!list.some((item) => item.id === created.id)) {
+    state.conversations = [created, ...list];
+    if (workspace && state.chatWorkspace === workspace) workspace.conversations = state.conversations;
+  }
+  emitConversationsUpdated();
+}
+
+export function syncActiveChatView({ skipRevalidate = false } = {}) {
+  const workspace = state.chatWorkspace;
+  if (!workspace || state.route[0] !== "chat") return;
+  if (!skipRevalidate) workspace._revalidate?.();
+  const threadId = workspace.session?.id || (state.route[1] && !["task", "project"].includes(state.route[1]) ? state.route[1] : "");
+  const live = activeTurnFor(threadId);
+  const form = chatForm();
+  if (live) {
+    if (form) {
+      form.dataset.busy = "1";
+      setComposerLocked(form, true, workspace);
+      if (live.kind === "image") {
+        const imgBtn = form.querySelector("[data-act=chat-generate-image]");
+        if (imgBtn) {
+          imgBtn.disabled = true;
+          imgBtn.textContent = "正在生成图片…";
+        }
+      }
+    }
+    syncLiveCanvas(live);
+    scrollToLatest();
+  } else if (form && !form.dataset.busy) {
     syncChatSubmit(form, workspace);
   }
 }
 
 export async function cancelActiveChat() {
-  if (typeof activeTurnCancel !== "function") return;
-  const cancel = activeTurnCancel;
-  activeTurnCancel = null;
-  const stopBtn = document.querySelector("[data-act=chat-cancel]");
+  const threadId = state.chatWorkspace?.session?.id ||
+    (state.route[0] === "chat" && state.route[1] && !["task", "project"].includes(state.route[1]) ? state.route[1] : "");
+  const live = activeTurnFor(threadId);
+  if (!live || typeof live.cancel !== "function" || live.cancelling) return;
+  live.cancelling = true;
+  const cancel = live.cancel;
+  const node = findLiveProgress(live.threadId);
+  const stopBtn = node?.querySelector("[data-act=chat-cancel]") || document.querySelector("[data-act=chat-cancel]");
   if (stopBtn) {
     stopBtn.disabled = true;
     stopBtn.textContent = "正在停止…";
   }
   await cancel();
+}
+
+export async function abortOrphanTurn(runId, kind = "turn", triggerButton = null) {
+  const workspace = state.chatWorkspace;
+  const threadId = workspace?.session?.id;
+  if (!workspace || !threadId || !runId) return;
+  if (triggerButton?.isConnected) {
+    triggerButton.disabled = true;
+    triggerButton.textContent = "正在结束…";
+  }
+  const path = kind === "image"
+    ? `/conversations/${encodeURIComponent(threadId)}/images/${encodeURIComponent(runId)}/fail`
+    : `/conversations/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(runId)}/fail`;
+  try {
+    await post(path, { message: "已手动结束未完成的任务，可重新发送" });
+  } catch (error) {
+    if (error.status !== 409 && error.status !== 404) {
+      if (triggerButton?.isConnected) {
+        triggerButton.disabled = false;
+        triggerButton.innerHTML = `${icon("stop")}结束并解锁`;
+      }
+      throw error;
+    }
+  }
+  sessionCache.delete(threadId);
+  if (isViewingThread(threadId, state.me?.id)) {
+    await refreshConversationInPlace(state.chatWorkspace, threadId);
+    toastMessage("已解除锁定，可继续发送消息", "success");
+  }
 }
 
 function appendProgressStep(progress, label) {
@@ -1169,21 +1894,21 @@ export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result
   }
 }
 
-async function executeDesktopTurn(workspace, threadId, requestId, payload, progress, allowImageTool, onLiveStep = () => {}) {
+async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = false, allowPptImages = true } = {}) {
   const desktop = window.officeDesktop;
   if (typeof desktop?.runAgent !== "function") throw new Error("请在桌面客户端中使用 AI 办理");
   const model = workspace.selectedModel;
   if (!selectedModelAvailable(workspace)) throw new Error(workspace.models?.length ? "请先选择可用模型" : "暂无可用模型，请联系管理员开通。");
 
-  const base = "/conversations/" + encodeURIComponent(threadId) + "/turns";
+  const base = "/conversations/" + encodeURIComponent(live.threadId) + "/turns";
   let prepared;
-  let phase = "prepare";
   let cancelled = false;
   const prepareAbort = new AbortController();
-  activeTurnCancel = async () => {
+  live.phase = "prepare";
+  live.cancel = async () => {
     cancelled = true;
-    if (phase === "prepare") prepareAbort.abort();
-    else if (phase === "agent" && typeof desktop.cancelAgent === "function") {
+    if (live.phase === "prepare") prepareAbort.abort();
+    else if (live.phase === "agent" && typeof desktop.cancelAgent === "function") {
       try { await desktop.cancelAgent(); } catch {}
     }
   };
@@ -1191,31 +1916,25 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
     prepared = await api(base + "/prepare", { method: "POST", body: { id: requestId, ...payload }, signal: prepareAbort.signal });
     if (cancelled) throw new Error("已停止生成");
     if (!prepared?.run_id) throw new Error("服务端未返回本轮运行编号");
+    live.runId = prepared.run_id;
     for (const step of prepared.steps || []) {
-      appendProgressStep(progress, step);
-      onLiveStep(step);
+      recordLiveStep(live, step);
     }
-    const note = progress?.querySelector(".running-note");
-    if (note) note.textContent = "正在调用模型…";
-    onLiveStep("正在调用模型…");
-    phase = "agent";
+    setLiveStatus(live, "正在调用模型…", { canvasLabel: "正在调用模型…" });
+    live.phase = "agent";
+    const usePptImages = Boolean(prepared.wants_pptx) && allowPptImages === true;
+    const enableImageTool = Boolean(workspace.image_models?.length) && (usePptImages || allowImageTool === true);
     const job = {
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
-      ...(allowImageTool === true && workspace.image_models?.length && model !== PIPELINE_MODEL ? { image_tool: true } : {})
+      ...(enableImageTool ? { image_tool: true, max_images: usePptImages ? 3 : 2 } : {})
     };
     return await runDesktopAgent(job, (label) => {
       if (typeof label !== "string" || !label) return;
-      appendProgressStep(progress, label);
-      onLiveStep(label);
-      if (progress?.isConnected) progress.querySelector(".running-note").textContent = label;
+      recordLiveStep(live, label, { updateStatus: true });
     }, async (result) => {
       const images = Array.isArray(result.images) ? result.images : [];
       let imageSaveFailures = 0;
-      if (progress?.isConnected) {
-        progress.querySelector(".running-note").textContent = "正在保存结果…";
-        progress.querySelector("[data-act=chat-cancel]")?.remove();
-      }
-      onLiveStep("正在保存并同步画布…");
+      setLiveStatus(live, "正在保存结果…", { removeCancel: true, canvasLabel: "正在保存并同步画布…" });
       // 图片已在 sub2api 计费：即使用户已点停止，也先把它们存进本轮记录，避免已付费的图片丢失。
       for (const image of images) {
         try {
@@ -1228,7 +1947,7 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
         const saved = images.length - imageSaveFailures;
         throw new Error(images.length ? `已停止生成（本轮已生成并计费 ${images.length} 张图片，${saved} 张已保存在本轮记录中${imageSaveFailures ? `，${imageSaveFailures} 张保存失败` : ""}）` : "已停止生成");
       }
-      phase = "complete";
+      live.phase = "complete";
       const completed = await post(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
         text: result.text,
         usage: {
@@ -1250,23 +1969,14 @@ async function executeDesktopTurn(workspace, threadId, requestId, payload, progr
       try {
         await post(base + "/" + encodeURIComponent(prepared.run_id) + "/fail", { message: error.message || "桌面执行失败" });
       } catch (failError) {
-        if (phase === "complete" && failError.status === 409 && (!error.status || error.status >= 500)) {
+        if (live.phase === "complete" && failError.status === 409 && (!error.status || error.status >= 500)) {
           error.message = "无法确认本轮是否已保存，请刷新会话查看最新结果。";
         } else if (failError.status !== 409) error.message += `（失败状态同步未成功：${failError.message}）`;
       }
     }
     throw error;
   } finally {
-    activeTurnCancel = null;
-  }
-}
-
-function setImageProgress(node, value, error = false) {
-  if (!node?.isConnected) return;
-  const note = node.querySelector("[data-image-progress]");
-  if (note) {
-    note.textContent = value;
-    note.classList.toggle("error", error);
+    live.cancel = null;
   }
 }
 
@@ -1288,16 +1998,18 @@ async function refreshConversationInPlace(workspace, threadId, { selectId = "", 
     api("/conversations/" + encodeURIComponent(threadId)),
     api("/conversations").catch(() => null)
   ]);
-  if (state.chatWorkspace !== workspace) return;
-  workspace.session = freshSession;
-  workspace.draftKey = "chat/" + threadId;
+  sessionCache.set(threadId, freshSession);
   if (Array.isArray(conversations)) {
-    workspace.conversations = conversations;
     state.conversations = conversations;
-    window.dispatchEvent(new CustomEvent("qo:conversations-updated"));
+    emitConversationsUpdated();
   }
+  const currentWorkspace = state.chatWorkspace;
+  if (!currentWorkspace || (currentWorkspace !== workspace && currentWorkspace.session?.id !== threadId)) return;
+  currentWorkspace.session = freshSession;
+  currentWorkspace.draftKey = "chat/" + threadId;
+  if (Array.isArray(conversations)) currentWorkspace.conversations = conversations;
   const turnsEl = document.querySelector("[data-chat-turns]");
-  if (turnsEl) turnsEl.innerHTML = historyView(workspace);
+  if (turnsEl) turnsEl.innerHTML = historyView(currentWorkspace);
   const titleWrap = document.querySelector("[data-thread-title-wrap]");
   if (titleWrap && freshSession?.title) {
     titleWrap.classList.remove("muted");
@@ -1313,16 +2025,16 @@ async function refreshConversationInPlace(workspace, threadId, { selectId = "", 
     state.studioTab = "deck";
     state._lastStudioKey = "chat/" + threadId;
     syncStudioDom();
-    await refreshCanvasLive(workspace, { selectId: selectId || artifacts[0]?.id || "", preferredPage, flash: true });
+    await refreshCanvasLive(currentWorkspace, { selectId: selectId || artifacts[0]?.id || "", preferredPage, flash: true });
   } else {
     setCanvasLiveState({ active: false });
     if (state.contextOpen && state.studioTab === "deck") {
-      await refreshCanvasLive(workspace, { selectId: artifacts[0]?.id || "", preferredPage, flash: false });
+      await refreshCanvasLive(currentWorkspace, { selectId: artifacts[0]?.id || "", preferredPage, flash: false });
     }
   }
 }
 
-export async function generateImageFromComposer(button, rerender) {
+export async function generateImageFromComposer(triggerButton, rerender) {
   const workspace = state.chatWorkspace;
   const form = chatForm();
   if (!workspace || !form) throw new Error("当前会话不可用");
@@ -1337,43 +2049,51 @@ export async function generateImageFromComposer(button, rerender) {
   const quality = form.elements.image_quality.value;
   const owner = state.me?.id;
   const threadId = workspace.session?.id || draftFor(workspace).newId || uuid();
+  if (activeTurnFor(threadId)) throw new Error("当前会话有一轮任务正在执行");
+
+  const live = {
+    threadId,
+    runId: null,
+    userId: owner,
+    kind: "image",
+    message: prompt,
+    selection: null,
+    steps: [],
+    statusText: "正在准备生图请求…",
+    liveKind: "image",
+    liveSteps: ["正在准备生图请求"],
+    targetPage: null,
+    canCancel: false,
+    cancelling: false,
+    phase: "prepare",
+    cancel: null
+  };
+  activeTurns.set(threadId, live);
+  emitConversationsUpdated();
+
   leaveEmptyState();
   switchStudioTab("deck");
-  setCanvasLiveState({ active: true, kind: "image", label: "正在构图并绘制图片…", prompt, steps: ["正在准备生图请求"] });
-  const turns = document.querySelector("[data-chat-turns]");
-  const pending = document.createElement("section");
-  pending.className = "conversation-turn pending-turn";
-  const request = document.createElement("div");
-  request.className = "request-entry";
-  const requestText = document.createElement("p");
-  requestText.textContent = prompt;
-  request.append(requestText);
-  const response = document.createElement("div");
-  response.className = "response-entry";
-  const note = document.createElement("p");
-  note.className = "running-note";
-  note.dataset.imageProgress = "";
-  note.setAttribute("role", "status");
-  note.textContent = "正在生成图片…";
-  response.append(note);
-  pending.append(request, response);
-  turns?.append(pending);
-  scrollToLatest();
+  setCanvasLiveState({ active: true, kind: "image", label: "正在构图并绘制图片…", prompt, steps: live.liveSteps });
+  startProgress(form, live);
   form.dataset.busy = "1";
-  button.disabled = true;
-  const originalLabel = button.textContent;
-  button.textContent = "正在生成图片…";
+  setComposerLocked(form, true, workspace);
+  const originalLabel = triggerButton.textContent;
+  triggerButton.disabled = true;
+  triggerButton.textContent = "正在生成图片…";
+
   let prepared;
   let generated;
   let saved = false;
-  let phase = "prepare";
   try {
     if (!workspace.session) {
-      workspace.session = await post("/conversations", {
+      const created = await post("/conversations", {
         id: threadId, assignment_id: workspace.task?.id || null,
         project_id: workspace.project?.id || null
       });
-      if (state.chatWorkspace === workspace) {
+      workspace.session = created;
+      ensureConversationListed(created, workspace);
+      if (state.chatWorkspace === workspace && state.me?.id === owner) {
+        workspace.draftKey = "chat/" + threadId;
         history.replaceState(null, "", "#chat/" + encodeURIComponent(threadId));
         state.route = ["chat", threadId];
       }
@@ -1381,43 +2101,75 @@ export async function generateImageFromComposer(button, rerender) {
     const base = "/conversations/" + encodeURIComponent(threadId) + "/images";
     prepared = await post(base + "/prepare", { prompt, model, size, quality });
     if (!prepared?.run_id) throw new Error("服务端未返回生图运行编号");
-    phase = "generate";
-    setImageProgress(pending, "正在生成图片…");
-    setCanvasLiveState({ active: true, kind: "image", label: "正在渲染高分辨率画面…", prompt, steps: ["已提交生图任务", "正在渲染画面"] });
+    live.runId = prepared.run_id;
+    live.phase = "generate";
+    setLiveStatus(live, "正在生成图片…", { canvasLabel: "正在渲染高分辨率画面…" });
     generated = await window.officeDesktop.generateImage({ prompt, model, size, quality });
-    phase = "complete";
-    setImageProgress(pending, "正在保存图片…");
-    setCanvasLiveState({ active: true, kind: "image", label: "正在保存并同步到画布…", prompt, steps: ["已提交生图任务", "画面渲染完成", "正在写入画布"] });
+    live.phase = "complete";
+    setLiveStatus(live, "正在保存图片…", { canvasLabel: "正在保存并同步到画布…" });
     const completed = await post(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
       png_base64: generated.png_base64, width: generated.width, height: generated.height,
       model: generated.model, size: generated.size, quality: generated.quality, usage: generated.usage || {}
     });
     saved = true;
-    form.elements.message.value = "";
-    syncComposerGrow(form.elements.message);
-    if (state.chatWorkspace === workspace && state.me?.id === owner) {
+    activeTurns.delete(threadId);
+    sessionCache.delete(threadId);
+    if (isViewingThread(threadId, owner)) {
+      const currentForm = chatForm();
+      if (currentForm?.elements?.message) {
+        currentForm.elements.message.value = "";
+        syncComposerGrow(currentForm.elements.message);
+      }
       const latestImgId = completed?.images?.[0]?.file?.id || "";
-      await refreshConversationInPlace(workspace, threadId, { selectId: latestImgId, openCanvas: true });
+      await refreshConversationInPlace(state.chatWorkspace, threadId, { selectId: latestImgId, openCanvas: true });
+    } else if (state.me?.id === owner) {
+      emitConversationsUpdated();
+      void api("/conversations/" + encodeURIComponent(threadId)).then((fresh) => { sessionCache.set(threadId, fresh); }).catch(() => {});
+      toastMessage("后台图片已生成，可切回原会话查看", "success");
     }
+    void refreshDesktopUsage().catch(() => {});
     return completed;
   } catch (error) {
-    setCanvasLiveState({ active: false });
+    activeTurns.delete(threadId);
+    sessionCache.delete(threadId);
+    emitConversationsUpdated();
+    const message = prepared?.run_id && !saved && generated && live.phase === "complete"
+      ? `图片已生成并计费，但保存失败：${error.message}`
+      : (error.message || "生图失败");
     if (prepared?.run_id && !saved) {
-      const message = generated && phase === "complete" ? `图片已生成并计费，但保存失败：${error.message}` : error.message || "生图失败";
       try {
         await post("/conversations/" + encodeURIComponent(threadId) + "/images/" + encodeURIComponent(prepared.run_id) + "/fail",
           { message: message.slice(0, 300) });
       } catch {}
-      setImageProgress(pending, message, true);
-    } else {
-      setImageProgress(pending, error.message || "生图失败", true);
     }
-    throw error;
+    if (isViewingThread(threadId, owner)) {
+      setCanvasLiveState({ active: false });
+      const node = findLiveProgress(threadId);
+      if (node) {
+        node.querySelector(".running-pulse")?.remove();
+        node.querySelector(".response-mark")?.classList.remove("is-working");
+        const note = node.querySelector(".running-note");
+        if (note) { note.textContent = message; note.classList.add("error"); }
+      }
+      throw error;
+    } else if (state.me?.id === owner) {
+      toastMessage(`后台生图失败：${message}`, "error");
+    }
   } finally {
+    activeTurns.delete(threadId);
+    emitConversationsUpdated();
     delete form.dataset.busy;
-    if (button.isConnected) {
-      button.disabled = false;
-      button.textContent = originalLabel;
+    if (form.isConnected) setComposerLocked(form, false, state.chatWorkspace);
+    if (isViewingThread(threadId, owner)) {
+      const currentForm = chatForm();
+      if (currentForm && currentForm !== form) {
+        delete currentForm.dataset.busy;
+        setComposerLocked(currentForm, false, state.chatWorkspace);
+      }
+    }
+    if (triggerButton.isConnected) {
+      triggerButton.disabled = false;
+      triggerButton.textContent = originalLabel;
     }
   }
 }
@@ -1442,51 +2194,73 @@ export async function sendMessage(form, rerender) {
   }
   const requestId = draft.pending?.signature === signature ? draft.pending.id : uuid();
   const threadId = workspace.session?.id || draft.newId || uuid();
+  if (activeTurnFor(threadId)) {
+    throw new Error("当前会话有一轮任务正在执行");
+  }
+  const other = otherActiveDesktopTurn(threadId);
+  if (other) {
+    const otherTitle = state.conversations?.find((c) => c.id === other.threadId)?.title;
+    throw new Error(otherTitle
+      ? `会话「${otherTitle}」正在本机执行，请等待完成或切换回去停止后再发送`
+      : "另一会话正在本机执行任务，请等待完成或停止后再发送");
+  }
+
   writeDraft(workspace, form, { newId: threadId, pending: { id: requestId, signature } });
-  const inView = () => form.isConnected && state.me?.id === user;
-  let progress;
   const liveKind = inferLiveCanvasKind(message, payload.mode, draft.selection, workspace);
-  const liveSteps = [];
-  const pushLiveStep = (label) => {
-    if (!label) return;
-    if (liveSteps[liveSteps.length - 1] !== label) liveSteps.push(label);
-    if (liveKind || (state.contextOpen && state.studioTab === "deck")) {
-      setCanvasLiveState({
-        active: true,
-        kind: liveKind || "pptx",
-        label,
-        prompt: message,
-        steps: liveSteps,
-        targetPage: draft.selection?.slide || null
-      });
-    }
+  const canCancel = !clientExecutionRequired() || typeof window.officeDesktop?.cancelAgent === "function";
+  const live = {
+    threadId,
+    runId: null,
+    userId: user,
+    kind: "turn",
+    message,
+    selection: draft.selection || null,
+    steps: [],
+    statusText: "正在思考…",
+    liveKind,
+    liveSteps: [],
+    targetPage: draft.selection?.slide || null,
+    canCancel,
+    cancelling: false,
+    phase: "prepare",
+    cancel: null
   };
+  activeTurns.set(threadId, live);
+  emitConversationsUpdated();
+
+  const initialInView = () => form.isConnected && state.me?.id === user;
+  const allowAiImages = form.elements.allow_ai_images?.checked === true;
+  const allowPptImages = form.elements.allow_ppt_images ? form.elements.allow_ppt_images.checked === true : pptImageAutoPreference();
   setComposerLocked(form, true, workspace);
   try {
     if (!workspace.session) {
-      workspace.session = await post("/conversations", {
+      const created = await post("/conversations", {
         id: threadId, assignment_id: workspace.task?.id || null,
         project_id: workspace.project?.id || null
       });
-      if (inView()) {
+      workspace.session = created;
+      ensureConversationListed(created, workspace);
+      if (initialInView()) {
+        workspace.draftKey = "chat/" + threadId;
         history.replaceState(null, "", "#chat/" + encodeURIComponent(threadId));
         state.route = ["chat", threadId];
       }
     }
-    if (inView()) {
-      progress = startProgress(form, message);
+    if (isViewingThread(threadId, user)) {
+      startProgress(form.isConnected ? form : chatForm(), live);
       if (liveKind) {
         switchStudioTab("deck");
-        pushLiveStep(draft.selection?.slide ? `正在准备修改第 ${draft.selection.slide} 页…` : "正在理解工作要求…");
+        setLiveStatus(live, live.statusText, {
+          canvasLabel: draft.selection?.slide ? `正在准备修改第 ${draft.selection.slide} 页…` : "正在理解工作要求…"
+        });
       }
     }
     let completed;
     if (clientExecutionRequired()) {
-      completed = await executeDesktopTurn(workspace, threadId, requestId, payload, progress,
-        form.elements.allow_ai_images?.checked === true, pushLiveStep);
+      completed = await executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool: allowAiImages, allowPptImages });
     } else {
       const controller = new AbortController();
-      activeTurnCancel = async () => { controller.abort(); };
+      live.cancel = async () => { controller.abort(); };
       try {
         const response = await fetch("/api/v1/conversations/" + encodeURIComponent(threadId) + "/turns", {
           method: "POST", headers: { "Content-Type": "application/json" }, credentials: "same-origin",
@@ -1494,18 +2268,18 @@ export async function sendMessage(form, rerender) {
           body: JSON.stringify({ id: requestId, ...payload })
         });
         completed = await readEvents(response, (label) => {
-          appendProgressStep(progress, label);
-          pushLiveStep(label);
-          if (progress?.isConnected) progress.querySelector(".running-note").textContent = label;
+          recordLiveStep(live, label, { updateStatus: true });
         });
       } catch (error) {
         if (error?.name === "AbortError") throw Object.assign(new Error("已停止生成"), { retryAsNew: true });
         throw error;
       } finally {
-        activeTurnCancel = null;
+        live.cancel = null;
       }
     }
     if (state.me?.id !== user) return;
+    activeTurns.delete(threadId);
+    sessionCache.delete(threadId);
     writeDraft(workspace, null, { message: "", newId: null, pending: null, selection: null });
     const latestFileId = completed.file && ["pptx", "docx"].includes(completed.file.extension)
       ? completed.file.id
@@ -1521,8 +2295,8 @@ export async function sendMessage(form, rerender) {
       files.add(completed.file.id);
       saveDraft(key, { ...submission, artifact_ids: [...files], key: uuid() });
     }
-    if (inView()) {
-      await refreshConversationInPlace(workspace, threadId, {
+    if (isViewingThread(threadId, user)) {
+      await refreshConversationInPlace(state.chatWorkspace, threadId, {
         selectId: latestFileId,
         preferredPage: targetPage,
         openCanvas: Boolean(latestFileId)
@@ -1537,26 +2311,64 @@ export async function sendMessage(form, rerender) {
         }
       }
       chatForm()?.elements.message.focus({ preventScroll: true });
+    } else {
+      emitConversationsUpdated();
+      void Promise.all([
+        api("/conversations/" + encodeURIComponent(threadId)).then((fresh) => { sessionCache.set(threadId, fresh); }),
+        api("/conversations").then((list) => {
+          if (state.me?.id === user && Array.isArray(list)) {
+            state.conversations = list;
+            emitConversationsUpdated();
+          }
+        })
+      ]).catch(() => {});
+      const title = state.conversations?.find((c) => c.id === threadId)?.title;
+      toastMessage(title ? `会话「${title}」已完成` : "后台会话已完成，可切回查看结果", "success");
     }
     void refreshDesktopUsage().catch(() => {});
   } catch (error) {
-    setCanvasLiveState({ active: false });
-    if (state.me?.id === user && inView()) {
-      progress?.querySelector("[data-act=chat-cancel]")?.remove();
-      progress?.querySelector(".running-pulse")?.remove();
-      progress?.querySelector(".response-mark")?.classList.remove("is-working");
-      const current = progress?.querySelector(".running-note");
-      if (current) { current.textContent = error.message; current.classList.add("error"); }
-      form.elements.message.value = message;
-      syncComposerGrow(form.elements.message);
+    activeTurns.delete(threadId);
+    sessionCache.delete(threadId);
+    emitConversationsUpdated();
+    if (state.me?.id === user) {
       const key = workspace.session?.id ? "chat/" + threadId : workspace.draftKey;
       const pending = error.retryAsNew ? null : { id: requestId, signature };
       saveDraft(key, { ...draft, message, mode: payload.mode, newId: threadId, pending });
       workspace.draftKey = key;
     }
-    throw error;
+    if (isViewingThread(threadId, user)) {
+      setCanvasLiveState({ active: false });
+      const node = findLiveProgress(threadId);
+      node?.querySelector("[data-act=chat-cancel]")?.remove();
+      node?.querySelector(".running-pulse")?.remove();
+      node?.querySelector(".response-mark")?.classList.remove("is-working");
+      const current = node?.querySelector(".running-note");
+      if (current) { current.textContent = error.message; current.classList.add("error"); }
+      const currentForm = chatForm();
+      if (currentForm?.elements?.message) {
+        currentForm.elements.message.value = message;
+        syncComposerGrow(currentForm.elements.message);
+      }
+      // 如果原 form 已脱离 DOM（用户中途切页后又切回），不再抛给旧 handleForm 避免重复或丢失反馈
+      if (form.isConnected) throw error;
+      if (!current) toastMessage(error.message || "本轮执行失败", "error");
+    } else if (state.me?.id === user) {
+      const stopped = String(error?.message || "").startsWith("已停止生成");
+      toastMessage(stopped ? "后台会话已停止" : `后台会话未完成：${error.message || "执行失败"}`, stopped ? "info" : "error");
+    }
   } finally {
-    activeTurnCancel = null;
-    setComposerLocked(form, false, workspace);
+    activeTurns.delete(threadId);
+    emitConversationsUpdated();
+    if (form.isConnected) {
+      delete form.dataset.busy;
+      setComposerLocked(form, false, state.chatWorkspace);
+    }
+    if (isViewingThread(threadId, user)) {
+      const currentForm = chatForm();
+      if (currentForm && currentForm !== form) {
+        delete currentForm.dataset.busy;
+        setComposerLocked(currentForm, false, state.chatWorkspace);
+      }
+    }
   }
 }

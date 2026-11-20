@@ -6,7 +6,8 @@ from fastapi import APIRouter
 from lxml import etree
 from pptx import Presentation
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL_TYPE
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pydantic import BaseModel, Field
 
 from .files import file_for
@@ -72,27 +73,77 @@ def shape_fill(shape):
     return None
 
 
+def shape_opacity(shape):
+    try:
+        alpha = shape._element.find(f".//{DRAW}solidFill/{DRAW}srgbClr/{DRAW}alpha")
+        if alpha is not None and alpha.get("val"):
+            return round(max(0.0, min(1.0, int(alpha.get("val")) / 100000.0)), 3)
+    except Exception:
+        pass
+    return 1.0
+
+
+def shape_border(shape):
+    try:
+        if hasattr(shape, "line") and shape.line.fill.type == MSO_FILL_TYPE.SOLID:
+            return color_value(shape.line.color, None)
+    except Exception:
+        pass
+    return None
+
+
+def shape_kind(shape):
+    if shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+        try:
+            if shape.auto_shape_type == MSO_SHAPE.ROUNDED_RECTANGLE:
+                return "round_rect"
+            if shape.auto_shape_type == MSO_SHAPE.OVAL:
+                return "ellipse"
+        except Exception:
+            pass
+    return "rect"
+
+
 def selected_layout(prs,page):
     slide=get_page(prs,page)
     scale=1000/(prs.slide_width or 1)
     objects=[]
-    image_budget=3*1024*1024
+    image_budget=6*1024*1024
     for shape in list(slide.shapes)[:180]:
         item={key:round(int(getattr(shape,key) or 0)*scale,2) for key in ("left","top","width","height")}
-        item.update(id=shape.shape_id, fill=shape_fill(shape))
+        fill = shape_fill(shape)
+        border = shape_border(shape)
+        opacity = shape_opacity(shape) if fill else 1.0
+        item.update(id=shape.shape_id, fill=fill, shape=shape_kind(shape))
+        if border:
+            item["border"] = border
+        if opacity < 0.999:
+            item["opacity"] = opacity
         if shape.shape_type==MSO_SHAPE_TYPE.PICTURE and image_budget>0:
             picture=shape.image
             if picture.content_type in {"image/png","image/jpeg","image/gif"} and len(picture.blob)<=image_budget:
                 item["image"]="data:"+picture.content_type+";base64,"+base64.b64encode(picture.blob).decode()
                 image_budget-=len(picture.blob)
         if shape.has_text_frame and shape.text.strip():
+            first_p=next((p for p in shape.text_frame.paragraphs if p.text.strip()), None)
             first=next((run for p in shape.text_frame.paragraphs for run in p.runs if run.text.strip()),None)
             font=first.font if first else None
             pt=font.size if font and font.size else 280000
+            align = "left"
+            if first_p and first_p.alignment == PP_ALIGN.CENTER:
+                align = "center"
+            elif first_p and first_p.alignment == PP_ALIGN.RIGHT:
+                align = "right"
+            valign = "top"
+            if shape.text_frame.vertical_anchor == MSO_ANCHOR.MIDDLE:
+                valign = "middle"
+            elif shape.text_frame.vertical_anchor == MSO_ANCHOR.BOTTOM:
+                valign = "bottom"
             item.update(text=shape.text[:900], size=round(int(pt)*scale,2), bold=bool(font and font.bold),
                         color=color_value(font.color,"#182231") if font else "#182231",
+                        align=align, valign=valign,
                         editable=editable_text(shape) is not None)
-        if item.get("text") or item.get("image") or item["fill"]:
+        if item.get("text") or item.get("image") or item["fill"] or item.get("border"):
             objects.append(item)
     bg=slide.background.fill
     color=color_value(bg.fore_color,"#ffffff") if bg.type==MSO_FILL_TYPE.SOLID else "#ffffff"

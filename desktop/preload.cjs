@@ -1,6 +1,13 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+const versionArg = process.argv.find((arg) => arg.startsWith("--qo-version="));
+const appVersion = versionArg ? versionArg.slice("--qo-version=".length).trim() : "";
+const hasTitleBarOverlay = process.argv.includes("--qo-titlebar-overlay=1");
+
 contextBridge.exposeInMainWorld("officeDesktop", {
+  version: appVersion,
+  hasTitleBarOverlay,
+  setTheme: (mode) => ipcRenderer.invoke("qo:set-theme", mode),
   signIn: () => ipcRenderer.invoke("qo:sign-in"),
   models: () => ipcRenderer.invoke("qo:models"),
   usage: () => ipcRenderer.invoke("qo:usage"),
@@ -18,6 +25,12 @@ contextBridge.exposeInMainWorld("officeDesktop", {
 
 window.addEventListener("DOMContentLoaded", async () => {
   if (window.location.protocol !== "file:") return;
+  const syncConnectTheme = () => {
+    const dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches === true;
+    void ipcRenderer.invoke("qo:set-theme", dark ? "dark" : "light").catch(() => {});
+  };
+  syncConnectTheme();
+  window.matchMedia?.("(prefers-color-scheme: dark)")?.addEventListener?.("change", syncConnectTheme);
   const form = document.getElementById("connection");
   if (!form) return;
   const url = document.getElementById("server");

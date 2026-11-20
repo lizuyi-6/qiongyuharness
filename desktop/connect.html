@@ -46,8 +46,11 @@ body{
   font:13.5px/1.6 "PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Segoe UI",system-ui,sans-serif;
   -webkit-font-smoothing:antialiased;
 }
+.win-drag{position:fixed;inset:0 0 auto 0;height:44px;-webkit-app-region:drag;z-index:1}
 main{
   position:relative;
+  z-index:2;
+  -webkit-app-region:no-drag;
   width:min(420px,100%);
   padding:32px 30px 28px;
   background:var(--page);
@@ -107,7 +110,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .notice.error{color:var(--danger)}
 </style>
 </head>
-<body><main>
+<body><div class="win-drag" aria-hidden="true"></div><main>
 <div class="brand">
   <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="butt" stroke-linejoin="miter"><path class="logo-outer" d="M13 18H6V6h12v7" stroke-width="2"/><path class="logo-inner" d="M9.6 13.4V9.6h3.8" stroke-width="1.45"/><path class="logo-axis" d="M12.6 12.6L18.8 18.8" stroke-width="2"/></svg></span>
   <span class="brand-name">穹驭办公</span>

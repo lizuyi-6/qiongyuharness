@@ -71,6 +71,14 @@
 .session-link.active { background: var(--bg-selected); color: var(--ink); font-weight: 560; }
 .session-link.active svg { color: var(--ink); }
 .session-link.active::before { transform: scaleY(1); opacity: 1; }
+.session-running-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--hairline);
+  flex: none;
+  animation: pulse-dot 1.1s ease-in-out infinite;
+}
 
 /* =========================================================
    AI 原生双屏中台：左对话 · 右实时创作画布（永远同屏并排）
@@ -577,6 +585,7 @@
 .running-note { color: var(--ink-2); font-size: 12.5px; }
 .running-note.error { color: var(--danger); }
 .running-bar:has(.running-note.error)::after { display: none; }
+.orphan-running-bar::after { display: none; }
 .stop-button {
   margin-left: auto;
   min-height: 26px;
@@ -877,17 +886,17 @@
 .slash-item:hover, .slash-item.active { background: var(--bg-selected); color: var(--ink); }
 .slash-item:hover svg, .slash-item.active svg { color: var(--ink); }
 
-/* 极简单行底栏 */
+/* 极简单行底栏（原生定制图标 + 浮层选择器） */
 .composer-actions {
   display: flex;
   flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
-  gap: 6px 8px;
-  padding-top: 7px;
+  gap: 6px 10px;
+  padding-top: 8px;
   border-top: 1px solid var(--line);
 }
-.composer-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; }
+.composer-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
 .composer-tool {
   position: relative;
   display: inline-flex;
@@ -897,20 +906,23 @@
   height: 30px;
   padding: 0;
   border: 1px solid transparent;
-  border-radius: 50%;
+  border-radius: 9px;
   background: transparent;
   color: var(--ink-2);
-  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), transform var(--t-fast);
 }
-.composer-tool svg { width: 15px; height: 15px; }
+.composer-tool svg { width: 15px; height: 15px; flex: none; }
 .composer-tool:hover:not(:disabled) { background: var(--bg-hover); color: var(--ink); }
+.composer-tool:active:not(:disabled) { transform: scale(0.94); }
 .composer-tool.active { background: var(--bg-selected); color: var(--ink); border-color: var(--line-strong); }
 .composer-tool.has-value { color: var(--ink); }
+.composer-tool:disabled { opacity: 0.45; cursor: not-allowed; }
 .composer-tool.dot-active::after {
   content: "";
   position: absolute;
-  top: 4px;
-  right: 4px;
+  top: 5px;
+  right: 5px;
   width: 5px;
   height: 5px;
   border-radius: 50%;
@@ -933,50 +945,179 @@
   font-variant-numeric: tabular-nums;
 }
 
-.composer-sep { width: 1px; height: 14px; margin: 0 3px; background: var(--line); }
+.composer-sep { width: 1px; height: 15px; margin: 0 5px; background: var(--line); }
 
-.composer-select {
-  height: 28px;
+/* 原生定制浮层选择器（彻底替换系统原生 select） */
+.composer-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.composer-picker-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
   padding: 0 9px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-pill);
-  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-subtle);
   color: var(--ink-2);
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 520;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
-  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-.composer-select:hover:not(:disabled),
-.composer-select:focus {
-  background: var(--bg-subtle);
+.composer-picker-trigger:hover:not(:disabled),
+.composer-picker.is-open .composer-picker-trigger {
+  background: var(--bg-hover);
   border-color: var(--line-strong);
   color: var(--ink);
-  outline: none;
 }
-.composer-select.model-select { max-width: min(176px, 38vw); }
+.composer-picker-trigger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.composer-picker-trigger .picker-glyph {
+  display: inline-flex;
+  align-items: center;
+  color: var(--ink-3);
+}
+.composer-picker-trigger .picker-glyph svg { width: 13px; height: 13px; }
+.composer-picker-trigger:hover:not(:disabled) .picker-glyph,
+.composer-picker.is-open .composer-picker-trigger .picker-glyph,
+.model-picker-trigger.is-pipeline .picker-glyph { color: var(--ink); }
 
-.composer-right { display: flex; align-items: center; gap: 6px; }
-.composer-enter-hint {
-  color: var(--ink-placeholder);
-  font-size: 11px;
-  user-select: none;
-  padding-right: 2px;
+.composer-picker-trigger .picker-label {
+  max-width: min(156px, 34vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+.composer-picker-trigger .picker-caret {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 1px;
+  color: var(--ink-3);
+  transition: transform var(--t-fast), color var(--t-fast);
+}
+.composer-picker-trigger .picker-caret svg { width: 12px; height: 12px; }
+.composer-picker.is-open .composer-picker-trigger .picker-caret {
+  transform: rotate(180deg);
+  color: var(--ink);
+}
+
+.composer-picker-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  min-width: 212px;
+  max-width: min(290px, 76vw);
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--bg-page);
+  box-shadow: var(--shadow-float);
+  display: grid;
+  gap: 2px;
+  animation: popover-in 150ms var(--ease-panel) both;
+}
+.composer-picker-menu.align-right { left: auto; right: 0; }
+.composer-picker-menu[hidden] { display: none; }
+
+.composer-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  text-align: left;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.composer-picker-item:hover:not(:disabled) { background: var(--bg-hover); color: var(--ink); }
+.composer-picker-item.active { background: var(--bg-selected); color: var(--ink); }
+.composer-picker-item:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.picker-item-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--ink-3);
+}
+.picker-item-glyph svg { width: 14px; height: 14px; }
+.composer-picker-item:hover:not(:disabled) .picker-item-glyph,
+.composer-picker-item.active .picker-item-glyph { color: var(--ink); }
+
+.picker-item-copy {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+.picker-item-copy strong {
+  font-size: 12.5px;
+  font-weight: 580;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.picker-item-copy small {
+  font-size: 11px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-item-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--ink);
+}
+.picker-item-check svg { width: 13px; height: 13px; }
+
+.composer-picker-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--line);
+}
+
+.composer-right { display: flex; align-items: center; gap: 7px; }
 
 .composer-send {
   display: inline-grid;
   place-items: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   border: 1px solid var(--line-strong);
   border-radius: 50%;
   background: var(--bg-subtle);
   color: var(--ink-3);
+  cursor: pointer;
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast), transform var(--t-fast);
 }
-.composer-send svg { width: 15px; height: 15px; }
+.composer-send svg { width: 14px; height: 14px; }
 .composer-send.ready:not(:disabled) {
   border-color: var(--accent);
   background: var(--accent);
@@ -988,6 +1129,7 @@
   transform: translateY(-1px);
 }
 .composer-send:active:not(:disabled) { transform: scale(0.93); }
+.composer-send:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* 生图手风琴抽屉 */
 .image-drawer {
@@ -1010,14 +1152,22 @@
 .image-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .image-controls label { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-2); font-size: 12px; }
 .image-controls select {
-  max-width: 146px;
-  min-height: 28px;
-  padding: 2px 8px;
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 152px;
+  height: 28px;
+  padding: 0 24px 0 9px;
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-xs);
-  background: var(--bg-page);
+  border-radius: 8px;
+  background-color: var(--bg-subtle);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 7px center;
+  color: var(--ink);
   font-size: 12px;
+  cursor: pointer;
 }
+.image-controls select:hover { border-color: var(--hairline-muted); background-color: var(--bg-hover); }
 .image-auto-option { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12px; cursor: pointer; }
 .image-auto-option input { accent-color: var(--accent); }
 
@@ -1154,18 +1304,31 @@
 .deck-select,
 .deck-page-select,
 .deck-shape-select {
+  appearance: none;
+  -webkit-appearance: none;
   width: 100%;
   min-width: 0;
   height: 32px;
-  padding: 0 10px;
+  padding: 0 28px 0 11px;
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius);
-  background: var(--bg-page);
+  border-radius: 10px;
+  background-color: var(--bg-page);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
   color: var(--ink);
   font-size: 12.5px;
+  cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: border-color var(--t-fast), background-color var(--t-fast);
+}
+.deck-select:hover:not(:disabled),
+.deck-page-select:hover:not(:disabled),
+.deck-shape-select:hover:not(:disabled) {
+  border-color: var(--hairline-muted);
+  background-color: var(--bg-subtle);
 }
 .deck-select:focus,
 .deck-page-select:focus,

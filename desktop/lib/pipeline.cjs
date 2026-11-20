@@ -162,7 +162,7 @@ function runPipeline({
       return true;
     }
 
-    async function callValidatedStage({ role, model, system, prompt, withContext, parser }) {
+    async function callValidatedStage({ role, model, system, prompt, withContext, withImages = false, parser }) {
       let currentPrompt = prompt;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         ensureNotAborted();
@@ -171,7 +171,7 @@ function runPipeline({
         calls += 1;
         let result;
         try {
-          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, timeoutMs, signal });
+          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, withImages, timeoutMs, signal });
         } catch (error) {
           if (error?.code === "ABORTED" || signal?.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
           if (error?.quota_error) throw error;
@@ -225,6 +225,7 @@ function runPipeline({
         system: job.system,
         prompt: job.prompt,
         withContext: hasContext,
+        withImages: true,
         parser: parseDeliverable
       });
       if (!light.parsed) {
@@ -253,6 +254,7 @@ function runPipeline({
         system: executionSystem(revise),
         prompt: job.prompt,
         withContext: hasContext,
+        withImages: true,
         parser: parseDeliverable
       });
       if (result.parsed) finalText = result.text;

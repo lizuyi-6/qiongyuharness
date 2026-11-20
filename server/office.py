@@ -7,6 +7,8 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from zipfile import BadZipFile, ZipFile
 
+from typing import Any, Literal
+
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Inches as DocInches, Pt as DocPt, RGBColor as DocRGB
@@ -14,8 +16,9 @@ from lxml import etree
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .identity import fail
 from .store import audit, instant, uid
@@ -508,6 +511,351 @@ def powerpoint(plan):
     for i, part in enumerate(paginate_deck(plan), 2):
         deck_page(prs.slides.add_slide(blank), part, i)
     prs.core_properties.title = plan.title
+    prs.core_properties.author = "穹驭办公"
+    out = BytesIO()
+    prs.save(out)
+    return out.getvalue()
+
+
+HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
+SLIDE_W = 13.333
+SLIDE_H = 7.5
+
+
+class OverlaySpec(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    color: str = "#000000"
+    opacity: float = Field(default=0.45, ge=0.0, le=1.0)
+
+
+class DeckDesign(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    concept: str = Field(default="", max_length=300)
+    palette: dict[str, str] = Field(default_factory=dict)
+    font: str = Field(default="Microsoft YaHei", max_length=60)
+
+
+class SlideElement(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    type: Literal["rect", "round_rect", "ellipse", "line", "text", "image", "table"]
+    x: float = Field(default=0.0, ge=-1.0, le=14.0)
+    y: float = Field(default=0.0, ge=-1.0, le=8.5)
+    w: float = Field(default=1.0, gt=0.0, le=15.0)
+    h: float = Field(default=0.5, gt=0.0, le=9.0)
+    # 图形属性
+    fill: str | None = None
+    opacity: float | None = Field(default=None, ge=0.0, le=1.0)
+    border: str | None = None
+    border_width: float = Field(default=1.0, ge=0.0, le=12.0)
+    radius: float | None = Field(default=None, ge=0.0, le=0.5)
+    # 文本属性
+    text: str | None = Field(default=None, max_length=2000)
+    size: float = Field(default=16.0, ge=8.0, le=120.0)
+    bold: bool = False
+    italic: bool = False
+    color: str | None = None
+    font: str | None = Field(default=None, max_length=60)
+    align: Literal["left", "center", "right"] = "left"
+    valign: Literal["top", "middle", "bottom"] = "top"
+    line_spacing: float = Field(default=1.25, ge=0.9, le=2.4)
+    # 图片属性（引用本轮生图 1-based 序号）
+    image_index: int | None = Field(default=None, ge=1, le=12)
+    fit: Literal["cover", "contain"] = "cover"
+    # 表格属性
+    columns: list[str] | None = Field(default=None, max_length=8)
+    rows: list[list[str]] | None = Field(default=None, max_length=14)
+    header_fill: str | None = None
+    header_color: str | None = None
+    row_fill: str | None = None
+    alt_fill: str | None = None
+    text_color: str | None = None
+    border_color: str | None = None
+
+
+class FreeSlide(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(default="", max_length=100)
+    bg: str = "#FFFFFF"
+    bg_image: int | None = Field(default=None, ge=1, le=12)
+    bg_overlay: OverlaySpec | None = None
+    notes: str = Field(default="", max_length=2000)
+    elements: list[SlideElement] = Field(default_factory=list, max_length=120)
+
+
+class DeckSpec(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    title: str = Field(min_length=1, max_length=110)
+    subtitle: str = Field(default="", max_length=140)
+    design: DeckDesign = Field(default_factory=DeckDesign)
+    slides: list[FreeSlide] = Field(min_length=1, max_length=30)
+
+    def clean(self):
+        return DeckSpec(
+            title=clean_text(self.title, 110),
+            subtitle=clean_text(self.subtitle, 140, False),
+            design=self.design,
+            slides=self.slides,
+        )
+
+
+def parse_hex_color(value: Any, default: str | None = None) -> str | None:
+    if not isinstance(value, str):
+        return default
+    raw = value.strip()
+    match = HEX_COLOR_RE.fullmatch(raw)
+    if not match:
+        return default
+    digits = match.group(1).upper()
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    return digits
+
+
+def _apply_alpha(color_elem, opacity: float | None):
+    if opacity is None or opacity >= 0.999:
+        return
+    alpha_val = max(0, min(100000, int(round(opacity * 100000))))
+    for child in list(color_elem):
+        if child.tag == f"{DRAW}alpha":
+            color_elem.remove(child)
+    alpha = etree.Element(f"{DRAW}alpha")
+    alpha.set("val", str(alpha_val))
+    color_elem.append(alpha)
+
+
+def _set_shape_fill(shape, color_hex: str | None, opacity: float | None = None):
+    if not color_hex:
+        shape.fill.background()
+        return
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor.from_string(color_hex)
+    if opacity is not None and opacity < 0.999:
+        srgb = shape._element.find(f".//{DRAW}solidFill/{DRAW}srgbClr")
+        if srgb is not None:
+            _apply_alpha(srgb, opacity)
+
+
+def _set_shape_border(shape, border_hex: str | None, border_width: float = 1.0):
+    if not border_hex or border_width <= 0:
+        shape.line.fill.background()
+        return
+    shape.line.color.rgb = RGBColor.from_string(border_hex)
+    shape.line.width = Pt(border_width)
+
+
+def _png_dimensions(blob: bytes) -> tuple[int, int] | None:
+    if len(blob) >= 24 and blob[:8] == b"\x89PNG\r\n\x1a\n" and blob[12:16] == b"IHDR":
+        w, h = struct.unpack(">II", blob[16:24])
+        if w > 0 and h > 0:
+            return w, h
+    return None
+
+
+def _add_fitted_picture(slide, blob: bytes, x: float, y: float, w: float, h: float, fit: str = "cover"):
+    dims = _png_dimensions(blob)
+    if not dims:
+        return slide.shapes.add_picture(BytesIO(blob), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
+    iw, ih = dims
+    img_ratio = iw / ih
+    box_ratio = w / h
+    if fit == "contain":
+        if img_ratio > box_ratio:
+            draw_w = w
+            draw_h = w / img_ratio
+            draw_x = x
+            draw_y = y + (h - draw_h) / 2
+        else:
+            draw_h = h
+            draw_w = h * img_ratio
+            draw_x = x + (w - draw_w) / 2
+            draw_y = y
+        return slide.shapes.add_picture(BytesIO(blob), Inches(draw_x), Inches(draw_y),
+                                        width=Inches(draw_w), height=Inches(draw_h))
+    # cover：等比铺满目标框，裁去超出部分，不拉伸变形
+    pic = slide.shapes.add_picture(BytesIO(blob), Inches(x), Inches(y), width=Inches(w), height=Inches(h))
+    if img_ratio > box_ratio:
+        crop = max(0.0, (1.0 - box_ratio / img_ratio) / 2.0)
+        pic.crop_left = crop
+        pic.crop_right = crop
+    elif img_ratio < box_ratio:
+        crop = max(0.0, (1.0 - img_ratio / box_ratio) / 2.0)
+        pic.crop_top = crop
+        pic.crop_bottom = crop
+    return pic
+
+
+def _fit_free_text_size(text: str, width: float, height: float, target_size: float, line_spacing: float) -> float:
+    lines_raw = text.replace("\r", "").split("\n")
+    size = float(target_size)
+    min_size = max(9.0, min(11.0, size * 0.65))
+    while size > min_size:
+        per_line = max(1.0, width * 72.0 / size * 0.92)
+        total_lines = sum(max(1, math.ceil(text_em(part) / per_line)) for part in lines_raw)
+        used_h = total_lines * size * max(1.15, line_spacing) / 72.0
+        if used_h <= height * 1.06:
+            return round(size, 1)
+        size -= 1.0 if size <= 24 else 2.0
+    return round(min_size, 1)
+
+
+def _add_free_text(slide, el: SlideElement, default_font: str, default_color: str):
+    raw = clean_text(el.text or "", 2000, False)
+    if not raw:
+        return
+    shape = slide.shapes.add_textbox(Inches(el.x), Inches(el.y), Inches(el.w), Inches(el.h))
+    if el.fill:
+        fill_hex = parse_hex_color(el.fill)
+        if fill_hex:
+            _set_shape_fill(shape, fill_hex, el.opacity)
+    frame = shape.text_frame
+    frame.word_wrap = True
+    frame.margin_left = frame.margin_right = Pt(2)
+    frame.margin_top = frame.margin_bottom = Pt(1)
+    valign_map = {"top": MSO_ANCHOR.TOP, "middle": MSO_ANCHOR.MIDDLE, "bottom": MSO_ANCHOR.BOTTOM}
+    align_map = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}
+    frame.vertical_anchor = valign_map.get(el.valign, MSO_ANCHOR.TOP)
+
+    font_name = (el.font or default_font or "Microsoft YaHei").strip() or "Microsoft YaHei"
+    color_hex = parse_hex_color(el.color, default_color) or "182231"
+    fitted_size = _fit_free_text_size(raw, el.w, el.h, el.size, el.line_spacing)
+
+    paragraphs = raw.replace("\r", "").split("\n")
+    for idx, line in enumerate(paragraphs):
+        p = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
+        p.alignment = align_map.get(el.align, PP_ALIGN.LEFT)
+        p.space_after = Pt(2 if idx < len(paragraphs) - 1 else 0)
+        p.line_spacing = el.line_spacing
+        run = p.add_run()
+        run.text = line
+        run.font.name = font_name
+        run.font.size = Pt(fitted_size)
+        run.font.bold = el.bold
+        run.font.italic = el.italic
+        run.font.color.rgb = RGBColor.from_string(color_hex)
+        run._r.get_or_add_rPr().append(etree.Element(f"{DRAW}ea", typeface=font_name))
+
+
+def _add_free_table(slide, el: SlideElement, palette: dict[str, str], default_font: str):
+    cols = [clean_text(" ".join(str(c).split()), 60, False) for c in (el.columns or [])]
+    if len(cols) < 1:
+        return
+    rows_raw = el.rows or []
+    rows = []
+    for row in rows_raw[:14]:
+        cleaned = [clean_text(" ".join(str(cell).split()), 120, False) for cell in row[:len(cols)]]
+        cleaned += [""] * (len(cols) - len(cleaned))
+        rows.append(cleaned)
+    all_rows = [cols, *rows]
+    col_count = len(cols)
+    first_w = el.w * (0.26 if col_count >= 3 else 0.36) if col_count > 1 else el.w
+    other_w = (el.w - first_w) / max(1, col_count - 1) if col_count > 1 else el.w
+    widths = [first_w] + [other_w] * (col_count - 1)
+    row_h = min(0.75, el.h / max(1, len(all_rows)))
+
+    header_fill = parse_hex_color(el.header_fill) or parse_hex_color(palette.get("primary")) or "1E293B"
+    header_color = parse_hex_color(el.header_color) or "FFFFFF"
+    row_fill = parse_hex_color(el.row_fill) or parse_hex_color(palette.get("surface")) or "FFFFFF"
+    alt_fill = parse_hex_color(el.alt_fill) or parse_hex_color(palette.get("bg")) or "F8FAFC"
+    text_color = parse_hex_color(el.text_color) or parse_hex_color(palette.get("text")) or "1E293B"
+    border_hex = parse_hex_color(el.border_color) or parse_hex_color(palette.get("border"))
+
+    for r_idx, row in enumerate(all_rows):
+        cx = el.x
+        ry = el.y + r_idx * row_h
+        is_header = r_idx == 0
+        for c_idx, value in enumerate(row):
+            cw = widths[c_idx]
+            cell_fill = header_fill if is_header else (row_fill if r_idx % 2 else alt_fill)
+            box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(cx), Inches(ry),
+                                         Inches(max(0.05, cw - 0.02)), Inches(max(0.05, row_h - 0.02)))
+            _set_shape_fill(box, cell_fill)
+            _set_shape_border(box, border_hex, 0.5 if border_hex else 0.0)
+            if value:
+                cell_el = SlideElement(
+                    type="text",
+                    x=cx + 0.08,
+                    y=ry + 0.04,
+                    w=max(0.1, cw - 0.18),
+                    h=max(0.1, row_h - 0.1),
+                    text=value,
+                    size=13.5 if is_header else 12.5,
+                    bold=is_header or c_idx == 0,
+                    color="#" + (header_color if is_header else text_color),
+                    font=default_font,
+                    align="left",
+                    valign="middle",
+                    line_spacing=1.18,
+                )
+                _add_free_text(slide, cell_el, default_font, text_color)
+            cx += cw
+
+
+def render_freeform_pptx(deck: DeckSpec, image_blobs: list[bytes] | tuple[bytes, ...] = ()) -> bytes:
+    """无模板自由画布渲染器：完全按 AI 输出的视觉设计系统、坐标原语与生图资产生成可编辑 PPTX。"""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(SLIDE_W), Inches(SLIDE_H)
+    blank = prs.slide_layouts[6]
+
+    palette = deck.design.palette if deck.design else {}
+    default_font = (deck.design.font if deck.design else "") or "Microsoft YaHei"
+    default_bg = parse_hex_color(palette.get("bg"), "FFFFFF") or "FFFFFF"
+    default_text = parse_hex_color(palette.get("text"), "182231") or "182231"
+
+    shape_map = {
+        "rect": MSO_SHAPE.RECTANGLE,
+        "round_rect": MSO_SHAPE.ROUNDED_RECTANGLE,
+        "ellipse": MSO_SHAPE.OVAL,
+        "line": MSO_SHAPE.RECTANGLE,
+    }
+
+    for slide_spec in deck.slides:
+        slide = prs.slides.add_slide(blank)
+        bg_hex = parse_hex_color(slide_spec.bg, default_bg) or default_bg
+        bg_fill = slide.background.fill
+        bg_fill.solid()
+        bg_fill.fore_color.rgb = RGBColor.from_string(bg_hex)
+
+        # 可选全屏背景图 + 半透明蒙层
+        if slide_spec.bg_image and 1 <= slide_spec.bg_image <= len(image_blobs):
+            _add_fitted_picture(slide, image_blobs[slide_spec.bg_image - 1], 0.0, 0.0, SLIDE_W, SLIDE_H, fit="cover")
+            if slide_spec.bg_overlay:
+                ov_hex = parse_hex_color(slide_spec.bg_overlay.color, bg_hex)
+                if ov_hex and slide_spec.bg_overlay.opacity > 0:
+                    overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0),
+                                                     Inches(SLIDE_W), Inches(SLIDE_H))
+                    _set_shape_fill(overlay, ov_hex, slide_spec.bg_overlay.opacity)
+                    overlay.line.fill.background()
+
+        for el in slide_spec.elements:
+            if el.type in shape_map:
+                w = max(0.01, el.w)
+                h = max(0.01, el.h)
+                shape = slide.shapes.add_shape(shape_map[el.type], Inches(el.x), Inches(el.y), Inches(w), Inches(h))
+                if el.type == "round_rect" and el.radius is not None:
+                    try:
+                        shape.adjustments[0] = max(0.0, min(0.5, float(el.radius)))
+                    except Exception:
+                        pass
+                fill_hex = parse_hex_color(el.fill)
+                border_hex = parse_hex_color(el.border)
+                if el.type == "line" and not fill_hex and border_hex:
+                    fill_hex = border_hex
+                    border_hex = None
+                _set_shape_fill(shape, fill_hex, el.opacity)
+                _set_shape_border(shape, border_hex, el.border_width)
+            elif el.type == "image":
+                if el.image_index and 1 <= el.image_index <= len(image_blobs):
+                    _add_fitted_picture(slide, image_blobs[el.image_index - 1], el.x, el.y,
+                                        max(0.1, el.w), max(0.1, el.h), fit=el.fit)
+            elif el.type == "text":
+                _add_free_text(slide, el, default_font, default_text)
+            elif el.type == "table":
+                _add_free_table(slide, el, palette, default_font)
+
+        if slide_spec.notes:
+            slide.notes_slide.notes_text_frame.text = clean_text(slide_spec.notes, 2000, False)
+
+    prs.core_properties.title = deck.title
     prs.core_properties.author = "穹驭办公"
     out = BytesIO()
     prs.save(out)

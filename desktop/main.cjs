@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, nativeImage, shell, Tray } = require("electron");
 const { createHash, randomBytes } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -11,10 +11,121 @@ app.setName("穹驭办公");
 if (process.platform === "win32") app.setAppUserModelId("com.qiongyutech.office");
 app.setPath("userData", path.join(app.getPath("appData"), "QiongyuOffice"));
 let window;
+let tray;
 let origin;
 let loginInProgress = false;
 let desktopAgent;
+let isQuitting = false;
+let trayHintShown = false;
+const appIconPath = path.join(__dirname, "office.ico");
 const connectPage = pathToFileURL(path.join(__dirname, "connect.html")).href;
+
+const singleLock = app.requestSingleInstanceLock();
+if (!singleLock) {
+  app.quit();
+}
+
+function showMainWindow(routeHash = "") {
+  if (!window || window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  if (routeHash && origin) {
+    try {
+      const current = window.webContents.getURL();
+      if (current && new URL(current).origin === origin) {
+        const targetHash = routeHash.startsWith("#") ? routeHash : `#${routeHash}`;
+        void window.webContents.executeJavaScript(`location.hash = ${JSON.stringify(targetHash)};`).catch(() => {});
+      }
+    } catch {}
+  }
+}
+
+function quitApplication() {
+  isQuitting = true;
+  try { desktopAgent?.cancelAgent(); } catch {}
+  app.quit();
+}
+
+function buildTrayMenu() {
+  const version = app.getVersion();
+  const visible = Boolean(window && !window.isDestroyed() && window.isVisible() && !window.isMinimized());
+  return Menu.buildFromTemplate([
+    {
+      label: visible ? "隐藏到托盘" : "打开穹驭办公",
+      click: () => {
+        if (!window || window.isDestroyed()) return;
+        if (window.isVisible() && !window.isMinimized()) window.hide();
+        else showMainWindow();
+      }
+    },
+    { type: "separator" },
+    {
+      label: "新建办公会话",
+      enabled: Boolean(origin),
+      click: () => showMainWindow("#chat")
+    },
+    {
+      label: "查看今日任务",
+      enabled: Boolean(origin),
+      click: () => showMainWindow("#today")
+    },
+    {
+      label: "我的文件",
+      enabled: Boolean(origin),
+      click: () => showMainWindow("#files")
+    },
+    { type: "separator" },
+    {
+      label: "停止当前 AI 执行",
+      click: () => {
+        try { desktopAgent?.cancelAgent(); } catch {}
+      }
+    },
+    {
+      label: "切换工作台地址…",
+      click: () => {
+        showMainWindow();
+        try { desktopAgent?.cancelAgent(); } catch {}
+        if (window && !window.isDestroyed()) void window.loadFile("connect.html");
+      }
+    },
+    { type: "separator" },
+    {
+      label: `穹驭办公 v${version}`,
+      enabled: false
+    },
+    {
+      label: "退出穹驭办公",
+      click: () => quitApplication()
+    }
+  ]);
+}
+
+function ensureTray() {
+  if (tray) return tray;
+  const icon = nativeImage.createFromPath(appIconPath);
+  tray = new Tray(icon);
+  tray.setToolTip(`穹驭办公 v${app.getVersion()}`);
+  tray.on("click", () => showMainWindow());
+  tray.on("double-click", () => showMainWindow());
+  tray.on("right-click", () => {
+    tray.popUpContextMenu(buildTrayMenu());
+  });
+  return tray;
+}
+
+app.on("second-instance", () => {
+  showMainWindow();
+});
+
+app.on("before-quit", () => {
+  isQuitting = true;
+  if (tray && !tray.isDestroyed()) {
+    tray.destroy();
+    tray = undefined;
+  }
+});
 
 function normalize(value) {
   const address = new URL(value?.trim());
@@ -112,6 +223,7 @@ ipcMain.handle("qo:sign-in", async (event) => {
     } catch (error) {
       window?.webContents.send("qo:agent-event", { type: "step", label: error.message || "模型列表加载失败" });
     }
+    showMainWindow();
     return true;
   } finally {
     loginInProgress = false;
@@ -151,14 +263,44 @@ ipcMain.handle("qo:open-connect", async (event) => {
   return true;
 });
 
+ipcMain.handle("qo:set-theme", (event, mode) => {
+  if (!trusted(event) && !trusted(event, true)) return false;
+  if (!window || window.isDestroyed()) return false;
+  const dark = mode === "dark";
+  window.setBackgroundColor(dark ? "#0b0b0c" : "#ffffff");
+  if (typeof window.setTitleBarOverlay === "function") {
+    window.setTitleBarOverlay({
+      color: "#00000000",
+      symbolColor: dark ? "#f4f4f5" : "#111113",
+      height: 44
+    });
+  }
+  return true;
+});
+
 app.whenReady().then(() => {
+  if (!singleLock) return;
   try { origin = config(); } catch { origin = undefined; }
+  ensureTray();
+  const useTitleBarOverlay = process.platform === "win32" || process.platform === "linux";
   window = new BrowserWindow({
     width: 1420, height: 960, minWidth: 780, minHeight: 570,
     title: "穹驭办公", backgroundColor: "#ffffff", autoHideMenuBar: true,
     icon: path.join(__dirname, "office.ico"),
+    titleBarStyle: "hidden",
+    ...(useTitleBarOverlay ? {
+      titleBarOverlay: {
+        color: "#00000000",
+        symbolColor: "#111113",
+        height: 44
+      }
+    } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
+      additionalArguments: [
+        `--qo-version=${app.getVersion()}`,
+        ...(useTitleBarOverlay ? ["--qo-titlebar-overlay=1"] : [])
+      ],
       contextIsolation: true, nodeIntegration: false, sandbox: true,
       webSecurity: true, partition: "qiongyu-office"
     }
@@ -193,8 +335,28 @@ app.whenReady().then(() => {
     } catch {}
     return { action: "deny" };
   });
+  window.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      window.hide();
+      if (process.platform === "win32" && tray && !trayHintShown) {
+        trayHintShown = true;
+        try {
+          tray.displayBalloon({
+            title: "穹驭办公已最小化到系统托盘",
+            content: "应用仍在后台运行，进行中的任务不会中断。点击托盘图标可重新打开，右键可退出。",
+            iconType: "none"
+          });
+        } catch {}
+      }
+    }
+  });
   window.on("closed", () => { window = undefined; });
   void openWorkplace();
 });
 
-app.on("window-all-closed", () => app.quit());
+app.on("activate", () => showMainWindow());
+
+app.on("window-all-closed", () => {
+  if (isQuitting) app.quit();
+});

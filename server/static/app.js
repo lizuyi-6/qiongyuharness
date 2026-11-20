@@ -6,12 +6,13 @@ import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator,
   syncSidebarConversations, syncThemeToggle, syncTodayBadge, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
-import { applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeSlashMenu, copyReply,
-  generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier, loadWorkspace,
-  openDeckInStudio, openImageLightbox, refreshDesktopUsage, removeSource, retryTurn, runDesktopAgent,
-  saveImageAutoPreference, saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel,
-  sendMessage, showConversationHistory, showSources, switchStudioTab, syncChatSubmit, syncComposerGrow,
-  syncDesktopUsagePanel, syncImageAutoIndicator, syncShellCanvasState, toggleDesktopUsage, toggleImageDrawer,
+import { abortOrphanTurn, applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeComposerPickers,
+  closeSlashMenu, copyReply, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
+  loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
+  removeSource, resetChatState, retryTurn, runDesktopAgent, saveImageAutoPreference, savePptImageAutoPreference,
+  saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
+  showSources, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
+  syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer,
   toggleWorkspaceContext, triggerSlashMenu, updateSlashMenu, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
@@ -43,6 +44,7 @@ function adminReset() {
 async function preloadSidebarData() {
   const me = state.me;
   if (!me) return;
+  prefetchDesktopModels();
   try {
     const [conversations, todayData] = await Promise.all([
       api("/conversations").catch(() => null),
@@ -65,6 +67,7 @@ async function preloadSidebarData() {
 async function login(user) {
   await post("/auth/demo", { user_id: user });
   clearDrafts();
+  resetChatState();
   sessionStorage.removeItem("qo-signed-out");
   clearAdmin();
   unmountShell();
@@ -94,6 +97,7 @@ async function login(user) {
 async function logout() {
   await post("/auth/logout", {});
   clearDrafts();
+  resetChatState();
   clearAdmin();
   unmountShell();
   sessionStorage.setItem("qo-signed-out", "1");
@@ -178,8 +182,10 @@ function display(content, ticket, keepScroll = false) {
     syncDesktopUsagePanel();
     scrollToLatest();
     mountDeck();
+    syncActiveChatView();
     if (!keepScroll && !state.chatWorkspace?.session?.turns?.length) {
-      document.querySelector("[data-form=conversation] textarea")?.focus({ preventScroll: true });
+      const textarea = document.querySelector("[data-form=conversation] textarea");
+      if (textarea && !textarea.disabled) textarea.focus({ preventScroll: true });
     }
   }
 }
@@ -397,6 +403,7 @@ const actionCopy = { extension: "申请延期", comment: "留言", revoke: "撤�
 
 async function onClick(event) {
   if (!event.target.closest("[data-form=conversation]")) closeSlashMenu();
+  if (!event.target.closest(".composer-picker")) closeComposerPickers();
   if (event.target.closest("a[data-stop-prop]")) return;
   const target = event.target.closest("[data-act]");
   if (!target || target.disabled) return;
@@ -432,6 +439,8 @@ async function onClick(event) {
     case "toggle-image-drawer": toggleImageDrawer(); break;
     case "slash-trigger": triggerSlashMenu(); break;
     case "slash-pick": await applySlashCommand(id); break;
+    case "picker-toggle": toggleComposerPicker(id); break;
+    case "picker-pick": pickComposerOption(target.dataset.picker || "", id); break;
     case "image-lightbox": openImageLightbox(id, target.dataset.alt || "", target.dataset.meta || ""); break;
     case "chat-retry": retryTurn(id); break;
     case "chat-remove-source": removeSource(id); break;
@@ -439,11 +448,12 @@ async function onClick(event) {
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
     case "chat-cancel": await cancelActiveChat(); break;
+    case "chat-abort-orphan": await abortOrphanTurn(id, target.dataset.kind || "turn", target); break;
     case "copy-reply": await copyReply(id, target); break;
     case "copy-invite": await copyText(id, "已复制项目邀请码"); break;
     case "desktop-connect": await window.officeDesktop?.openConnect?.(); break;
-    case "usage-toggle": await toggleDesktopUsage(target); break;
-    case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace, target.closest("[data-usage-panel]")); break;
+    case "usage-toggle": await toggleDesktopUsage(); break;
+    case "usage-refresh": await refreshDesktopUsage(state.chatWorkspace); break;
     case "slides-clear": clearSelection(); break;
     case "project-create": projectDialog("create"); break;
     case "project-join": projectDialog("join"); break;
@@ -586,7 +596,7 @@ async function onClick(event) {
           toastMessage("当前为浏览器访问，AI 办理请在穹驭办公桌面客户端中使用");
           break;
         }
-        const info = await loadDesktopModelState();
+        const info = await loadDesktopModelState({ force: true });
         if (info.models?.length) {
           const suffix = info.pipelineAvailable ? "（支持智能分工）" : "";
           toastMessage(`桌面连接正常，当前可用 ${info.models.length} 个模型${suffix}`, "success");
@@ -727,11 +737,11 @@ async function handleForm(event) {
     }
     if (message) toastMessage(message, "success");
   } catch (error) {
-    errorIn(form, error);
+    if (form.isConnected) errorIn(form, error);
   } finally {
     delete form.dataset.busy;
     if (form.dataset.form === "conversation") {
-      syncChatSubmit(form, state.chatWorkspace);
+      if (form.isConnected) syncChatSubmit(form, state.chatWorkspace);
     } else {
       controls.forEach((node) => {
         if (form.dataset.form === "generate") {
@@ -791,6 +801,11 @@ document.addEventListener("change", (event) => {
     syncImageAutoIndicator();
     return;
   }
+  if (event.target.matches("[name=allow_ppt_images]")) {
+    savePptImageAutoPreference(event.target.checked);
+    syncImageAutoIndicator();
+    return;
+  }
   if (event.target.matches("[data-chat-model]")) {
     selectChatModel(event.target);
     return;
@@ -833,6 +848,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     setMobileNav(false);
     closeSlashMenu();
+    closeComposerPickers();
   }
   if (event.target.matches?.("[data-form=conversation] textarea")) {
     if (handleSlashKeydown(event)) return;

@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from . import gateway, prompting
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
 from .identity import fail
-from .office import Plan, add_file, clean_text, powerpoint, safe_name, word
+from .office import DeckSpec, Plan, add_file, clean_text, powerpoint, render_freeform_pptx, safe_name, word
 from .presentation import Replacement, Selection, edit_scope, pptx_file, revise_slide
 from .projects import project_for, project_sources
 from .store import audit, database, instant, pack, uid, unpack
@@ -47,6 +47,7 @@ class Decision(BaseModel):
     reply: str = Field(min_length=1, max_length=6500)
     kind: Literal["docx", "pptx"] | None = None
     plan: Plan | None = None
+    deck: DeckSpec | None = None
 
 
 class SlideChange(BaseModel):
@@ -354,6 +355,8 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
 
     task_fields = {name: task[name] for name in ("title", "description", "deliverable", "due_at")} if task else None
     plan = latest.get("plan") if latest else None
+    latest_kind = latest.get("kind") if latest else None
+    include_pptx = prompting.wants_pptx(body.message, body.mode, task, latest_kind)
     operation, genre = prompting.route(body.message, task_fields,
                                        plan.get("title", "") if isinstance(plan, dict) else "",
                                        [item["request"] for item in recent])
@@ -362,16 +365,18 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
     rules = prompting.checklist(operation, genre)
     if rules:
         payload["写作规范"] = rules
-    if pages := prompting.page_rule(body.message, body.mode, latest.get("kind") if latest else None):
+    if pages := prompting.page_rule(body.message, body.mode, latest_kind):
         payload["页数要求"] = pages
     plugin_context = {"项目": project, "资料": sources} if project else None
     if project and gateway.MODE in {"dsh", "desktop"}:
         payload["项目"] = project
         payload["参考资料"] = []
         payload["接入说明"] = "先调用 office_context_read，获取本轮授权资料。"
-    return {"kind": "conversation", "system": prompting.conversation_system(body.mode, operation, genre),
+    return {"kind": "conversation",
+            "system": prompting.conversation_system(body.mode, operation, genre, include_pptx=include_pptx),
             "prompt": pack(payload), "context": plugin_context,
-            "preset_step": prompting.steps_label(operation, genre)}
+            "preset_step": prompting.steps_label(operation, genre),
+            "wants_pptx": include_pptx}
 
 
 def parse_turn_response(text, kind):
@@ -410,20 +415,32 @@ async def decide_slide(body, scope, sources, project, assignment, user, run):
     return parse_turn_response(raw, prepared["kind"]), usage
 
 
-def office_file(decision, mode):
+def office_file(decision, mode, image_blobs=()):
     if decision.action == "reply":
         return None
-    if not decision.kind or not decision.plan or mode == "reply" or (mode in FORMATS and mode != decision.kind):
+    if not decision.kind or mode == "reply" or (mode in FORMATS and mode != decision.kind):
         fail(502, "返回的文稿格式与本轮请求不一致")
-    plan = decision.plan.clean()
-    # 版式按条数自动排（卡片 / 两栏列表 / 表格），字号随字数缩放；每页超过 6 条由分页拆成"（续）"页。
-    # 只拒绝单条长到任何字号都放不下的情况。
-    if decision.kind == "pptx" and any(len(" ".join(p.split())) > 200 for s in plan.sections for p in s.points):
-        fail(502, "有要点超过 200 字，超出 PPT 版式，请缩短后重试")
     kind = decision.kind
+    if kind == "pptx" and decision.deck is not None:
+        deck = decision.deck.clean()
+        name = safe_name(deck.title[:105]) + ".pptx"
+        data = render_freeform_pptx(deck, image_blobs)
+        summary = {
+            "title": deck.title,
+            "subtitle": deck.subtitle,
+            "design": deck.design.model_dump(),
+            "slides": [{"title": slide.title, "notes": slide.notes[:200]} for slide in deck.slides],
+        }
+        return kind, summary, name, data
+    if not decision.plan:
+        fail(502, "返回的文稿缺少内容结构")
+    plan = decision.plan.clean()
+    # 兼容旧 plan 格式兜底：仅拒绝单条长到任何字号都放不下的情况。
+    if kind == "pptx" and any(len(" ".join(p.split())) > 200 for s in plan.sections for p in s.points):
+        fail(502, "有要点超过 200 字，超出 PPT 版式，请缩短后重试")
     name = safe_name(plan.title[:105]) + "." + kind
     data = word(plan) if kind == "docx" else powerpoint(plan)
-    return kind, plan, name, data
+    return kind, plan.model_dump(), name, data
 
 
 def event(kind, **payload):
@@ -570,13 +587,15 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
         audit(db, "agent.started", user["id"], assignment, run_id=run, engine=engine)
     return {"run_id": run, "kind": prompt_data["kind"], "system": prompt_data["system"],
             "prompt": prompt_data["prompt"], "context": prompt_data["context"],
-            "steps": [*steps, "正在整理回复"], "body": body, "user": user, "assignment": assignment,
+            "steps": [*steps, "正在整理回复"], "wants_pptx": bool(prompt_data.get("wants_pptx")),
+            "body": body, "user": user, "assignment": assignment,
             "task": task, "sources": sources, "recent": recent, "latest": latest,
             "project": project, "scope": scope, "target": target, "engine": engine,
             "conversation_id": key}
 
 
 async def complete_turn(key, run, payload, user, *, expected_engine):
+    image_blobs = []
     with database() as db:
         turn = db.one("SELECT * FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
         run_row = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
@@ -592,10 +611,17 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         body = TurnRequest.model_validate(unpack(turn["input"]))
         target = selection_target(db, key, body, user)
         recent, latest = history_for(db, key)
+        turn_result = unpack(turn["result"] or "{}")
+        for img_entry in turn_result.get("images") or []:
+            fid = (img_entry.get("file") or {}).get("id") if isinstance(img_entry, dict) else None
+            if fid:
+                art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user["id"]))
+                if art and art["data"]:
+                    image_blobs.append(bytes(art["data"]))
 
-    if len(payload.text.encode("utf-8")) > 256 * 1024:
-        fail_turn(run, user, assignment, "模型响应超过 256 KB")
-        fail(413, "模型响应超过 256 KB")
+    if len(payload.text.encode("utf-8")) > 512 * 1024:
+        fail_turn(run, user, assignment, "模型响应超过 512 KB")
+        fail(413, "模型响应超过 512 KB")
     try:
         scope = await asyncio.to_thread(edit_scope, target["data"], body.selection) if target else None
         decision = parse_turn_response(payload.text, "slide" if scope else "conversation")
@@ -604,7 +630,7 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             rendered = None
         else:
             revised = None
-            rendered = await asyncio.to_thread(office_file, decision, body.mode)
+            rendered = await asyncio.to_thread(office_file, decision, body.mode, image_blobs)
     except HTTPException as error:
         fail_turn(run, user, assignment, str(error.detail))
         raise
@@ -642,11 +668,11 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             result.update(file=public_file(db, artifact), kind="pptx")
             steps.append(f"已保存第 {scope['page']} 页的修订版")
         elif rendered:
-            kind, plan, name, content = rendered
+            kind, plan_data, name, content = rendered
             parent = latest["file"]["id"] if latest and latest["file"]["name"] == name else None
             artifact = add_file(db, user["id"], name, content, kind, "generated",
                                 assignment=assignment, parent=parent, run=run)
-            result.update(file=public_file(db, artifact), plan=plan.model_dump(), kind=kind)
+            result.update(file=public_file(db, artifact), plan=plan_data, kind=kind)
             steps.append("已导出 " + FORMATS[kind])
         changed = db.execute("UPDATE office_turns SET result=?,status='completed' WHERE id=? AND status='running'",
                              (pack(result), run)).rowcount
@@ -801,8 +827,8 @@ def store_turn_image_route(key: str, run: str, payload: TurnImage, user: User):
             fail(409, "本轮执行已结束")
         result = unpack(turn["result"] or "{}")
         images = result.setdefault("images", [])
-        if len(images) >= 2:
-            fail(409, "本轮生图次数已达上限（2 张）")
+        if len(images) >= 3:
+            fail(409, "本轮生图次数已达上限（3 张）")
         index = len(images) + 1
         file_id = add_file(db, user["id"], safe_name(f"AI配图-{index}") + ".png", data, "png", "image",
                            assignment=assignment, run=run)
@@ -827,7 +853,7 @@ async def prepare_turn_route(key: str, body: TurnRequest, user: User):
     prepared = await prepare_conversation(key, body, user, engine="desktop")
     if "replay" in prepared:
         fail(409, "本轮请求已经提交，请等待执行完成")
-    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps")}
+    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps", "wants_pptx")}
 
 
 @router.post("/{key}/turns/{run}/complete")

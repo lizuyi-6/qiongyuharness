@@ -86,7 +86,11 @@ export function getTheme() {
 export function applyTheme(mode = getTheme()) {
   const next = mode === "dark" ? "dark" : "light";
   document.documentElement.dataset.theme = next;
+  if (window.officeDesktop?.hasTitleBarOverlay) {
+    document.documentElement.classList.add("desktop-titlebar");
+  }
   try { localStorage.setItem(THEME_KEY, next); } catch {}
+  try { void window.officeDesktop?.setTheme?.(next); } catch {}
   return next;
 }
 

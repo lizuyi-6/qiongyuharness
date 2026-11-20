@@ -89,7 +89,7 @@ async def lifespan(_):
             pass
 
 
-app = FastAPI(title="穹驭办公 API", version="0.1.0", lifespan=lifespan,
+app = FastAPI(title="穹驭办公 API", version="0.2.6", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url="/openapi.json" if DEMO else None)
 app.add_middleware(RequestLimits)
 if not DEMO:
@@ -113,7 +113,12 @@ def health():
 
 @app.get("/api/v1/config")
 def app_config():
-    return {"demo": DEMO, "sso": bool(identity.ISSUER and identity.CLIENT), "timezone": str(ZONE)}
+    return {
+        "demo": DEMO,
+        "sso": bool(identity.ISSUER and identity.CLIENT),
+        "timezone": str(ZONE),
+        "version": os.environ.get("QO_APP_VERSION") or app.version,
+    }
 
 
 @app.get("/api/v1/engine", dependencies=[Depends(identity.user_for)])
