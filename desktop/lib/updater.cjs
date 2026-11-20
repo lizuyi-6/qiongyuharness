@@ -90,11 +90,15 @@ function buildDeltaApplyScript({ pid, resourcesDir, stagedDir, backupDir, exePat
     `$Files = @(${relList})`,
     "",
     "# 等待旧版主进程完全退出以释放 app.asar 句柄",
-    "for ($i = 0; $i -lt 100; $i++) {",
+    "for ($i = 0; $i -lt 32; $i++) {",
     "  if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { break }",
     "  Start-Sleep -Milliseconds 250",
     "}",
-    "Start-Sleep -Milliseconds 350",
+    "if (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) {",
+    "  Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue",
+    "}",
+    "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath } | Stop-Process -Force -ErrorAction SilentlyContinue",
+    "Start-Sleep -Milliseconds 400",
     "",
     "New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null",
     "$BackedUp = @()",
@@ -149,7 +153,8 @@ function buildDeltaApplyScript({ pid, resourcesDir, stagedDir, backupDir, exePat
     "  }",
     "}",
     "if (Test-Path -LiteralPath $ExePath) {",
-    "  Start-Process -FilePath $ExePath",
+    "  $ExeDir = Split-Path -Parent $ExePath",
+    "  Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal",
     "}",
     ""
   ].join("\r\n");
@@ -164,18 +169,23 @@ function buildFullApplyScript({ pid, installerPath, exePath, appliedPath, versio
     `$AppliedPath = ${psQuote(appliedPath)}`,
     `$Version = ${psQuote(version)}`,
     "",
-    "for ($i = 0; $i -lt 100; $i++) {",
+    "for ($i = 0; $i -lt 32; $i++) {",
     "  if (-not (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)) { break }",
     "  Start-Sleep -Milliseconds 250",
     "}",
-    "Start-Sleep -Milliseconds 350",
+    "if (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) {",
+    "  Stop-Process -Id $TargetPid -Force -ErrorAction SilentlyContinue",
+    "}",
+    "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath } | Stop-Process -Force -ErrorAction SilentlyContinue",
+    "Start-Sleep -Milliseconds 400",
     "",
     "$proc = Start-Process -FilePath $InstallerPath -ArgumentList '/S' -Wait -PassThru",
     "if ($proc -and $proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $ExePath)) {",
     "  $meta = @{ version = $Version; mode = 'full'; applied_at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress",
     "  Set-Content -LiteralPath $AppliedPath -Value $meta -Encoding UTF8",
     "  Remove-Item -LiteralPath $InstallerPath -Force -ErrorAction SilentlyContinue",
-    "  Start-Process -FilePath $ExePath",
+    "  $ExeDir = Split-Path -Parent $ExePath",
+    "  Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal",
     "} elseif (Test-Path -LiteralPath $InstallerPath) {",
     "  Start-Process -FilePath $InstallerPath",
     "}",
@@ -692,23 +702,38 @@ function createDesktopUpdater({
     // 写入 UTF-8 BOM，确保 Windows PowerShell 5.1 正确解析中文路径（如 穹驭办公.exe）
     await fsp.writeFile(scriptPath, `\uFEFF${scriptContent}`, { encoding: "utf8" });
 
-    const powershellExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const child = spawnImpl(powershellExe, [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy", "Bypass",
-      "-WindowStyle", "Hidden",
-      "-File", scriptPath
-    ], {
-      detached: true,
-      windowsHide: true,
-      stdio: "ignore"
-    });
-    child.unref?.();
+    const sysRoot = process.env.SystemRoot || "C:\\Windows";
+    const powershellExe = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const wscriptExe = path.join(sysRoot, "System32", "wscript.exe");
+    const vbsPath = path.join(updatesDir, `launch-${readyArtifact.mode}-${readyArtifact.version}.vbs`);
+    // 使用 Windows 原生 GUI 子系统 wscript.exe 启动隐藏的 PowerShell，避免 powershell.exe 在 DETACHED_PROCESS + stdio:ignore 下无控制台句柄直接退出
+    if (fs.existsSync(wscriptExe)) {
+      const psCmd = `"${powershellExe}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
+      const vbsContent = `CreateObject("WScript.Shell").Run "${psCmd.replace(/"/g, '""')}", 0, False\r\n`;
+      await fsp.writeFile(vbsPath, vbsContent, { encoding: "ascii" });
+      const child = spawnImpl(wscriptExe, ["//B", "//Nologo", vbsPath], {
+        detached: true,
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      child.unref?.();
+    } else {
+      const child = spawnImpl(powershellExe, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+        "-File", scriptPath
+      ], {
+        detached: false,
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      child.unref?.();
+    }
 
     setTimeout(() => {
       quitApplication?.();
-    }, 180);
+    }, 220);
     return snapshot();
   }
 
