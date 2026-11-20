@@ -90,7 +90,7 @@ async def lifespan(_):
             pass
 
 
-app = FastAPI(title="穹驭办公 API", version="0.2.11", lifespan=lifespan,
+app = FastAPI(title="穹驭办公 API", version="0.2.12", lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url="/openapi.json" if DEMO else None)
 app.add_middleware(RequestLimits)
 if not DEMO:

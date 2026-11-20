@@ -2,8 +2,15 @@
 
 const { spawn } = require("node:child_process");
 const { createHash } = require("node:crypto");
-const fs = require("node:fs");
-const fsp = require("node:fs/promises");
+// Electron 主进程会对 node:fs 的 .asar 路径做虚拟文件系统拦截，读写更新包时优先使用 original-fs 绕过拦截。
+let rawFs;
+try {
+  rawFs = require("original-fs");
+} catch {
+  rawFs = require("node:fs");
+}
+const fs = rawFs;
+const fsp = rawFs.promises;
 const path = require("node:path");
 const zlib = require("node:zlib");
 const { sessionFetch } = require("./session-cookie.cjs");
@@ -94,7 +101,8 @@ function buildDeltaApplyScript({ pid, resourcesDir, stagedDir, backupDir, exePat
     "try {",
     "  foreach ($rel in $Files) {",
     "    $winRel = $rel -replace '/', '\\\\'",
-    "    $src = Join-Path $StagedDir $winRel",
+    "    $src = Join-Path $StagedDir ($winRel + '.payload')",
+    "    if (-not (Test-Path -LiteralPath $src)) { $src = Join-Path $StagedDir $winRel }",
     "    $dst = Join-Path $ResourcesDir $winRel",
     "    $bak = Join-Path $BackupDir $winRel",
     "    if (-not (Test-Path -LiteralPath $src)) { throw \"Missing staged file: $rel\" }",
@@ -222,7 +230,7 @@ async function unpackAndVerifyDeltaPatch({ patchPath, stagedDir, expectedVersion
     if (content.length !== item.size || sha256Buffer(content) !== item.sha256.toLowerCase()) {
       throw new Error(`增量更新包文件校验失败：${item.path}`);
     }
-    const target = path.resolve(stagedRoot, item.path);
+    const target = path.resolve(stagedRoot, `${item.path}.payload`);
     const relative = path.relative(stagedRoot, target);
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
       throw new Error(`增量更新包路径越界：${item.path}`);

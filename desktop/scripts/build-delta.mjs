@@ -107,7 +107,7 @@ const manifest = {
   published_at: new Date().toISOString(),
   notes,
   runtime_hash: runtimeHash,
-  min_delta_version: "0.2.9",
+  min_delta_version: "0.2.12",
   delta: {
     file: deltaFile,
     size: gzBytes.length,
