@@ -6,7 +6,7 @@ const path = require("node:path");
 const { createLoopbackGateway } = require("./lib/loopback-gateway.cjs");
 const { runDsh } = require("./lib/dsh-bridge.cjs");
 const { runPipeline } = require("./lib/pipeline.cjs");
-const { listModelsWithRefresh, modelServiceError, parseModels } = require("./lib/models.cjs");
+const { listModelsWithRefresh, modelServiceCode, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
 const { quotaExhaustionMessage, requestUsage, USAGE_TIMEOUT_MS } = require("./lib/usage.cjs");
@@ -35,9 +35,10 @@ function validateBaseUrl(value) {
   return url.origin + "/v1";
 }
 
-function responseError(payload, status, fallback) {
+function responseError(payload, status) {
   if (typeof payload?.detail === "string" && payload.detail.trim()) return payload.detail.trim();
-  return modelServiceError(status, undefined) || fallback;
+  if (status === 401) return "登录已失效，请重新登录";
+  return `工作台请求失败(HTTP ${status})`;
 }
 
 const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
@@ -129,7 +130,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         if (response.ok) throw new Error("工作台返回了无效数据");
       }
     }
-    if (!response.ok) throw new Error(responseError(payload, response.status, "工作台请求失败"));
+    if (!response.ok) throw new Error(responseError(payload, response.status));
     return payload;
   }
 
@@ -200,15 +201,26 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
 
   async function fetchModels(credential) {
     const url = `${credential.baseUrl.replace(/\/+$/, "")}/models`;
-    const response = await net.fetch(url, {
-      headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
-      redirect: "error",
-      signal: AbortSignal.timeout(USAGE_TIMEOUT_MS)
-    });
+    let response;
+    try {
+      response = await net.fetch(url, {
+        headers: { Authorization: `Bearer ${credential.apiKey}`, Accept: "application/json" },
+        redirect: "error",
+        signal: AbortSignal.timeout(USAGE_TIMEOUT_MS)
+      });
+    } catch (error) {
+      if (error?.name === "TimeoutError" || error?.code === "ETIMEDOUT" || error?.code === "UND_ERR_CONNECT_TIMEOUT") {
+        throw new Error("模型服务响应超时，请稍后重试");
+      }
+      throw new Error("无法连接模型服务，请检查网络连接后重试");
+    }
     if (!response.ok) {
       let payload = {};
       try { payload = await response.json(); } catch {}
-      throw Object.assign(new Error(modelServiceError(response.status, payload?.detail)), { status: response.status });
+      throw Object.assign(new Error(modelServiceError(response.status, payload)), {
+        status: response.status,
+        code: modelServiceCode(payload)
+      });
     }
     let payload;
     try { payload = await response.json(); } catch { throw new Error("模型服务返回的列表格式无效"); }
@@ -509,4 +521,4 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
   };
 }
 
-module.exports = { createDesktopAgent, nodeAtLeast, sanitizePipelineConfig, validateBaseUrl };
+module.exports = { createDesktopAgent, nodeAtLeast, responseError, sanitizePipelineConfig, validateBaseUrl };

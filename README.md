@@ -58,14 +58,17 @@ UPDATE users SET subject = NULL WHERE email = 'old@example.com' AND enabled = 0;
 - `QO_SUB2API_PROVISION_KEY`：管理员创建的受限管理密钥，只授予 `users.provision.write`，使用 `adm_sc_` 前缀。
 - `QO_SUB2API_DEFAULT_GROUP_ID`：正整数分组 ID。
 - `QO_SUB2API_KEY_NAME`：密钥名，默认 `qiongyu-office`。
+- `QO_SUB2API_RATE_LIMIT_5H_USD`：必填的每密钥 5 小时美元限额，范围 `0..100000`，`0` 表示不限；员工策略示例为 `20`。
+- `QO_SUB2API_RATE_LIMIT_1D_USD`：可选的每密钥 1 天美元限额，范围 `0..100000`，`0` 表示不限。
+- `QO_SUB2API_RATE_LIMIT_7D_USD`：可选的每密钥 7 天美元限额，范围 `0..100000`，`0` 表示不限；周额度仍由 sub2api 穹驭订阅分组承担。
 
 员工登录后，桌面端向工作台调用 `POST /api/v1/me/model-credential`。工作台按员工邮箱和姓名请求 sub2api 找到或创建用户、找到或创建同名密钥，并把密钥明文只返回给桌面端；工作台不把明文密钥写入数据库或审计记录。sub2api 管理员账号所用邮箱不能作为员工开通邮箱：上游返回 `admin_user_not_provisionable` 时，工作台以 403 拒绝。
 
 只有 `employee`、`manager`、`admin` 角色能请求模型凭证；`reviewer` 可以登录工作台，但请求模型凭证会被拒绝。
 
-部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID 和密钥名填入 `.env`。部署前在同一 shell 加载这两个环境变量并运行 `python scripts/check_sub2api_key.py`；探测不通过时不要启动服务。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
+部署步骤：在 sub2api 中创建只具备上述开通权限的受限管理密钥；确认目标分组 ID；将 URL、密钥、分组 ID、密钥名和 5 小时限额填入 `.env`，需要时再设置日限额。部署前在同一 shell 加载这些变量并运行 `python scripts/check_sub2api_key.py`；探测不通过时不要启动服务。启动服务后，给员工分发桌面安装包并配置工作台地址。`QO_SUB2API_URL` 不要包含 `/v1`，桌面端会用返回的 `base_url` 请求模型列表及 Chat Completions。
 
-服务启动校验会检查 sub2api URL 是无路径的 HTTPS origin、provision key 去除首尾空白后以 `adm_sc_` 开头且带有后缀、分组 ID 为正整数、key name 符合格式。它不会向 sub2api 发请求；部署探测脚本会用无效邮箱验证开通接口返回 `400 invalid_email`，并验证读取用户列表返回 `403`。这些探测不替代在 sub2api 管理端确认密钥权限配置。
+服务启动校验会检查 sub2api URL 是无路径的 HTTPS origin、provision key 去除首尾空白后以 `adm_sc_` 开头且带有后缀、分组 ID 为正整数、key name 符合格式，以及 5 小时限额必填、日/周限额（若配置）均为有限数且处于 `0..100000`。额度配置无效会阻止服务启动。它不会向 sub2api 发请求；部署探测脚本会用无效邮箱验证开通接口返回 `400 invalid_email`，并验证读取用户列表返回 `403`。这些探测不替代在 sub2api 管理端确认密钥权限配置。
 
 ### 5. 启动与安装桌面端
 

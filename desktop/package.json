@@ -1,6 +1,6 @@
 {
   "name": "qiongyu-office-desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Qiongyu Office employee desktop",
   "author": "Qiongyu Technology",
   "main": "main.cjs",
@@ -24,7 +24,8 @@
       "lib/**",
       "preload.cjs",
       "package.json",
-      "connect.html"
+      "connect.html",
+      "office.ico"
     ],
     "extraResources": [
       {
@@ -40,7 +41,7 @@
       "target": [
         "nsis"
       ],
-      "signAndEditExecutable": false,
+      "signAndEditExecutable": true,
       "icon": "office.ico"
     },
     "nsis": {

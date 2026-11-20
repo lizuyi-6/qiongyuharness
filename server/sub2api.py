@@ -1,5 +1,7 @@
+import json
 import os
 import re
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 
 import httpx
@@ -18,7 +20,35 @@ def settings():
         "provision_key": os.getenv("QO_SUB2API_PROVISION_KEY", "").strip(),
         "default_group_id": os.getenv("QO_SUB2API_DEFAULT_GROUP_ID", "").strip(),
         "key_name": os.getenv("QO_SUB2API_KEY_NAME", "qiongyu-office").strip(),
+        "rate_limit_5h_usd": os.getenv("QO_SUB2API_RATE_LIMIT_5H_USD"),
+        "rate_limit_1d_usd": os.getenv("QO_SUB2API_RATE_LIMIT_1D_USD"),
+        "rate_limit_7d_usd": os.getenv("QO_SUB2API_RATE_LIMIT_7D_USD"),
     }
+
+
+def parse_rate_limit(value, name, *, required=False):
+    if value is None or not value.strip():
+        if required:
+            raise RuntimeError(f"Enterprise mode requires {name}.")
+        return None
+    value = value.strip()
+    if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", value):
+        raise RuntimeError(f"{name} must be a finite number between 0 and 100000.")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as error:
+        raise RuntimeError(f"{name} must be a finite number between 0 and 100000.") from error
+    if not parsed.is_finite() or parsed < 0 or parsed > 100000:
+        raise RuntimeError(f"{name} must be a finite number between 0 and 100000.")
+    return parsed
+
+
+def provision_request_json(payload):
+    pairs = []
+    for key, value in payload.items():
+        encoded_value = str(value) if isinstance(value, Decimal) else json.dumps(value)
+        pairs.append(f"{json.dumps(key)}:{encoded_value}")
+    return "{" + ",".join(pairs) + "}"
 
 
 def validate_config():
@@ -43,6 +73,12 @@ def validate_config():
         raise RuntimeError("Enterprise mode requires a positive QO_SUB2API_DEFAULT_GROUP_ID.")
     if not re.fullmatch(r"[a-z0-9][a-z0-9:._-]{0,63}", config["key_name"]):
         raise RuntimeError("QO_SUB2API_KEY_NAME must match the provision key-name format.")
+    for key, env_name, required in (
+        ("rate_limit_5h_usd", "QO_SUB2API_RATE_LIMIT_5H_USD", True),
+        ("rate_limit_1d_usd", "QO_SUB2API_RATE_LIMIT_1D_USD", False),
+        ("rate_limit_7d_usd", "QO_SUB2API_RATE_LIMIT_7D_USD", False),
+    ):
+        parse_rate_limit(config[key], env_name, required=required)
 
 
 ERROR_MESSAGES = {
@@ -79,16 +115,31 @@ async def model_credential(request: Request):
     config = settings()
     try:
         default_group_id = int(config["default_group_id"])
+        rate_limit_5h = parse_rate_limit(
+            config["rate_limit_5h_usd"], "QO_SUB2API_RATE_LIMIT_5H_USD", required=True
+        )
+        rate_limit_1d = parse_rate_limit(config["rate_limit_1d_usd"], "QO_SUB2API_RATE_LIMIT_1D_USD")
+        rate_limit_7d = parse_rate_limit(config["rate_limit_7d_usd"], "QO_SUB2API_RATE_LIMIT_7D_USD")
+        request_body = {
+            "email": user["email"],
+            "display_name": user["name"],
+            "key_name": config["key_name"],
+            "default_group_id": default_group_id,
+            "rate_limit_5h": rate_limit_5h,
+        }
+        if rate_limit_1d is not None:
+            request_body["rate_limit_1d"] = rate_limit_1d
+        if rate_limit_7d is not None:
+            request_body["rate_limit_7d"] = rate_limit_7d
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             response = await client.post(
                 f"{config['url']}/api/v1/admin/provision/user-key",
-                headers={"x-api-key": config["provision_key"], "User-Agent": USER_AGENT},
-                json={
-                    "email": user["email"],
-                    "display_name": user["name"],
-                    "key_name": config["key_name"],
-                    "default_group_id": default_group_id,
+                headers={
+                    "x-api-key": config["provision_key"],
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/json",
                 },
+                content=provision_request_json(request_body),
             )
     except (httpx.HTTPError, ValueError):
         raise HTTPException(502, "模型服务暂不可用，请稍后重试或联系管理员")
@@ -103,11 +154,15 @@ async def model_credential(request: Request):
         group_id = result["group_id"]
         user_created = result["user_created"]
         key_created = result["key_created"]
+        subscription_id = result.get("subscription_id")
+        subscription_created = result.get("subscription_created")
         if (not isinstance(api_key, str) or not api_key
                 or isinstance(sub2api_user_id, bool) or not isinstance(sub2api_user_id, int)
                 or isinstance(key_id, bool) or not isinstance(key_id, int)
                 or isinstance(group_id, bool) or not isinstance(group_id, int) or group_id <= 0
-                or not isinstance(user_created, bool) or not isinstance(key_created, bool)):
+                or not isinstance(user_created, bool) or not isinstance(key_created, bool)
+                or (subscription_id is not None and (isinstance(subscription_id, bool) or not isinstance(subscription_id, int)))
+                or ("subscription_created" in result and not isinstance(subscription_created, bool))):
             raise ValueError("invalid provision response")
     except (ValueError, KeyError, TypeError):
         raise HTTPException(502, "模型服务返回内容无效，请联系管理员")
@@ -120,6 +175,8 @@ async def model_credential(request: Request):
             key_id=key_id,
             user_created=user_created,
             key_created=key_created,
+            subscription_id=subscription_id,
+            subscription_created=subscription_created,
         )
     return {
         "base_url": f"{config['url']}/v1",

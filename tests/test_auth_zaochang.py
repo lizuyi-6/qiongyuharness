@@ -249,16 +249,21 @@ class ZaochangAuthTest(unittest.TestCase):
         with store.database(write=True) as db:
             return identity.make_session(db, self.user_id(email))
 
-    def call_model_credential(self, email, handler):
+    def call_model_credential(self, email, handler, extra_env=None):
         real_client = httpx.AsyncClient
+        config_env = {
+            "QO_SUB2API_URL": "https://aethernettech.dev",
+            "QO_SUB2API_PROVISION_KEY": "adm_sc_test_restricted-provision-key",
+            "QO_SUB2API_DEFAULT_GROUP_ID": "7",
+            "QO_SUB2API_KEY_NAME": "qiongyu-office",
+            "QO_SUB2API_RATE_LIMIT_5H_USD": "20",
+            "QO_SUB2API_RATE_LIMIT_1D_USD": "",
+            "QO_SUB2API_RATE_LIMIT_7D_USD": "",
+        }
+        config_env.update(extra_env or {})
         with (
             patch.object(sub2api, "DEMO", False),
-            patch.dict(os.environ, {
-                "QO_SUB2API_URL": "https://aethernettech.dev",
-                "QO_SUB2API_PROVISION_KEY": "adm_sc_test_restricted-provision-key",
-                "QO_SUB2API_DEFAULT_GROUP_ID": "7",
-                "QO_SUB2API_KEY_NAME": "qiongyu-office",
-            }),
+            patch.dict(os.environ, config_env),
             patch.object(sub2api.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)),
         ):
             with TestClient(app) as client:
@@ -278,10 +283,12 @@ class ZaochangAuthTest(unittest.TestCase):
                 "display_name": "经办员工",
                 "key_name": "qiongyu-office",
                 "default_group_id": 7,
+                "rate_limit_5h": 20,
             })
             return httpx.Response(200, json={
                 "user_id": 51, "user_created": True, "key_id": 82,
                 "key_created": True, "key": key_value, "group_id": 7,
+                "subscription_id": 9001, "subscription_created": True,
             })
 
         response = self.call_model_credential("worker@example.com", endpoint)
@@ -296,11 +303,83 @@ class ZaochangAuthTest(unittest.TestCase):
             audit_rows = db.all("SELECT payload FROM events WHERE type='model.credential_issued'")
             self.assertTrue(audit_rows)
             self.assertTrue(all(key_value not in row["payload"] for row in audit_rows))
-            self.assertTrue(any('"key_id":82' in row["payload"] and '"sub2api_user_id":51' in row["payload"] for row in audit_rows))
+            self.assertTrue(any('"key_id":82' in row["payload"] and '"sub2api_user_id":51' in row["payload"]
+                and '"subscription_id":9001' in row["payload"] and '"subscription_created":true' in row["payload"]
+                for row in audit_rows))
             tables = [row["name"] for row in db.all("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
             for table in tables:
                 for row in db.all(f'SELECT * FROM "{table}"'):
                     self.assertNotIn(key_value, repr(tuple(row)), f"credential persisted in {table}")
+
+    def test_model_credential_accepts_legacy_response_without_subscription_metadata(self):
+        response = self.call_model_credential("worker@example.com", lambda request: httpx.Response(200, json={
+            "user_id": 51, "user_created": False, "key_id": 82,
+            "key_created": False, "key": "sk-legacy", "group_id": 7,
+        }))
+        self.assertEqual(response.status_code, 200, response.text)
+        with store.database() as db:
+            audit_rows = db.all("SELECT payload FROM events WHERE type='model.credential_issued'")
+        self.assertTrue(any('"subscription_id":null' in row["payload"]
+            and '"subscription_created":null' in row["payload"] for row in audit_rows))
+
+    def test_model_credential_omits_unconfigured_optional_rate_limits(self):
+        def endpoint(request):
+            body = json.loads(request.content)
+            self.assertEqual(body["rate_limit_5h"], 20)
+            self.assertNotIn("rate_limit_1d", body)
+            self.assertNotIn("rate_limit_7d", body)
+            return httpx.Response(200, json={
+                "user_id": 51, "user_created": False, "key_id": 82,
+                "key_created": False, "key": "sk-test", "group_id": 7,
+            })
+
+        response = self.call_model_credential("worker@example.com", endpoint)
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_model_credential_includes_configured_optional_rate_limits(self):
+        def endpoint(request):
+            body = json.loads(request.content)
+            self.assertEqual(body["rate_limit_5h"], 20)
+            self.assertEqual(body["rate_limit_1d"], 45.5)
+            self.assertEqual(body["rate_limit_7d"], 100)
+            return httpx.Response(200, json={
+                "user_id": 51, "user_created": False, "key_id": 82,
+                "key_created": False, "key": "sk-test", "group_id": 7,
+            })
+
+        response = self.call_model_credential("worker@example.com", endpoint, {
+            "QO_SUB2API_RATE_LIMIT_1D_USD": "45.5",
+            "QO_SUB2API_RATE_LIMIT_7D_USD": "100",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_model_credential_preserves_small_finite_decimal_as_json_number(self):
+        def endpoint(request):
+            self.assertIn(b'"rate_limit_5h":1E-1000', request.content)
+            return httpx.Response(200, json={
+                "user_id": 51, "user_created": False, "key_id": 82,
+                "key_created": False, "key": "sk-test", "group_id": 7,
+            })
+
+        response = self.call_model_credential("worker@example.com", endpoint, {
+            "QO_SUB2API_RATE_LIMIT_5H_USD": "1e-1000",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_model_credential_rejects_invalid_subscription_metadata(self):
+        base = {
+            "user_id": 51, "user_created": False, "key_id": 82,
+            "key_created": False, "key": "sk-test", "group_id": 7,
+        }
+        for overrides in (
+            {"subscription_id": True},
+            {"subscription_id": "9001"},
+            {"subscription_created": 1},
+        ):
+            response = self.call_model_credential("worker@example.com", lambda request, values=overrides:
+                httpx.Response(200, json={**base, **values}))
+            self.assertEqual(response.status_code, 502, response.text)
+            self.assertEqual(response.json()["detail"], "模型服务返回内容无效，请联系管理员")
 
     def test_model_credential_maps_sub2api_errors_and_denies_reviewer(self):
         cases = (
@@ -336,6 +415,7 @@ class ZaochangAuthTest(unittest.TestCase):
             "QO_SUB2API_PROVISION_KEY": "adm_sc_test_0123456789abcdef",
             "QO_SUB2API_DEFAULT_GROUP_ID": "7",
             "QO_SUB2API_KEY_NAME": "qiongyu-office",
+            "QO_SUB2API_RATE_LIMIT_5H_USD": "20",
         }
         with patch.object(sub2api, "DEMO", False), patch.dict(os.environ, good, clear=False):
             sub2api.validate_config()
@@ -353,6 +433,31 @@ class ZaochangAuthTest(unittest.TestCase):
                     sub2api.validate_config()
             with patch.dict(os.environ, {"QO_SUB2API_PROVISION_KEY": "  adm_sc_test_key  "}, clear=False):
                 sub2api.validate_config()
+        missing_limit = {key: value for key, value in good.items() if key != "QO_SUB2API_RATE_LIMIT_5H_USD"}
+        with patch.object(sub2api, "DEMO", False), patch.dict(os.environ, missing_limit, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "QO_SUB2API_RATE_LIMIT_5H_USD"):
+                sub2api.validate_config()
+        for name, values in (
+            ("QO_SUB2API_RATE_LIMIT_5H_USD", ("-1", "nan", "inf", "100000.1", "not-a-number", "10_0")),
+            ("QO_SUB2API_RATE_LIMIT_1D_USD", ("-1", "nan", "inf", "100000.1", "not-a-number", "10_0")),
+            ("QO_SUB2API_RATE_LIMIT_7D_USD", ("-1", "nan", "inf", "100000.1", "not-a-number", "10_0")),
+        ):
+            for value in values:
+                with patch.object(sub2api, "DEMO", False), patch.dict(os.environ, {**good, name: value}, clear=True):
+                    with self.assertRaisesRegex(RuntimeError, name):
+                        sub2api.validate_config()
+
+    def test_missing_sub2api_5h_limit_fails_app_startup(self):
+        startup_env = {
+            "QO_SUB2API_URL": "https://aethernettech.dev",
+            "QO_SUB2API_PROVISION_KEY": "adm_sc_test_0123456789abcdef",
+            "QO_SUB2API_DEFAULT_GROUP_ID": "7",
+            "QO_SUB2API_KEY_NAME": "qiongyu-office",
+        }
+        with (patch.object(sub2api, "DEMO", False), patch.dict(os.environ, startup_env, clear=True)):
+            with self.assertRaisesRegex(RuntimeError, "QO_SUB2API_RATE_LIMIT_5H_USD"):
+                with TestClient(app):
+                    self.fail("enterprise application must reject startup without the 5h limit")
 
     def test_sqlite_legacy_users_and_flows_get_new_columns(self):
         legacy_dir = Path(self.temp.name) / "legacy"

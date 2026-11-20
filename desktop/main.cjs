@@ -7,6 +7,8 @@ const { startLoopbackCallback } = require("./lib/desktop-login.cjs");
 const { createDesktopAgent } = require("./agent.cjs");
 
 app.setName("穹驭办公");
+// 与安装器快捷方式写入的 AppUserModelID(= build.appId)一致，任务栏才会把窗口归到固定的快捷方式并用其图标。
+if (process.platform === "win32") app.setAppUserModelId("com.qiongyutech.office");
 app.setPath("userData", path.join(app.getPath("appData"), "QiongyuOffice"));
 let window;
 let origin;
@@ -154,6 +156,7 @@ app.whenReady().then(() => {
   window = new BrowserWindow({
     width: 1420, height: 960, minWidth: 780, minHeight: 570,
     title: "穹驭办公", backgroundColor: "#ffffff", autoHideMenuBar: true,
+    icon: path.join(__dirname, "office.ico"),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true, nodeIntegration: false, sandbox: true,

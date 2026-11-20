@@ -18,7 +18,7 @@ test("运行时裁剪只匹配指定的开发期文件后缀", async () => {
 
 test("electron-builder 配置指向 7z 运行时并保留 NSIS 默认压缩类型", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(DESKTOP_ROOT, "package.json"), "utf8"));
-  assert.equal(packageJson.version, "0.2.1");
+  assert.equal(packageJson.version, "0.2.2");
   assert.deepEqual(packageJson.build.extraResources, [{ from: "runtime-stage/qo-runtime.7z", to: "qo-runtime.7z" }]);
   assert.deepEqual(packageJson.build.electronLanguages, ["zh-CN", "en-US"]);
   assert.equal(packageJson.build.nsis.oneClick, false);
@@ -72,4 +72,19 @@ function readBmp(fileName, expectedWidth, expectedHeight) {
 test("安装器侧栏和页眉为指定尺寸的无压缩 24 位 BMP", () => {
   readBmp("installerSidebar.bmp", 164, 314);
   readBmp("installerHeader.bmp", 150, 57);
+});
+
+test("exe 写入穹驭图标与版本信息，窗口和任务栏使用同一图标", () => {
+  const packageJson = JSON.parse(fs.readFileSync(path.join(DESKTOP_ROOT, "package.json"), "utf8"));
+  // signAndEditExecutable=false 会让 electron-builder 跳过改写 exe 资源，exe 保留 Electron 默认图标(任务栏/快捷方式都显示原子图标)。
+  assert.equal(packageJson.build.win.signAndEditExecutable, true);
+  assert.equal(packageJson.build.win.icon, "office.ico");
+  assert.ok(packageJson.build.files.includes("office.ico"), "office.ico 必须打进 app.asar，窗口图标才能加载");
+  const icon = fs.readFileSync(path.join(DESKTOP_ROOT, "office.ico"));
+  assert.equal(icon.readUInt16LE(2), 1, "office.ico 必须是 ICO");
+  const sizes = Array.from({ length: icon.readUInt16LE(4) }, (_, index) => icon[6 + 16 * index] || 256);
+  assert.ok(sizes.includes(256) && sizes.includes(32) && sizes.includes(16), `office.ico 尺寸不全: ${sizes}`);
+  const main = fs.readFileSync(path.join(DESKTOP_ROOT, "main.cjs"), "utf8");
+  assert.match(main, /icon: path\.join\(__dirname, "office\.ico"\)/);
+  assert.ok(main.includes(`app.setAppUserModelId("${packageJson.build.appId}")`), "AppUserModelID 必须等于 build.appId");
 });
