@@ -153,7 +153,7 @@ app.whenReady().then(() => {
   try { origin = config(); } catch { origin = undefined; }
   window = new BrowserWindow({
     width: 1420, height: 960, minWidth: 780, minHeight: 570,
-    title: "穹驭办公", backgroundColor: "#fffefa", autoHideMenuBar: true,
+    title: "穹驭办公", backgroundColor: "#ffffff", autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true, nodeIntegration: false, sandbox: true,
