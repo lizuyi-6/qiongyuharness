@@ -5,7 +5,7 @@ const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
 const RESPONSE_LIMIT = 3 * 1024 * 1024;
-const MAX_CALLS = 12;
+const MAX_CALLS = 32;
 // 不再自设输出上限：表内模型按其官方单次输出上限下发 max_tokens（2026-11-20 查官方/公开文档，
 // 并在线上以该值实测上游返回 200）；表外模型不下发 max_tokens，由上游默认值决定。
 // 显式下发而不是省略，是因为 sub2api 转 Anthropic 协议上游时，缺省会补 8192。

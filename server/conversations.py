@@ -865,8 +865,6 @@ def store_turn_image_route(key: str, run: str, payload: TurnImage, user: User):
             fail(409, "本轮执行已结束")
         result = unpack(turn["result"] or "{}")
         images = result.setdefault("images", [])
-        if len(images) >= 3:
-            fail(409, "本轮生图次数已达上限（3 张）")
         index = len(images) + 1
         file_id = add_file(db, user["id"], safe_name(f"AI配图-{index}") + ".png", data, "png", "image",
                            assignment=assignment, run=run)

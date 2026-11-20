@@ -9,7 +9,7 @@ import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm
 import { abortOrphanTurn, applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeComposerPickers,
   closeSlashMenu, copyReply, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
   loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
-  removeSource, resetChatState, retryTurn, runDesktopAgent, saveImageAutoPreference, savePptImageAutoPreference,
+  removeSource, resetChatState, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
   showSources, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
   syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer,
@@ -798,11 +798,6 @@ document.addEventListener("input", (event) => {
 document.addEventListener("change", (event) => {
   if (event.target.matches("[name=allow_ai_images]")) {
     saveImageAutoPreference(event.target.checked);
-    syncImageAutoIndicator();
-    return;
-  }
-  if (event.target.matches("[name=allow_ppt_images]")) {
-    savePptImageAutoPreference(event.target.checked);
     syncImageAutoIndicator();
     return;
   }

@@ -49,9 +49,11 @@ async function readBody(request) {
   }
 }
 
-async function createImageBroker({ generate, model, maxImages = 2, deadlineAt, now = Date.now }) {
+async function createImageBroker({ generate, model, maxImages = null, deadlineAt, now = Date.now }) {
+  const hasLimit = Number.isInteger(maxImages) && maxImages >= 1;
+  const validLimit = maxImages === null || maxImages === undefined || maxImages === 0 || maxImages === Infinity || hasLimit;
   if (typeof generate !== "function" || typeof model !== "string" || !/^gpt-image-/.test(model) ||
-      !Number.isInteger(maxImages) || maxImages < 1 || !Number.isFinite(deadlineAt) || typeof now !== "function") {
+      !validLimit || !Number.isFinite(deadlineAt) || typeof now !== "function") {
     throw new TypeError("生图 broker 参数无效");
   }
   const key = randomBytes(32).toString("base64url");
@@ -91,7 +93,7 @@ async function createImageBroker({ generate, model, maxImages = 2, deadlineAt, n
       json(response, 429, { ok: false, message: "上一张图片还在生成" });
       return;
     }
-    if (attempts >= maxImages) {
+    if (hasLimit && attempts >= maxImages) {
       json(response, 409, { ok: false, message: `本轮生图次数已达上限（${maxImages} 张）` });
       return;
     }

@@ -6,8 +6,7 @@ import { renderMarkdown } from "./markdown.js";
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
 const PIPELINE_MODEL = "qo:pipeline";
-const imageAutoPreferenceKey = "qo/chat/allow-ai-images";
-const pptImageAutoPreferenceKey = "qo/chat/allow-ppt-images";
+const imageAutoPreferenceKey = "qo/chat/allow-agent-images";
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 let usageRequestId = 0;
 
@@ -86,7 +85,7 @@ function sessionSignature(session) {
   ]);
 }
 
-// AI 自行生图按张计费：缺省关闭，由员工本人勾选开启；按账号分开记忆，避免共用电脑时沿用他人的选择。
+// 默认允许 AI 按需自动生图（不设张数上限，按张计费），员工可随时手动关闭；按账号分开记忆。
 function imageAutoPreferenceStorageKey() {
   return state.me?.id ? `${imageAutoPreferenceKey}/${state.me.id}` : "";
 }
@@ -94,36 +93,15 @@ function imageAutoPreferenceStorageKey() {
 export function imageAutoPreference() {
   try {
     const key = imageAutoPreferenceStorageKey();
-    return Boolean(key) && localStorage.getItem(key) === "true";
-  } catch {
-    return false;
-  }
-}
-
-export function saveImageAutoPreference(value) {
-  try {
-    const key = imageAutoPreferenceStorageKey();
-    if (key) localStorage.setItem(key, value ? "true" : "false");
-  } catch {}
-}
-
-function pptImageAutoPreferenceStorageKey() {
-  return state.me?.id ? `${pptImageAutoPreferenceKey}/${state.me.id}` : "";
-}
-
-// 制作 PPT 时默认开启自动配图（1-3 张，按张计费），员工可随时手动关闭。
-export function pptImageAutoPreference() {
-  try {
-    const key = pptImageAutoPreferenceStorageKey();
     return !key || localStorage.getItem(key) !== "false";
   } catch {
     return true;
   }
 }
 
-export function savePptImageAutoPreference(value) {
+export function saveImageAutoPreference(value) {
   try {
-    const key = pptImageAutoPreferenceStorageKey();
+    const key = imageAutoPreferenceStorageKey();
     if (key) localStorage.setItem(key, value ? "true" : "false");
   } catch {}
 }
@@ -712,7 +690,7 @@ function syncComposerModelsDom(workspace) {
   }
   const showImageControls = clientExecutionRequired() && typeof window.officeDesktop?.runAgent === "function" && (workspace.image_models?.length > 0);
   if (showImageControls && !form.querySelector("[data-image-toggle]")) {
-    const imageAutoOn = imageAutoPreference() || pptImageAutoPreference();
+    const imageAutoOn = imageAutoPreference();
     const drawerOpen = Boolean(state.imageDrawerOpen);
     const sep = form.querySelector(".composer-tools .composer-sep");
     const btnHtml = `<button type="button" class="composer-tool ${drawerOpen ? "active" : ""} ${imageAutoOn ? "dot-active" : ""}" data-act="toggle-image-drawer" data-image-toggle aria-expanded="${drawerOpen ? "true" : "false"}" title="图片生成设置" aria-label="图片生成设置">${icon("image")}</button>`;
@@ -731,10 +709,8 @@ function syncComposerModelsDom(workspace) {
             </select></label>
             ${button("生成图片", "chat-generate-image", { cls: "sm", icon: "image", disabled: Boolean(form.dataset.busy) })}
           </div>
-          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ppt_images" ${pptImageAutoPreference() ? "checked" : ""}>
-            <span>制作 PPT 时自动配图（1–3 张，按张计费）</span></label>
           <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ai_images" ${imageAutoPreference() ? "checked" : ""}>
-            <span>普通对话允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>
+            <span>允许 AI 按需自动生图（不限张数，按张计费）</span></label>
         </div>
       </div>
     </div>`;
@@ -1230,7 +1206,7 @@ function composer(workspace) {
   const modelRequired = desktopRequired && desktopAvailable;
   const imageModels = workspace.image_models || [];
   const showImageControls = desktopRequired && desktopAvailable && imageModels.length > 0;
-  const imageAutoOn = showImageControls && (imageAutoPreference() || pptImageAutoPreference());
+  const imageAutoOn = showImageControls && imageAutoPreference();
   const drawerOpen = showImageControls && Boolean(state.imageDrawerOpen);
   const selectedCount = (draft.selected || []).length;
   const draftText = draft.message || "";
@@ -1283,10 +1259,8 @@ function composer(workspace) {
             </select></label>
             ${button("生成图片", "chat-generate-image", { cls: "sm", icon: "image", disabled: blocked })}
           </div>
-          <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ppt_images" ${pptImageAutoPreference() ? "checked" : ""}>
-            <span>制作 PPT 时自动配图（1–3 张，按张计费）</span></label>
           <label class="image-auto-option" data-image-auto-wrap><input type="checkbox" name="allow_ai_images" ${imageAutoPreference() ? "checked" : ""}>
-            <span>普通对话允许 AI 自动生图（每轮最多 2 张，按张计费）</span></label>
+            <span>允许 AI 按需自动生图（不限张数，按张计费）</span></label>
         </div>
       </div>
     </div>` : ""}
@@ -1381,9 +1355,8 @@ export function syncImageAutoIndicator() {
   const form = chatForm();
   const toggleBtn = form?.querySelector("[data-image-toggle]");
   const checkbox = form?.elements?.allow_ai_images;
-  const pptCheckbox = form?.elements?.allow_ppt_images;
   if (toggleBtn) {
-    toggleBtn.classList.toggle("dot-active", Boolean(checkbox?.checked || pptCheckbox?.checked));
+    toggleBtn.classList.toggle("dot-active", Boolean(checkbox ? checkbox.checked : imageAutoPreference()));
   }
 }
 
@@ -1955,7 +1928,7 @@ export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result
   }
 }
 
-async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = false, allowPptImages = true } = {}) {
+async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = true } = {}) {
   const desktop = window.officeDesktop;
   if (typeof desktop?.runAgent !== "function") throw new Error("请在桌面客户端中使用 AI 办理");
   const model = workspace.selectedModel;
@@ -1983,12 +1956,11 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
     }
     setLiveStatus(live, "正在调用模型…", { canvasLabel: "正在调用模型…" });
     live.phase = "agent";
-    const usePptImages = Boolean(prepared.wants_pptx) && allowPptImages === true;
-    const enableImageTool = Boolean(workspace.image_models?.length) && (usePptImages || allowImageTool === true);
+    const enableImageTool = Boolean(workspace.image_models?.length) && allowImageTool === true;
     const job = {
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
       ...(prepared.wants_pptx ? { ppt_check: true } : {}),
-      ...(enableImageTool ? { image_tool: true, max_images: usePptImages ? 3 : 2 } : {})
+      ...(enableImageTool ? { image_tool: true } : {})
     };
     return await runDesktopAgent(job, (label) => {
       if (typeof label !== "string" || !label) return;
@@ -2294,8 +2266,7 @@ export async function sendMessage(form, rerender) {
   emitConversationsUpdated();
 
   const initialInView = () => form.isConnected && state.me?.id === user;
-  const allowAiImages = form.elements.allow_ai_images?.checked === true;
-  const allowPptImages = form.elements.allow_ppt_images ? form.elements.allow_ppt_images.checked === true : pptImageAutoPreference();
+  const allowAiImages = form.elements.allow_ai_images ? form.elements.allow_ai_images.checked === true : imageAutoPreference();
   setComposerLocked(form, true, workspace);
   try {
     if (!workspace.session) {
@@ -2322,7 +2293,7 @@ export async function sendMessage(form, rerender) {
     }
     let completed;
     if (clientExecutionRequired()) {
-      completed = await executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool: allowAiImages, allowPptImages });
+      completed = await executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool: allowAiImages });
     } else {
       const controller = new AbortController();
       live.cancel = async () => { controller.abort(); };

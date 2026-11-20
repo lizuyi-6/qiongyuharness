@@ -44,7 +44,7 @@ function responseError(payload, status) {
 const PIPELINE_ROLES = ["understand", "execute", "accept", "review", "light"];
 const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
 const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
-const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：当制作 PPT 需要封面主视觉或关键配图，或用户明确需要图片时调用 office_image_generate（按张计费，遵守本轮张数上限）；制作 PPT 时提示词强调画面无文字，并用返回的 image_index 填入 deck.slides 的 bg_image 或 image 元素；不要在 reply 文字中输出图片链接、Markdown 图片或 base64；纯文字问答不要调用。";
+const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：当制作 PPT 需要封面主视觉、章节过渡或关键配图，或用户明确需要图片时，可按需调用 office_image_generate（按张计费，不限张数）；制作 PPT 时提示词强调画面无文字，并用返回的 image_index 填入 deck.slides 的 bg_image 或 image 元素；不要在 reply 文字中输出图片链接、Markdown 图片或 base64；不需要配图的纯文字问答不要调用。";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -343,7 +343,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     const imageModels = available.filter((model) => model.startsWith("gpt-image-")).sort((a, b) => a.localeCompare(b));
     const imageToolEnabled = job.image_tool === true && imageModels.length > 0;
     const pptCheckEnabled = job.ppt_check === true;
-    const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 && job.max_images <= 3 ? job.max_images : 2;
+    const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 ? job.max_images : null;
     const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
     ensureNotAborted();
     const { credential } = await getCredentialImpl(origin);
@@ -535,7 +535,8 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           emit,
           now: clockNow,
           startedAt,
-          signal
+          signal,
+          getGeneratedImageCount: () => imageBroker?.images.length || 0
         });
         return {
           ...pipelineResult,

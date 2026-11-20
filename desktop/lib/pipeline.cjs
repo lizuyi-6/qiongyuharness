@@ -22,47 +22,91 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const cleaned = text.replace(/,\s*([}\]])/g, "$1");
+    if (cleaned !== text) {
+      try {
+        return JSON.parse(cleaned);
+      } catch {}
+    }
+    return undefined;
+  }
+}
+
 function parseJsonObject(value) {
   if (typeof value !== "string") throw new Error("响应不是文本");
-  const parsed = JSON.parse(value);
-  if (!isObject(parsed)) throw new Error("响应必须是 JSON 对象");
-  return parsed;
+  const trimmed = value.trim();
+  const candidates = [];
+  const unfenced = trimmed.replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+  candidates.push(trimmed);
+  if (unfenced !== trimmed) candidates.push(unfenced);
+  const fenceMatches = trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi);
+  for (const match of fenceMatches) {
+    if (match[1]?.trim()) candidates.push(match[1].trim());
+  }
+  const firstBrace = unfenced.indexOf("{");
+  const lastBrace = unfenced.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(unfenced.slice(firstBrace, lastBrace + 1));
+  }
+  for (const candidate of candidates) {
+    const parsed = tryParseJson(candidate);
+    if (isObject(parsed)) return parsed;
+  }
+  throw new Error("响应必须是有效 JSON 对象");
 }
 
 function parseBrief(value) {
   const parsed = parseJsonObject(value);
-  if (!new Set(["light", "standard", "critical"]).has(parsed.tier) ||
-      typeof parsed.goal !== "string" || parsed.goal.length > 500 ||
-      !Array.isArray(parsed.constraints) || parsed.constraints.length > 12 ||
-      !Array.isArray(parsed.acceptance) || parsed.acceptance.length > 12 ||
-      [...parsed.constraints, ...parsed.acceptance].some((item) => typeof item !== "string" || item.length > 500)) {
+  const tier = new Set(["light", "standard", "critical"]).has(parsed.tier) ? parsed.tier : "";
+  const goal = typeof parsed.goal === "string" ? parsed.goal.trim().slice(0, 500) : "";
+  const constraints = Array.isArray(parsed.constraints)
+    ? parsed.constraints.filter((item) => typeof item === "string" && item.trim()).slice(0, 12).map((item) => item.trim().slice(0, 500))
+    : null;
+  const acceptance = Array.isArray(parsed.acceptance)
+    ? parsed.acceptance.filter((item) => typeof item === "string" && item.trim()).slice(0, 12).map((item) => item.trim().slice(0, 500))
+    : null;
+  if (!tier || !goal || !constraints || !acceptance) {
     throw new Error("理解结果字段不符合约定");
   }
   return {
-    tier: parsed.tier,
-    goal: parsed.goal,
-    constraints: parsed.constraints,
-    acceptance: parsed.acceptance
+    tier,
+    goal,
+    constraints,
+    acceptance
   };
 }
 
 function parseDeliverable(value) {
   const parsed = parseJsonObject(value);
+  const hasArtifact = isObject(parsed.deck) || isObject(parsed.plan) || Array.isArray(parsed.slides);
   if (typeof parsed.reply !== "string" || !parsed.reply.trim()) {
-    throw new Error("交付结果缺少 reply 字符串");
+    if (hasArtifact) {
+      const title = parsed.deck?.title || parsed.plan?.title || parsed.title || "";
+      parsed.reply = title ? `已为你生成《${String(title).trim().slice(0, 80)}》。` : "已按要求完成生成。";
+    } else {
+      throw new Error("交付结果缺少 reply 字符串");
+    }
   }
   return parsed;
 }
 
 function parseAssessment(value) {
   const parsed = parseJsonObject(value);
-  if (!new Set(["pass", "fail"]).has(parsed.verdict) ||
-      !Array.isArray(parsed.issues) || parsed.issues.length > 10 ||
-      parsed.issues.some((item) => typeof item !== "string" || !item.trim() || item.length > 300) ||
-      typeof parsed.summary !== "string" || parsed.summary.length > 500) {
+  const verdict = new Set(["pass", "fail"]).has(parsed.verdict) ? parsed.verdict : "";
+  const rawIssues = Array.isArray(parsed.issues) ? parsed.issues : null;
+  const summary = typeof parsed.summary === "string" ? parsed.summary.trim().slice(0, 500) : "";
+  if (!verdict || !rawIssues) {
     throw new Error("验收结果字段不符合约定");
   }
-  return { verdict: parsed.verdict, issues: parsed.issues, summary: parsed.summary };
+  const issues = rawIssues
+    .map((item) => (typeof item === "string" ? item.trim().slice(0, 300) : ""))
+    .filter(Boolean)
+    .slice(0, 10);
+  return { verdict, issues, summary };
 }
 
 function roleError(role, model) {
@@ -108,7 +152,8 @@ function runPipeline({
   emit = () => {},
   now = Date.now,
   startedAt = now(),
-  signal
+  signal,
+  getGeneratedImageCount = () => 0
 }) {
   return (async () => {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" ||
@@ -164,6 +209,7 @@ function runPipeline({
 
     async function callValidatedStage({ role, model, system, prompt, withContext, withImages = false, parser }) {
       let currentPrompt = prompt;
+      let stageWithImages = withImages;
       for (let attempt = 0; attempt < 2; attempt += 1) {
         ensureNotAborted();
         if (!canStartStage()) return { stopped: true, stopReason };
@@ -171,7 +217,7 @@ function runPipeline({
         calls += 1;
         let result;
         try {
-          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, withImages, timeoutMs, signal });
+          result = await runStage({ role, model, system, prompt: currentPrompt, withContext, withImages: stageWithImages, timeoutMs, signal });
         } catch (error) {
           if (error?.code === "ABORTED" || signal?.aborted) throw Object.assign(new Error("已停止生成"), { code: "ABORTED" });
           if (error?.quota_error) throw error;
@@ -184,12 +230,17 @@ function runPipeline({
         try {
           const parsed = parser(result?.text);
           stages.push({ role, model, outcome: role === "accept" || role === "review" ? parsed.verdict : "ok", usage });
-          return { parsed, text: result.text };
+          return { parsed, text: JSON.stringify(parsed) };
         } catch (error) {
           stages.push({ role, model, outcome: "format_error", usage });
           if (attempt === 1) return { formatFailure: true };
           emit({ type: "step", label: "程序校验：格式有误，正在修复" });
-          currentPrompt = `${prompt}\n\n程序校验错误：${formatIssue(error)}。请修正格式后只返回符合约定的 JSON，不要添加解释。`;
+          const imageCount = Number(getGeneratedImageCount()) || 0;
+          const imageReuseNote = stageWithImages && imageCount > 0
+            ? ` 本轮已生成 ${imageCount} 张图片（image_index 为 1 至 ${imageCount}），请直接复用已有 image_index，不要重新生图。`
+            : "";
+          if (imageCount > 0) stageWithImages = false;
+          currentPrompt = `${prompt}\n\n程序校验错误：${formatIssue(error)}。${imageReuseNote}请修正格式后只返回符合约定的单个 JSON 对象，不要使用代码围栏或添加解释。`;
           if (!canStartStage()) return { formatFailure: true, stopped: true, stopReason };
         }
       }
