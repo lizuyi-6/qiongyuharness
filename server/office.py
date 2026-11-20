@@ -520,50 +520,135 @@ def powerpoint(plan):
 HEX_COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
 SLIDE_W = 13.333
 SLIDE_H = 7.5
+_ELEMENT_TYPE_ALIASES = {
+    "rect": "rect",
+    "rectangle": "rect",
+    "box": "rect",
+    "bar": "rect",
+    "block": "rect",
+    "shape": "rect",
+    "round_rect": "round_rect",
+    "rounded_rect": "round_rect",
+    "rounded_rectangle": "round_rect",
+    "roundrect": "round_rect",
+    "card": "round_rect",
+    "pill": "round_rect",
+    "badge": "round_rect",
+    "tag": "round_rect",
+    "ellipse": "ellipse",
+    "oval": "ellipse",
+    "circle": "ellipse",
+    "dot": "ellipse",
+    "line": "line",
+    "divider": "line",
+    "rule": "line",
+    "separator": "line",
+    "connector": "line",
+    "arrow": "line",
+    "text": "text",
+    "textbox": "text",
+    "label": "text",
+    "heading": "text",
+    "title": "text",
+    "paragraph": "text",
+    "image": "image",
+    "img": "image",
+    "picture": "image",
+    "photo": "image",
+    "table": "table",
+}
+
+
+def _to_float(value: Any, default: float) -> float:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) else default
+    if isinstance(value, str):
+        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        if match:
+            num = float(match.group(0))
+            return num if math.isfinite(num) else default
+    return default
+
+
+def _to_int(value: Any, default: int | None = None) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return int(round(value))
+    if isinstance(value, str):
+        match = re.search(r"\d+", value)
+        if match:
+            return int(match.group(0))
+    return default
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def _coerce_opacity(value: Any, default: float | None = None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return default
+    num = _to_float(value, -1.0)
+    if num < 0:
+        return default
+    if num > 1.0:
+        num = num / 100.0
+    return _clamp(num, 0.0, 1.0)
+
+
+def _coerce_str(value: Any, limit: int = 2000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = "\n".join(_coerce_str(item, limit) for item in value if item is not None)
+    text = str(value)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", "", text).strip()
+    return text[:limit]
 
 
 class OverlaySpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
     color: str = "#000000"
-    opacity: float = Field(default=0.45, ge=0.0, le=1.0)
+    opacity: float = 0.45
 
 
 class DeckDesign(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    concept: str = Field(default="", max_length=300)
+    concept: str = ""
     palette: dict[str, str] = Field(default_factory=dict)
-    font: str = Field(default="Microsoft YaHei", max_length=60)
+    font: str = "Microsoft YaHei"
 
 
 class SlideElement(BaseModel):
     model_config = ConfigDict(extra="ignore")
     type: Literal["rect", "round_rect", "ellipse", "line", "text", "image", "table"]
-    x: float = Field(default=0.0, ge=-1.0, le=14.0)
-    y: float = Field(default=0.0, ge=-1.0, le=8.5)
-    w: float = Field(default=1.0, gt=0.0, le=15.0)
-    h: float = Field(default=0.5, gt=0.0, le=9.0)
-    # 图形属性
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 0.5
     fill: str | None = None
-    opacity: float | None = Field(default=None, ge=0.0, le=1.0)
+    opacity: float | None = None
     border: str | None = None
-    border_width: float = Field(default=1.0, ge=0.0, le=12.0)
-    radius: float | None = Field(default=None, ge=0.0, le=0.5)
-    # 文本属性
-    text: str | None = Field(default=None, max_length=2000)
-    size: float = Field(default=16.0, ge=8.0, le=120.0)
+    border_width: float = 1.0
+    radius: float | None = None
+    text: str | None = None
+    size: float = 16.0
     bold: bool = False
     italic: bool = False
     color: str | None = None
-    font: str | None = Field(default=None, max_length=60)
+    font: str | None = None
     align: Literal["left", "center", "right"] = "left"
     valign: Literal["top", "middle", "bottom"] = "top"
-    line_spacing: float = Field(default=1.25, ge=0.9, le=2.4)
-    # 图片属性（引用本轮生图 1-based 序号）
-    image_index: int | None = Field(default=None, ge=1, le=12)
+    line_spacing: float = 1.25
+    image_index: int | None = None
     fit: Literal["cover", "contain"] = "cover"
-    # 表格属性
-    columns: list[str] | None = Field(default=None, max_length=8)
-    rows: list[list[str]] | None = Field(default=None, max_length=14)
+    columns: list[str] | None = None
+    rows: list[list[str]] | None = None
     header_fill: str | None = None
     header_color: str | None = None
     row_fill: str | None = None
@@ -574,28 +659,181 @@ class SlideElement(BaseModel):
 
 class FreeSlide(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    title: str = Field(default="", max_length=100)
+    title: str = ""
     bg: str = "#FFFFFF"
-    bg_image: int | None = Field(default=None, ge=1, le=12)
+    bg_image: int | None = None
     bg_overlay: OverlaySpec | None = None
-    notes: str = Field(default="", max_length=2000)
-    elements: list[SlideElement] = Field(default_factory=list, max_length=120)
+    notes: str = ""
+    elements: list[SlideElement] = Field(default_factory=list)
 
 
 class DeckSpec(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    title: str = Field(min_length=1, max_length=110)
-    subtitle: str = Field(default="", max_length=140)
+    title: str = "演示文稿"
+    subtitle: str = ""
     design: DeckDesign = Field(default_factory=DeckDesign)
     slides: list[FreeSlide] = Field(min_length=1, max_length=30)
 
     def clean(self):
         return DeckSpec(
-            title=clean_text(self.title, 110),
-            subtitle=clean_text(self.subtitle, 140, False),
+            title=_coerce_str(self.title, 110) or "演示文稿",
+            subtitle=_coerce_str(self.subtitle, 140),
             design=self.design,
             slides=self.slides,
         )
+
+
+def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec:
+    """对 AI 输出的自由画布 JSON 做强容错归一化，避免因轻微越界、null 值或别名导致整份 PPT 失败。"""
+    if not isinstance(raw, dict):
+        fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
+    raw_slides = raw.get("slides")
+    if not isinstance(raw_slides, list) or not raw_slides:
+        fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
+
+    raw_design = raw.get("design") if isinstance(raw.get("design"), dict) else {}
+    raw_palette = raw_design.get("palette") if isinstance(raw_design.get("palette"), dict) else {}
+    palette = {
+        str(k): v.strip()
+        for k, v in raw_palette.items()
+        if isinstance(v, str) and parse_hex_color(v)
+    }
+    design = DeckDesign(
+        concept=_coerce_str(raw_design.get("concept"), 300),
+        palette=palette,
+        font=_coerce_str(raw_design.get("font"), 60) or "Microsoft YaHei",
+    )
+
+    slides: list[FreeSlide] = []
+    for s_idx, item in enumerate(raw_slides[:30]):
+        if not isinstance(item, dict):
+            continue
+        raw_bg = item.get("bg")
+        if isinstance(raw_bg, dict):
+            raw_bg = raw_bg.get("color") or raw_bg.get("fill")
+        bg = raw_bg.strip() if isinstance(raw_bg, str) and parse_hex_color(raw_bg) else (palette.get("bg") or "#FFFFFF")
+
+        bg_image = _to_int(item.get("bg_image"))
+        if bg_image is not None and not (1 <= bg_image <= 12):
+            bg_image = None
+
+        raw_ov = item.get("bg_overlay")
+        bg_overlay = None
+        if isinstance(raw_ov, dict):
+            ov_color = raw_ov.get("color") if isinstance(raw_ov.get("color"), str) and parse_hex_color(raw_ov.get("color")) else bg
+            ov_opacity = _coerce_opacity(raw_ov.get("opacity"), 0.5)
+            bg_overlay = OverlaySpec(color=ov_color, opacity=ov_opacity if ov_opacity is not None else 0.5)
+        elif isinstance(raw_ov, str) and parse_hex_color(raw_ov):
+            bg_overlay = OverlaySpec(color=raw_ov.strip(), opacity=0.5)
+
+        elements: list[SlideElement] = []
+        raw_elements = item.get("elements") if isinstance(item.get("elements"), list) else []
+        for el in raw_elements[:120]:
+            if not isinstance(el, dict):
+                continue
+            raw_type = str(el.get("type") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            el_type = _ELEMENT_TYPE_ALIASES.get(raw_type)
+            if not el_type:
+                continue
+            x = _clamp(_to_float(el.get("x"), 0.0), -2.0, 15.0)
+            y = _clamp(_to_float(el.get("y"), 0.0), -2.0, 9.5)
+            w = _clamp(_to_float(el.get("w", el.get("width")), 1.0), 0.015, 16.0)
+            h = _clamp(_to_float(el.get("h", el.get("height")), 0.02 if el_type == "line" else 0.5), 0.015, 10.0)
+            if el_type == "line" and el.get("x2") is not None and el.get("y2") is not None:
+                x2 = _to_float(el.get("x2"), x + w)
+                y2 = _to_float(el.get("y2"), y)
+                x, y = min(x, x2), min(y, y2)
+                w = _clamp(abs(x2 - x), 0.015, 16.0)
+                h = _clamp(abs(y2 - y), 0.015, 10.0)
+
+            radius = None
+            if el.get("radius") is not None:
+                r_val = _to_float(el.get("radius"), 0.1)
+                if r_val > 0.5:
+                    r_val = min(0.5, r_val / max(1.0, min(w, h) * 72.0))
+                radius = _clamp(r_val, 0.0, 0.5)
+
+            align_raw = str(el.get("align") or "left").strip().lower()
+            align = align_raw if align_raw in {"left", "center", "right"} else "left"
+            valign_raw = str(el.get("valign") or "top").strip().lower()
+            if valign_raw == "center":
+                valign_raw = "middle"
+            valign = valign_raw if valign_raw in {"top", "middle", "bottom"} else "top"
+            fit_raw = str(el.get("fit") or "cover").strip().lower()
+            fit = fit_raw if fit_raw in {"cover", "contain"} else "cover"
+
+            img_idx = _to_int(el.get("image_index", el.get("index")))
+            if img_idx is not None and not (1 <= img_idx <= 12):
+                img_idx = None
+
+            cols = None
+            rows = None
+            if el_type == "table":
+                raw_cols = el.get("columns")
+                raw_rows = el.get("rows")
+                if isinstance(raw_cols, list) and raw_cols:
+                    cols = [_coerce_str(c, 60) for c in raw_cols[:8]]
+                if isinstance(raw_rows, list):
+                    rows = [
+                        [_coerce_str(cell, 160) for cell in row[:8]]
+                        for row in raw_rows[:14]
+                        if isinstance(row, list)
+                    ]
+
+            raw_text = el.get("text")
+            text_val = _coerce_str(raw_text, 2000) if raw_text is not None else None
+            if el_type == "text" and not text_val:
+                continue
+
+            elements.append(SlideElement(
+                type=el_type,
+                x=x,
+                y=y,
+                w=w,
+                h=h,
+                fill=el.get("fill") if isinstance(el.get("fill"), str) else None,
+                opacity=_coerce_opacity(el.get("opacity")),
+                border=el.get("border") if isinstance(el.get("border"), str) else (el.get("stroke") if isinstance(el.get("stroke"), str) else None),
+                border_width=_clamp(_to_float(el.get("border_width", el.get("stroke_width")), 1.0), 0.0, 12.0),
+                radius=radius,
+                text=text_val,
+                size=_clamp(_to_float(el.get("size", el.get("font_size")), 16.0), 8.0, 120.0),
+                bold=bool(el.get("bold") or str(el.get("font_weight") or "").lower() in {"bold", "600", "700", "800"}),
+                italic=bool(el.get("italic")),
+                color=el.get("color") if isinstance(el.get("color"), str) else None,
+                font=_coerce_str(el.get("font"), 60) or None,
+                align=align,
+                valign=valign,
+                line_spacing=_clamp(_to_float(el.get("line_spacing"), 1.25), 0.9, 2.4),
+                image_index=img_idx,
+                fit=fit,
+                columns=cols,
+                rows=rows,
+                header_fill=el.get("header_fill") if isinstance(el.get("header_fill"), str) else None,
+                header_color=el.get("header_color") if isinstance(el.get("header_color"), str) else None,
+                row_fill=el.get("row_fill") if isinstance(el.get("row_fill"), str) else None,
+                alt_fill=el.get("alt_fill") if isinstance(el.get("alt_fill"), str) else None,
+                text_color=el.get("text_color") if isinstance(el.get("text_color"), str) else None,
+                border_color=el.get("border_color") if isinstance(el.get("border_color"), str) else None,
+            ))
+
+        slides.append(FreeSlide(
+            title=_coerce_str(item.get("title"), 100) or f"第 {s_idx + 1} 页",
+            bg=bg,
+            bg_image=bg_image,
+            bg_overlay=bg_overlay,
+            notes=_coerce_str(item.get("notes"), 2000),
+            elements=elements,
+        ))
+
+    if not slides:
+        fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
+    return DeckSpec(
+        title=_coerce_str(raw.get("title"), 110) or _coerce_str(fallback_title, 110) or "演示文稿",
+        subtitle=_coerce_str(raw.get("subtitle"), 140),
+        design=design,
+        slides=slides,
+    )
 
 
 def parse_hex_color(value: Any, default: str | None = None) -> str | None:

@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from . import gateway, prompting
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
 from .identity import fail
-from .office import DeckSpec, Plan, add_file, clean_text, powerpoint, render_freeform_pptx, safe_name, word
+from .office import DeckSpec, Plan, add_file, clean_text, coerce_deck_spec, powerpoint, render_freeform_pptx, safe_name, word
 from .presentation import Replacement, Selection, edit_scope, pptx_file, revise_slide
 from .projects import project_for, project_sources
 from .store import audit, database, instant, pack, uid, unpack
@@ -43,6 +43,7 @@ class TurnRequest(BaseModel):
 
 
 class Decision(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     action: Literal["reply", "export"]
     reply: str = Field(min_length=1, max_length=6500)
     kind: Literal["docx", "pptx"] | None = None
@@ -379,16 +380,53 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
             "wants_pptx": include_pptx}
 
 
+def _extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.I)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(cleaned[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
+
+
 def parse_turn_response(text, kind):
-    text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.I)
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.I)
     if kind == "slide":
         try:
-            return SlideChange.model_validate_json(text)
-        except ValidationError:
+            return SlideChange.model_validate_json(cleaned)
+        except ValidationError as exc:
+            LOG.warning("SlideChange validation failed: %s", exc)
             fail(502, "模型未返回可执行的文字修改，请重试")
+    data = _extract_json_object(text)
+    raw_kind = str(data.get("kind") or "").strip().lower()
+    if raw_kind in {"ppt", "powerpoint"}:
+        data["kind"] = "pptx"
+    elif raw_kind in {"doc", "word"}:
+        data["kind"] = "docx"
+    raw_deck = data.get("deck")
+    if not isinstance(raw_deck, dict) and isinstance(data.get("plan"), dict) and isinstance(data["plan"].get("slides"), list):
+        raw_deck = data["plan"]
+    if not isinstance(raw_deck, dict) and isinstance(data.get("slides"), list):
+        raw_deck = data
+    if (data.get("action") == "export" or data.get("kind") == "pptx") and isinstance(raw_deck, dict) and isinstance(raw_deck.get("slides"), list):
+        deck = coerce_deck_spec(raw_deck)
+        reply = str(data.get("reply") or "").strip()[:6500] or f"已生成演示文稿《{deck.title}》。"
+        return Decision(action="export", reply=reply, kind="pptx", deck=deck)
     try:
-        return Decision.model_validate_json(text)
-    except ValidationError:
+        return Decision.model_validate(data)
+    except ValidationError as exc:
+        LOG.warning("Decision validation failed: %s", exc)
         fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
 
 
