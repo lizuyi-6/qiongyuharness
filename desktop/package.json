@@ -53,7 +53,8 @@
         "zh_CN"
       ],
       "language": "2052",
-      "multiLanguageInstaller": false,
+      "multiLanguageInstaller": true,
+      "displayLanguageSelector": false,
       "installerSidebar": "installerSidebar.bmp",
       "uninstallerSidebar": "installerSidebar.bmp",
       "installerHeader": "installerHeader.bmp",

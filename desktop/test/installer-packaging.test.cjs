@@ -28,7 +28,11 @@ test("electron-builder 配置指向 7z 运行时并保留 NSIS 默认压缩类�
   assert.equal(packageJson.build.nsis.include, "installer.nsh");
   assert.deepEqual(packageJson.build.nsis.installerLanguages, ["zh_CN"]);
   assert.equal(packageJson.build.nsis.language, "2052");
-  assert.equal(packageJson.build.nsis.multiLanguageInstaller, false);
+  // electron-builder 在 multiLanguageInstaller=false 时会忽略 installerLanguages、强制 en_US(按钮/标题变英文)；
+  // 这里直接用它自己的 LangConfigurator 计算实际写进安装器的语言，并确认不弹语言选择框。
+  const { LangConfigurator } = require("app-builder-lib/out/targets/nsis/nsisLang.js");
+  assert.deepEqual(new LangConfigurator(packageJson.build.nsis).langs, ["zh_CN"]);
+  assert.notEqual(packageJson.build.nsis.displayLanguageSelector, true);
   assert.equal(packageJson.build.nsis.installerSidebar, "installerSidebar.bmp");
   assert.equal(packageJson.build.nsis.uninstallerSidebar, "installerSidebar.bmp");
   assert.equal(packageJson.build.nsis.installerHeader, "installerHeader.bmp");
