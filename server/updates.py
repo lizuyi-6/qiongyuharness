@@ -16,7 +16,7 @@ from .store import DATA
 
 router = APIRouter(prefix="/api/v1/updates")
 
-RELEASES_DIR = Path(os.environ.get("QO_RELEASES_DIR") or (DATA.parent / "releases"))
+RELEASES_DIR = Path(os.environ.get("QO_RELEASES_DIR") or (DATA / "releases"))
 SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.(?:qopatch|exe)$")
 SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
 
