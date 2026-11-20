@@ -361,8 +361,29 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
     operation, genre = prompting.route(body.message, task_fields,
                                        plan.get("title", "") if isinstance(plan, dict) else "",
                                        [item["request"] for item in recent])
-    payload = {"当前请求": body.message, "近期会话": recent, "当前任务": task_fields, "参考资料": sources,
-               "最近文稿": {key: latest[key] for key in ("plan", "kind")} if latest else None, "输出偏好": body.mode}
+    web_search = search.search_status()
+    srv_time = web_search.get("server_time") or search.server_time_snapshot()
+    require_search = bool(web_search["configured"] and web_search["required"])
+    payload = {
+        "当前服务器时间": {
+            "unix_timestamp": srv_time["unix_timestamp"],
+            "iso": srv_time["iso"],
+            "date": srv_time["date"],
+            "year": srv_time["year"],
+            "month": srv_time["month"],
+            "display": srv_time["display"],
+            "搜索与叙事基准": (
+                f"当前服务器真实时间为 {srv_time['year']} 年 {srv_time['month']} 月（今日 {srv_time['date']}，Unix时间戳 {srv_time['unix_timestamp']}）。"
+                f"所有“最新/今年/目前/近期”均指 {srv_time['year']} 年，调用 web_search 检索时必须优先搜索 {srv_time['year']} 年最新进展，严禁将 2024 或 2025 年当作当前年份！"
+            ),
+        },
+        "当前请求": body.message,
+        "近期会话": recent,
+        "当前任务": task_fields,
+        "参考资料": sources,
+        "最近文稿": {key: latest[key] for key in ("plan", "kind")} if latest else None,
+        "输出偏好": body.mode,
+    }
     rules = prompting.checklist(operation, genre)
     if rules:
         payload["写作规范"] = rules
@@ -373,16 +394,19 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
         payload["项目"] = project
         payload["参考资料"] = []
         payload["接入说明"] = "先调用 office_context_read，获取本轮授权资料。"
-    web_search = search.search_status()
-    require_search = bool(web_search["configured"] and web_search["required"])
     return {"kind": "conversation",
             "system": prompting.conversation_system(body.mode, operation, genre,
                                                     include_pptx=include_pptx,
-                                                    require_web_search=require_search),
+                                                    require_web_search=require_search,
+                                                    server_time=srv_time),
             "prompt": pack(payload), "context": plugin_context,
             "preset_step": prompting.steps_label(operation, genre),
             "wants_pptx": include_pptx,
-            "web_search": {"enabled": bool(web_search["configured"]), "required": require_search}}
+            "web_search": {
+                "enabled": bool(web_search["configured"]),
+                "required": require_search,
+                "server_time": srv_time,
+            }}
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:

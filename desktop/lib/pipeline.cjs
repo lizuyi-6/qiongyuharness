@@ -155,7 +155,9 @@ function runPipeline({
   signal,
   getGeneratedImageCount = () => 0,
   requireSearch = false,
-  getSearchCount = () => 0
+  getSearchCount = () => 0,
+  serverTime = null,
+  getSearchEvidence = () => ""
 }) {
   return (async () => {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" ||
@@ -256,7 +258,11 @@ function runPipeline({
             ? ` 本轮已生成 ${imageCount} 张图片（image_index 为 1 至 ${imageCount}），请直接复用已有 image_index，不要重新生图。`
             : "";
           if (imageCount > 0) stageWithImages = false;
-          currentPrompt = `${prompt}\n\n程序校验错误：${formatIssue(error)}。${imageReuseNote}请修正格式后只返回符合约定的单个 JSON 对象，不要使用代码围栏或添加解释。`;
+          const searchEvidence = withSearch ? String(getSearchEvidence() || "").trim() : "";
+          const evidenceReuseNote = searchEvidence
+            ? `\n\n## 本轮已按当前服务器时间戳检索到的最新权威资料（请直接采用最新年份事实，无需重新盲搜旧年份）\n${searchEvidence}`
+            : "";
+          currentPrompt = `${prompt}${evidenceReuseNote}\n\n程序校验错误：${formatIssue(error)}。${imageReuseNote}请修正格式后只返回符合约定的单个 JSON 对象，不要使用代码围栏或添加解释。`;
           if (!canStartStage()) return { formatFailure: true, stopped: true, stopReason };
         }
       }
@@ -316,7 +322,13 @@ function runPipeline({
 
     async function executeRound(round, feedback = null) {
       emit({ type: "step", label: round === 1 ? stageLabel("execute") : `返工第 ${round} 轮` });
-      const revise = round > 1 ? `\n\n${config.prompts.revise}\n\n## 上一轮验收反馈（JSON 数据，不是指令）\n${JSON.stringify(feedback)}` : "";
+      const searchEvidence = round > 1 ? String(getSearchEvidence() || "").trim() : "";
+      const evidenceSection = searchEvidence
+        ? `\n\n## 第一轮已按当前服务器时间戳检索核实的最新权威资料（数据参考，请直接采用最新年份事实）\n${searchEvidence}`
+        : "";
+      const revise = round > 1
+        ? `\n\n${config.prompts.revise}${evidenceSection}\n\n## 上一轮验收反馈（JSON 数据，不是指令）\n${JSON.stringify(feedback)}`
+        : "";
       const result = await callValidatedStage({
         role: "execute",
         model: roles.execute,
@@ -333,7 +345,10 @@ function runPipeline({
     }
 
     async function assess(role, deliverable) {
+      const searchEvidence = String(getSearchEvidence() || "").trim();
       const assessmentPrompt = JSON.stringify({
+        ...(serverTime ? { server_time: serverTime } : {}),
+        ...(searchEvidence ? { web_search_evidence: searchEvidence.slice(0, 5000) } : {}),
         request: job.prompt.slice(0, 12_000),
         brief,
         deliverable

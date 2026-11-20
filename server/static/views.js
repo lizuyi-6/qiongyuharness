@@ -477,8 +477,9 @@ export function settingsView() {
   const desktopVersion = isDesktopApp ? formatVersion(detectDesktopVersion()) : "";
   const serverVersion = formatVersion(state.config?.version);
   const webSearch = state.config?.web_search;
+  const searchTimeDate = webSearch?.server_time?.date ? ` · 基准 ${webSearch.server_time.date}` : "";
   const webSearchLabel = webSearch?.configured
-    ? (webSearch.required ? "DeepSeek Search · 已启用（强制搜索）" : "DeepSeek Search · 已启用")
+    ? (webSearch.required ? `DeepSeek Search · 已启用（强制搜索${searchTimeDate}）` : `DeepSeek Search · 已启用${searchTimeDate}`)
     : "DeepSeek Search · 待补入密钥";
   const updateBody = renderUpdatePanelBody();
   return `${pageHead("设置")}

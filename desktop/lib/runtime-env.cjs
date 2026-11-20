@@ -3,7 +3,7 @@ const path = require("node:path");
 const PASSTHROUGH_ENV = ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "LANG"];
 
 function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, model, system, contextPath,
-  imageBrokerUrl, imageBrokerKey, searchBrokerUrl, searchBrokerKey, dshBin }) {
+  imageBrokerUrl, imageBrokerKey, searchBrokerUrl, searchBrokerKey, serverTime, dshBin }) {
   if (!home || !gatewayUrl || !gatewayKey || !model) throw new Error("桌面运行环境参数无效");
   const env = {};
   for (const name of PASSTHROUGH_ENV) {
@@ -36,6 +36,12 @@ function buildRuntimeEnv({ baseEnv = process.env, home, gatewayUrl, gatewayKey, 
     if (!searchBrokerUrl || !searchBrokerKey) throw new Error("联网搜索服务凭证无效");
     env.QO_SEARCH_BROKER_URL = searchBrokerUrl;
     env.QO_SEARCH_BROKER_KEY = searchBrokerKey;
+  }
+  if (serverTime && typeof serverTime === "object") {
+    if (serverTime.unix_timestamp) env.QO_SERVER_TIMESTAMP = String(serverTime.unix_timestamp);
+    if (serverTime.year) env.QO_SERVER_YEAR = String(serverTime.year);
+    if (serverTime.date) env.QO_SERVER_DATE = String(serverTime.date);
+    if (serverTime.display) env.QO_SERVER_TIME_DISPLAY = String(serverTime.display);
   }
   return env;
 }

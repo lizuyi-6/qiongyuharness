@@ -36,8 +36,28 @@ function sourceLabel(url, title) {
   }
 }
 
+function currentServerTimeMeta(resultServerTime) {
+  if (resultServerTime && typeof resultServerTime === "object" && resultServerTime.unix_timestamp) {
+    return resultServerTime;
+  }
+  const envTs = Number.parseInt(process.env.QO_SERVER_TIMESTAMP || "", 10);
+  const now = Number.isSafeInteger(envTs) && envTs > 0 ? new Date(envTs * 1000) : new Date();
+  const unix_timestamp = Math.floor(now.getTime() / 1000);
+  const year = Number.parseInt(process.env.QO_SERVER_YEAR || "", 10) || now.getFullYear();
+  const date = process.env.QO_SERVER_DATE || now.toISOString().slice(0, 10);
+  const display = process.env.QO_SERVER_TIME_DISPLAY || `${date} (Unix时间戳: ${unix_timestamp})`;
+  return { unix_timestamp, year, date, display };
+}
+
 function formatSearchOutput(result) {
-  const parts = [EXTERNAL_WEB_CONTENT_NOTICE];
+  const srvTime = currentServerTimeMeta(result?.server_time);
+  const parts = [
+    EXTERNAL_WEB_CONTENT_NOTICE,
+    `[服务器实时时间基准] 当前服务器时间：${srvTime.display} | Unix时间戳：${srvTime.unix_timestamp}（当前真实年份：${srvTime.year}年，基准日期：${srvTime.date}）。请严格以 ${srvTime.year} 年为“今年/最新/目前”的唯一时间基准，优先采用离当前时间戳最近的 ${srvTime.year} 年最新发布的模型、产品与数据，切勿将 2024–2025 年的旧状态当作最新现状！`
+  ];
+  if (Array.isArray(result?.queries) && result.queries.length > 0) {
+    parts.push(`[按当前服务器时间戳执行的检索词] ${result.queries.join(" | ")}`);
+  }
   if (typeof result?.answer === "string" && result.answer.trim()) {
     parts.push(result.answer.trim());
   }
@@ -46,14 +66,12 @@ function formatSearchOutput(result) {
     const lines = sources.map((src) => {
       const label = sourceLabel(src.url, src.title);
       const excerpt = (typeof src.summary === "string" && src.summary.trim())
-        ? src.summary.trim().replace(/\s+/g, " ").slice(0, 360)
-        : (typeof src.snippet === "string" ? src.snippet.trim().replace(/\s+/g, " ").slice(0, 360) : "");
-      const meta = [];
-      if (excerpt) meta.push(excerpt);
-      if (typeof src.published_at === "string" && src.published_at.trim()) meta.push(`(${src.published_at.trim()})`);
-      return `- [${label}](${src.url})${meta.length ? ` — ${meta.join(" ")}` : ""}`;
+        ? src.summary.trim().replace(/\s+/g, " ").slice(0, 1000)
+        : (typeof src.snippet === "string" ? src.snippet.trim().replace(/\s+/g, " ").slice(0, 1000) : "");
+      const pubDate = typeof src.published_at === "string" && src.published_at.trim() ? `[发布/更新: ${src.published_at.trim()}] ` : "";
+      return `- ${pubDate}[${label}](${src.url})${excerpt ? ` — ${excerpt}` : ""}`;
     });
-    parts.push(`Sources:\n${lines.join("\n")}`);
+    parts.push(`Sources (已按当前服务器时间戳 ${srvTime.unix_timestamp} 进行新鲜度提权排序):\n${lines.join("\n")}`);
   } else if (!result?.answer) {
     parts.push("No results found.");
   }
@@ -121,7 +139,8 @@ async function runWebFetch(args, execution) {
     }
     const content = typeof result.content === "string" ? result.content.trim() : "";
     if (!content) return "网页抓取失败：未提取到有效正文。";
-    return `${EXTERNAL_WEB_CONTENT_NOTICE}\n\nSource: ${targetUrl}\n\n${content}${result.truncated ? "\n\n(内容较长，已截断保留前 24000 字)" : ""}`;
+    const srvTime = currentServerTimeMeta(result?.server_time);
+    return `${EXTERNAL_WEB_CONTENT_NOTICE}\n[服务器实时时间基准: ${srvTime.display} | Unix时间戳: ${srvTime.unix_timestamp}]\n\nSource: ${targetUrl}\n\n${content}${result.truncated ? "\n\n(内容较长，已截断保留前 24000 字)" : ""}`;
   } catch (error) {
     const message = error?.name === "AbortError" ? "网页抓取已取消" : (error?.message || "抓页服务暂不可用");
     return `网页抓取失败：${message}`;
@@ -130,16 +149,17 @@ async function runWebFetch(args, execution) {
 
 export function apply(ctx) {
   ctx.tools.guard((execution) => ALLOWED_TOOLS.has(execution.name) ? undefined : "本轮只允许调用办公资料读取、联网搜索、生图与 PPT 排版校验工具");
+  const srvTime = currentServerTimeMeta();
 
   ctx.tools.register(defineTool({
     name: "web_search",
-    description: "通过 DeepSeek 官方搜索接口联网检索最新信息，返回权威来源摘要与链接。支持一次并发查询 1–4 个关键词。",
+    description: `通过 DeepSeek 官方搜索接口联网检索最新信息（当前服务器时间：${srvTime.display}，Unix时间戳：${srvTime.unix_timestamp}，当前年份：${srvTime.year}年）。支持一次并发查询 1–4 个关键词，检索最新进展时必须在关键词中带上当前服务器年份 ${srvTime.year}。`,
     parameters: {
       queries: {
         type: "array",
         required: true,
         items: { type: "string" },
-        description: "1–4 条精准搜索关键词，系统将并发搜索并去重合并结果。"
+        description: `1–4 条精准搜索关键词（当前服务器年份为 ${srvTime.year} 年，检索最新动态/产品/模型/数据时请显式包含 ${srvTime.year}，切勿将 2024/2025 当作当前年份）。`
       },
       count: {
         type: "number",
@@ -148,7 +168,7 @@ export function apply(ctx) {
       },
       ori_question: {
         type: "string",
-        description: "可选，用户的原始问题摘要（128 字以内），有助于 DeepSeek 搜索更精准排序。"
+        description: "可选，用户的原始问题摘要（128 字以内），有助于 DeepSeek 搜索结合当前时间戳更精准排序。"
       }
     },
     timeoutMs: 45_000,

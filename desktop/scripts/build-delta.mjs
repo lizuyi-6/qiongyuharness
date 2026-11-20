@@ -99,6 +99,15 @@ try {
   }
 } catch {}
 
+if (!fullInfo) {
+  try {
+    const prevManifest = JSON.parse(await readFile(path.join(distDir, "manifest.json"), "utf8"));
+    if (prevManifest?.full?.file && prevManifest?.full?.sha256 && Number(prevManifest?.full?.size) > 0) {
+      fullInfo = prevManifest.full;
+    }
+  } catch {}
+}
+
 const notes = String(process.env.QO_RELEASE_NOTES || "").trim() ||
   `穹驭办公 v${version}：支持应用内秒级增量更新与在线下载安装。`;
 

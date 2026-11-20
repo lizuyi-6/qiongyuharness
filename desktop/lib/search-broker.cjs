@@ -5,6 +5,83 @@ const { randomBytes, timingSafeEqual } = require("node:crypto");
 
 const MAX_BODY_BYTES = 32 * 1024;
 const SEARCH_TIMEOUT_MS = 40_000;
+const YEAR_ONLY_RE = /\b(202[0-9])\b/g;
+const HISTORICAL_MONTH_RE = /202\d\s*年\s*\d{1,2}\s*月/;
+const HIST_BG_STOPWORDS_RE = /\b(?:202\d(?:年(?:\d{1,2}月)?)?|成立时间|创始人|公司简介|发展历程|融资历程|背景)\b/g;
+
+function normalizeServerTime(serverTime, now = Date.now) {
+  if (serverTime && typeof serverTime === "object" && Number.isInteger(serverTime.unix_timestamp) && serverTime.year && serverTime.date) {
+    return {
+      unix_timestamp: serverTime.unix_timestamp,
+      year: Number(serverTime.year),
+      month: Number(serverTime.month) || 1,
+      date: String(serverTime.date),
+      display: String(serverTime.display || `${serverTime.date} (Unix时间戳: ${serverTime.unix_timestamp})`)
+    };
+  }
+  const ms = typeof now === "function" ? now() : Date.now();
+  const shanghaiDate = new Date(ms + 8 * 3600 * 1000);
+  const year = shanghaiDate.getUTCFullYear();
+  const month = shanghaiDate.getUTCMonth() + 1;
+  const day = shanghaiDate.getUTCDate();
+  const hh = String(shanghaiDate.getUTCHours()).padStart(2, "0");
+  const mm = String(shanghaiDate.getUTCMinutes()).padStart(2, "0");
+  const ss = String(shanghaiDate.getUTCSeconds()).padStart(2, "0");
+  const unix_timestamp = Math.floor(ms / 1000);
+  const date = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return {
+    unix_timestamp,
+    year,
+    month,
+    date,
+    display: `${year}年${String(month).padStart(2, "0")}月${String(day).padStart(2, "0")}日 ${hh}:${mm}:${ss} (UTC+8, Unix时间戳: ${unix_timestamp})`
+  };
+}
+
+function anchorQueriesToServerTime(queries, srvTime) {
+  const curYear = Number(srvTime?.year) || new Date().getFullYear();
+  const curYearStr = String(curYear);
+  const staleYears = new Set([String(curYear - 1), String(curYear - 2)]);
+  const anchored = [];
+  const seen = new Set();
+
+  for (const q of queries) {
+    let updated = q;
+    const foundYears = new Set([...updated.matchAll(YEAR_ONLY_RE)].map((m) => m[1]));
+    const hasStale = [...foundYears].some((y) => staleYears.has(y));
+    const hasCurrent = foundYears.has(curYearStr);
+    if (hasStale && !hasCurrent) {
+      const hasExplicitHistMonth = HISTORICAL_MONTH_RE.test(updated);
+      const hasMultiYearCompare = foundYears.size >= 2 || updated.includes("年报");
+      if (!hasExplicitHistMonth && !hasMultiYearCompare) {
+        for (const sy of staleYears) {
+          updated = updated.replace(new RegExp(`\\b${sy}(?=\\s*年|\\b)`, "g"), curYearStr);
+        }
+      } else if (updated.includes("最新") || updated.includes("近况") || updated.includes("动态")) {
+        updated = `${updated} ${curYearStr}`;
+      }
+    }
+    updated = updated.replace(/\s+/g, " ").trim().slice(0, 200);
+    if (updated && !seen.has(updated)) {
+      seen.add(updated);
+      anchored.push(updated);
+    }
+  }
+
+  const rawHadCurrentYear = queries.some((q) => q.includes(curYearStr));
+  if (anchored.length > 0 && (!rawHadCurrentYear || !anchored.some((q) => q.includes(curYearStr)))) {
+    const first = anchored[0];
+    const cleanedTopic = first.replace(HIST_BG_STOPWORDS_RE, " ");
+    const tokens = cleanedTopic.split(/\s+/).filter((tok) => tok && !/^abab[\d.]*$/i.test(tok));
+    const topic = tokens.slice(0, 2).join(" ").trim() || first.split(/\s+/)[0];
+    const freshQuery = `${topic} ${curYearStr}年 最新模型 产品发布 动态`.slice(0, 200);
+    if (!seen.has(freshQuery)) {
+      anchored.unshift(freshQuery);
+    }
+  }
+
+  return anchored.slice(0, 5);
+}
 
 function json(response, status, value) {
   const body = Buffer.from(JSON.stringify(value));
@@ -41,15 +118,56 @@ async function readBody(request) {
   }
 }
 
-async function createSearchBroker({ search, fetchPage, onSearch = () => {}, onFetch = () => {} }) {
+async function createSearchBroker({ search, fetchPage, serverTime, now = Date.now, onSearch = () => {}, onFetch = () => {} }) {
   if (typeof search !== "function" || typeof fetchPage !== "function") {
     throw new TypeError("搜索 broker 参数无效");
   }
   const key = randomBytes(32).toString("base64url");
   const secret = Buffer.from(key, "utf8");
+  let activeServerTime = normalizeServerTime(serverTime, now);
   let searchCount = 0;
   let fetchCount = 0;
   const queriesHistory = [];
+  const evidenceByUrl = new Map();
+  const fetchedPages = new Map();
+
+  function recordSearchSources(sources = []) {
+    if (!Array.isArray(sources)) return;
+    for (const src of sources.slice(0, 8)) {
+      if (!src || typeof src.url !== "string" || !src.url) continue;
+      const excerpt = (typeof src.summary === "string" && src.summary.trim())
+        ? src.summary.trim().replace(/\s+/g, " ").slice(0, 320)
+        : (typeof src.snippet === "string" ? src.snippet.trim().replace(/\s+/g, " ").slice(0, 320) : "");
+      evidenceByUrl.set(src.url, {
+        url: src.url,
+        title: typeof src.title === "string" && src.title.trim() ? src.title.trim() : src.url,
+        published_at: typeof src.published_at === "string" ? src.published_at.trim() : "",
+        excerpt
+      });
+    }
+  }
+
+  function getEvidenceDigest(maxChars = 6000) {
+    if (!evidenceByUrl.size && !fetchedPages.size) return "";
+    const lines = [
+      `[服务器权威时间基准] ${activeServerTime.display} (当前年份: ${activeServerTime.year}年, 基准日期: ${activeServerTime.date}, Unix时间戳: ${activeServerTime.unix_timestamp})`,
+      `[本轮已执行的检索词] ${[...new Set(queriesHistory)].slice(0, 16).join(" | ")}`
+    ];
+    if (evidenceByUrl.size) {
+      lines.push("【已检索核实的最新权威来源摘要】");
+      for (const item of [...evidenceByUrl.values()].slice(0, 14)) {
+        const dateTag = item.published_at ? `[${item.published_at}] ` : "";
+        lines.push(`- ${dateTag}${item.title} (${item.url})${item.excerpt ? `：${item.excerpt}` : ""}`);
+      }
+    }
+    if (fetchedPages.size) {
+      lines.push("【已精读的网页正文摘要】");
+      for (const [url, snippet] of [...fetchedPages.entries()].slice(0, 4)) {
+        lines.push(`- ${url}：${snippet}`);
+      }
+    }
+    return lines.join("\n").slice(0, maxChars);
+  }
 
   const server = createServer(async (request, response) => {
     if (request.method !== "POST" || (request.url !== "/search" && request.url !== "/fetch")) {
@@ -89,26 +207,32 @@ async function createSearchBroker({ search, fetchPage, onSearch = () => {}, onFe
           : typeof body.value.query === "string"
             ? [body.value.query]
             : [];
-        const queries = [...new Set(
+        const cleanedQueries = [...new Set(
           rawQueries
             .map((item) => (typeof item === "string" ? item.replace(/\s+/g, " ").trim() : ""))
             .filter(Boolean)
             .slice(0, 4)
         )];
-        if (!queries.length) {
+        if (!cleanedQueries.length) {
           json(response, 400, { ok: false, message: "请提供至少 1 个非空搜索关键词" });
           return;
         }
+        const queries = anchorQueriesToServerTime(cleanedQueries, activeServerTime);
         const count = Number.isInteger(body.value.count) && body.value.count >= 1 && body.value.count <= 20
           ? body.value.count
           : 8;
         const oriQuestion = typeof body.value.ori_question === "string" ? body.value.ori_question.trim().slice(0, 200) : undefined;
         const needContent = body.value.need_content === true;
-        onSearch(queries);
+        onSearch(queries, activeServerTime);
         const result = await search({ queries, count, ori_question: oriQuestion, need_content: needContent }, { signal: controller.signal });
+        if (result?.server_time && typeof result.server_time === "object") {
+          activeServerTime = normalizeServerTime(result.server_time, now);
+        }
+        const effectiveQueries = Array.isArray(result?.queries) && result.queries.length ? result.queries : queries;
         searchCount += 1;
-        queriesHistory.push(...queries);
-        json(response, 200, { ok: true, ...result });
+        queriesHistory.push(...effectiveQueries);
+        recordSearchSources(result?.sources);
+        json(response, 200, { ok: true, server_time: activeServerTime, ...result, queries: effectiveQueries });
       } else {
         const targetUrl = typeof body.value.url === "string" ? body.value.url.trim() : "";
         if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
@@ -117,8 +241,14 @@ async function createSearchBroker({ search, fetchPage, onSearch = () => {}, onFe
         }
         onFetch(targetUrl);
         const result = await fetchPage({ url: targetUrl }, { signal: controller.signal });
+        if (result?.server_time && typeof result.server_time === "object") {
+          activeServerTime = normalizeServerTime(result.server_time, now);
+        }
         fetchCount += 1;
-        json(response, 200, { ok: true, ...result });
+        if (typeof result?.content === "string" && result.content.trim()) {
+          fetchedPages.set(targetUrl, result.content.trim().replace(/\s+/g, " ").slice(0, 520));
+        }
+        json(response, 200, { ok: true, server_time: activeServerTime, ...result });
       }
     } catch (error) {
       const raw = typeof error?.message === "string" ? error.message : "搜索服务暂不可用";
@@ -139,7 +269,9 @@ async function createSearchBroker({ search, fetchPage, onSearch = () => {}, onFe
     key,
     get searchCount() { return searchCount; },
     get fetchCount() { return fetchCount; },
+    get serverTime() { return activeServerTime; },
     queriesHistory,
+    getEvidenceDigest,
     async close() {
       if (!server.listening) return;
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -147,4 +279,4 @@ async function createSearchBroker({ search, fetchPage, onSearch = () => {}, onFe
   };
 }
 
-module.exports = { MAX_BODY_BYTES, SEARCH_TIMEOUT_MS, createSearchBroker };
+module.exports = { MAX_BODY_BYTES, SEARCH_TIMEOUT_MS, anchorQueriesToServerTime, createSearchBroker, normalizeServerTime };

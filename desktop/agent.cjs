@@ -12,7 +12,7 @@ const { sessionFetch } = require("./lib/session-cookie.cjs");
 const { quotaExhaustionMessage, requestUsage, USAGE_TIMEOUT_MS } = require("./lib/usage.cjs");
 const { createImageGenerator } = require("./lib/image-gen.cjs");
 const { createImageBroker } = require("./lib/image-broker.cjs");
-const { createSearchBroker } = require("./lib/search-broker.cjs");
+const { createSearchBroker, normalizeServerTime } = require("./lib/search-broker.cjs");
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -47,6 +47,13 @@ const REQUIRED_PIPELINE_ROLES = ["understand", "execute", "accept"];
 const PIPELINE_ROLE_LABELS = { understand: "理解", execute: "执行", accept: "验收" };
 const IMAGE_TOOL_INSTRUCTIONS = "生图工具使用说明：当制作 PPT 需要封面主视觉、章节过渡或关键配图，或用户明确需要图片时，可按需调用 office_image_generate（按张计费，不限张数）；制作 PPT 时提示词强调画面无文字，并用返回的 image_index 填入 deck.slides 的 bg_image 或 image 元素；不要在 reply 文字中输出图片链接、Markdown 图片或 base64；不需要配图的纯文字问答不要调用。";
 const SEARCH_TOOL_INSTRUCTIONS = "DeepSeek 联网搜索工具使用说明（强制要求）：本轮已提供 web_search 与 web_fetch 工具。在给出最终答复、文档或 PPT 之前，你必须至少调用 1 次 web_search（传入 1–4 条关键词）检索最新权威资料，需要精读某条来源时调用 web_fetch，并在回答中注明来源链接。未调用 web_search 将被程序拦截重写。";
+
+function buildSearchToolInstructions(serverTime) {
+  if (serverTime && serverTime.year && serverTime.date && serverTime.unix_timestamp) {
+    return `DeepSeek 联网搜索工具使用说明（强制按当前服务器时间戳检索）：当前服务器权威时间为 ${serverTime.display || serverTime.date}（Unix时间戳：${serverTime.unix_timestamp}，当前真实年份：${serverTime.year}年）。本轮已提供 web_search 与 web_fetch 工具。在给出最终答复、文档或 PPT 之前，你必须先根据当前服务器时间戳（${serverTime.year}年）至少调用 1 次 web_search（传入 1–4 条关键词，检索最新动态/产品/模型/数据时必须显式包含 ${serverTime.year}，严禁把 2024 或 2025 当作当前年份！），需要精读某条来源时调用 web_fetch，并在回答中采用离当前时间戳最近的 ${serverTime.year} 年最新权威事实。未调用 web_search 将被程序拦截重写。`;
+  }
+  return SEARCH_TOOL_INSTRUCTIONS;
+}
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -348,13 +355,20 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     const pptCheckEnabled = job.ppt_check === true;
     let webSearchEnabled = job.web_search?.enabled === true;
     let webSearchRequired = job.web_search?.required === true;
-    if (job.web_search === undefined && origin) {
+    let rawServerTime = job.web_search?.server_time || job.server_time || null;
+    if ((job.web_search === undefined || !rawServerTime) && origin) {
       try {
         const searchStatus = await readSessionJson(origin, `${origin}/api/v1/search/status`);
-        webSearchEnabled = searchStatus?.configured === true;
-        webSearchRequired = Boolean(webSearchEnabled && searchStatus?.required !== false);
+        if (job.web_search === undefined) {
+          webSearchEnabled = searchStatus?.configured === true;
+          webSearchRequired = Boolean(webSearchEnabled && searchStatus?.required !== false);
+        }
+        if (!rawServerTime && searchStatus?.server_time) {
+          rawServerTime = searchStatus.server_time;
+        }
       } catch {}
     }
+    const serverTime = normalizeServerTime(rawServerTime, clockNow);
     const maxImages = Number.isInteger(job.max_images) && job.max_images >= 1 ? job.max_images : null;
     const imageModel = imageModels.includes("gpt-image-2.6-flare") ? "gpt-image-2.6-flare" : imageModels[0];
     ensureNotAborted();
@@ -483,6 +497,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             searchBrokerUrl: searchBroker.url,
             searchBrokerKey: searchBroker.key
           } : {}),
+          serverTime: searchBroker?.serverTime || serverTime,
           dshBin: runtimePaths.dshBin
         });
         const node = getNodeExecutable();
@@ -566,9 +581,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             body: JSON.stringify(payload),
             signal: reqSignal
           }),
-          onSearch: (queries) => {
+          serverTime,
+          now: clockNow,
+          onSearch: (queries, srvTime) => {
             const label = queries.slice(0, 3).join(" / ").slice(0, 100);
-            emit({ type: "step", label: `DeepSeek 搜索：${label}` });
+            const dateTag = srvTime?.date || serverTime?.date || "";
+            emit({ type: "step", label: `DeepSeek 搜索${dateTag ? `（基准 ${dateTag}）` : ""}：${label}` });
           },
           onFetch: (targetUrl) => {
             let host = targetUrl;
@@ -579,7 +597,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       }
       const extraSystemParts = [];
       if (imageBroker) extraSystemParts.push(IMAGE_TOOL_INSTRUCTIONS);
-      if (searchBroker && webSearchRequired) extraSystemParts.push(SEARCH_TOOL_INSTRUCTIONS);
+      if (searchBroker && webSearchRequired) extraSystemParts.push(buildSearchToolInstructions(searchBroker.serverTime || serverTime));
       const effectiveSystem = extraSystemParts.length ? `${job.system}\n\n${extraSystemParts.join("\n\n")}` : job.system;
       if (pipelineRequested) {
         const pipelineJob = { ...job, system: effectiveSystem };
@@ -594,7 +612,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           signal,
           getGeneratedImageCount: () => imageBroker?.images.length || 0,
           requireSearch: Boolean(searchBroker && webSearchRequired),
-          getSearchCount: () => searchBroker?.searchCount || 0
+          getSearchCount: () => searchBroker?.searchCount || 0,
+          serverTime: searchBroker?.serverTime || serverTime,
+          getSearchEvidence: () => searchBroker?.getEvidenceDigest?.() || ""
         });
         return {
           ...pipelineResult,
