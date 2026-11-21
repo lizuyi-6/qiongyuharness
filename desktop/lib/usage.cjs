@@ -142,6 +142,7 @@ async function requestUsage(credential, fetchImpl = globalThis.fetch, timeoutMs 
     return { state: "unavailable" };
   }
   if (response.status === 401 || response.status === 403) return { state: "unauthorized" };
+  if (response.status === 451) return { state: "blocked", status: 451 };
   if (response.status >= 500) return { state: "unavailable" };
   if (!response.ok) return { state: "invalid" };
   let payload;

@@ -6,12 +6,35 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import identity
 from .identity import user_for
 from .store import DEMO, audit, database
 
 router = APIRouter()
 USER_AGENT = "QiongyuOffice-Server/0.1.0"
+PROXY_FORWARD_REQ_HEADERS = (
+    "authorization",
+    "content-type",
+    "accept",
+    "openai-beta",
+    "x-request-id",
+    "idempotency-key",
+    "user-agent",
+)
+PROXY_FORWARD_RESP_HEADERS = (
+    "content-type",
+    "retry-after",
+    "x-request-id",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+)
+PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
 
 
 def settings():
@@ -23,7 +46,33 @@ def settings():
         "rate_limit_5h_usd": os.getenv("QO_SUB2API_RATE_LIMIT_5H_USD"),
         "rate_limit_1d_usd": os.getenv("QO_SUB2API_RATE_LIMIT_1D_USD"),
         "rate_limit_7d_usd": os.getenv("QO_SUB2API_RATE_LIMIT_7D_USD"),
+        "proxy_upstream": os.getenv("QO_SUB2API_PROXY_UPSTREAM", "").strip().rstrip("/"),
+        "client_url": os.getenv("QO_SUB2API_CLIENT_URL", "").strip().rstrip("/"),
     }
+
+
+def _valid_origin(raw: str, *, allow_loopback_http: bool = False) -> bool:
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    if not raw or not parsed.hostname or parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        return False
+    if parsed.scheme == "https":
+        return True
+    if allow_loopback_http and parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        return True
+    return False
+
+
+def client_base_url(config) -> str:
+    if config.get("client_url"):
+        return f"{config['client_url']}/v1"
+    if config.get("proxy_upstream"):
+        origin = os.getenv("QO_PUBLIC_ORIGIN", identity.ORIGIN).strip().rstrip("/")
+        if _valid_origin(origin, allow_loopback_http=False):
+            return f"{origin}/v1"
+    return f"{config['url']}/v1"
 
 
 def parse_rate_limit(value, name, *, required=False):
@@ -79,6 +128,10 @@ def validate_config():
         ("rate_limit_7d_usd", "QO_SUB2API_RATE_LIMIT_7D_USD", False),
     ):
         parse_rate_limit(config[key], env_name, required=required)
+    if config["proxy_upstream"] and not _valid_origin(config["proxy_upstream"], allow_loopback_http=True):
+        raise RuntimeError("QO_SUB2API_PROXY_UPSTREAM must be an HTTPS or loopback HTTP origin without a path.")
+    if config["client_url"] and not _valid_origin(config["client_url"], allow_loopback_http=False):
+        raise RuntimeError("QO_SUB2API_CLIENT_URL must be a valid HTTPS origin without a path.")
 
 
 ERROR_MESSAGES = {
@@ -179,8 +232,106 @@ async def model_credential(request: Request):
             subscription_created=subscription_created,
         )
     return {
-        "base_url": f"{config['url']}/v1",
+        "base_url": client_base_url(config),
         "api_key": api_key,
         "key_id": key_id,
         "group_id": group_id,
     }
+
+
+def _extract_bearer_token(request: Request) -> str:
+    raw = (request.headers.get("authorization") or "").strip()
+    if not raw.lower().startswith("bearer "):
+        raise HTTPException(401, "缺少模型访问凭证")
+    token = raw[7:].strip()
+    if not token or len(token) > 512 or any(ch.isspace() for ch in token):
+        raise HTTPException(401, "模型访问凭证无效")
+    if token.startswith("adm_sc_"):
+        raise HTTPException(403, "禁止使用管理密钥调用模型代理")
+    return token
+
+
+async def _proxy_v1(request: Request, endpoint: str):
+    if DEMO:
+        raise HTTPException(404, "演示模式未开启模型代理")
+    config = settings()
+    upstream = config["proxy_upstream"]
+    if not upstream:
+        raise HTTPException(404, "未启用模型代理转发")
+    _extract_bearer_token(request)
+
+    target_url = f"{upstream}/v1/{endpoint}"
+    if request.url.query:
+        target_url = f"{target_url}?{request.url.query}"
+
+    forward_headers = {"Accept-Encoding": "identity"}
+    for name in PROXY_FORWARD_REQ_HEADERS:
+        val = request.headers.get(name)
+        if val:
+            forward_headers[name] = val
+
+    body = await request.body() if request.method in {"POST", "PUT", "PATCH"} else None
+    client = httpx.AsyncClient(timeout=PROXY_TIMEOUT, trust_env=False)
+    try:
+        req = client.build_request(
+            request.method,
+            target_url,
+            headers=forward_headers,
+            content=body,
+        )
+        upstream_resp = await client.send(req, stream=True)
+    except httpx.HTTPError:
+        await client.aclose()
+        return JSONResponse(
+            {"error": {"message": "模型服务暂不可用，请稍后重试", "type": "upstream_error"}},
+            status_code=502,
+        )
+
+    resp_headers = {
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+    }
+    for name in PROXY_FORWARD_RESP_HEADERS:
+        val = upstream_resp.headers.get(name)
+        if val is not None:
+            resp_headers[name] = val
+
+    async def stream_body():
+        try:
+            async for chunk in upstream_resp.aiter_bytes():
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream_resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        stream_body(),
+        status_code=upstream_resp.status_code,
+        headers=resp_headers,
+    )
+
+
+@router.get("/v1/models")
+async def proxy_models(request: Request):
+    return await _proxy_v1(request, "models")
+
+
+@router.get("/v1/usage")
+async def proxy_usage(request: Request):
+    return await _proxy_v1(request, "usage")
+
+
+@router.post("/v1/chat/completions")
+async def proxy_chat_completions(request: Request):
+    return await _proxy_v1(request, "chat/completions")
+
+
+@router.post("/v1/images/generations")
+async def proxy_images_generations(request: Request):
+    return await _proxy_v1(request, "images/generations")
+
+
+@router.post("/v1/responses")
+async def proxy_responses(request: Request):
+    return await _proxy_v1(request, "responses")

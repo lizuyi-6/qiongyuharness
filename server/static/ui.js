@@ -294,35 +294,104 @@ export function setApiErrorHook(fn) {
   apiErrorHook = typeof fn === "function" ? fn : null;
 }
 
+const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
+const UPLOAD_EXTENSIONS = new Set(["docx", "pptx", "xlsx", "pdf", "txt", "md"]);
+const TRANSIENT_STATUSES = new Set([408, 502, 503, 504]);
+
+function friendlyNetworkMessage(err, timedOut) {
+  if (timedOut) return "请求超时，请检查网络后重试";
+  const raw = String(err?.message || "");
+  if (/failed to fetch|networkerror|load failed|network request failed|err_connection|err_internet/i.test(raw)) {
+    return "网络连接中断，请检查网络后重试";
+  }
+  return raw || "网络请求异常，请检查网络后重试";
+}
+
+function friendlyStatusMessage(status, detail) {
+  if (detail) return detail;
+  if (status === 408) return "请求超时（408），请检查网络后重试";
+  if (status === 413) return "文件体积超出 12 MB 限制，请压缩后再上传";
+  if (status === 502 || status === 503 || status === 504) return `服务暂时繁忙（${status}），请稍后重试`;
+  return `工作台请求失败（${status}）`;
+}
+
 export async function api(path, options = {}) {
-  const headers = new Headers(options.headers || {});
-  let data = options.body;
-  if (data !== undefined && !(data instanceof FormData)) {
+  const { timeoutMs, retryOnTransient, ...fetchOpts } = options;
+  const headers = new Headers(fetchOpts.headers || {});
+  let data = fetchOpts.body;
+  const isFormData = data instanceof FormData;
+  if (data !== undefined && !isFormData) {
     headers.set("Content-Type", "application/json");
     data = JSON.stringify(data);
   }
-  const method = (options.method || "GET").toUpperCase();
+  const method = (fetchOpts.method || "GET").toUpperCase();
+  const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : (isFormData ? 120_000 : 45_000);
+  const canRetry = method === "GET" || retryOnTransient === true;
+  const maxAttempts = canRetry ? 2 : 1;
   const startedAt = Date.now();
-  let response;
-  try {
-    response = await fetch("/api/v1" + path, { ...options, headers, body: data, credentials:"same-origin" });
-  } catch (netErr) {
-    try { apiErrorHook?.({ method, path, status: 0, durationMs: Date.now() - startedAt, message: netErr?.message || "网络请求异常" }); } catch {}
-    throw netErr;
-  }
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = Array.isArray(result.detail)
-      ? result.detail.map((entry) => entry.msg || "请检查输入").slice(0, 3).join("、")
-      : result.detail || `工作台请求失败（${response.status}）`;
-    const error = new Error(message);
-    error.status = response.status;
-    if (response.status !== 401 && !String(path).startsWith("/feedback")) {
-      try { apiErrorHook?.({ method, path, status: response.status, durationMs: Date.now() - startedAt, message }); } catch {}
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, effectiveTimeout);
+    const externalSignal = fetchOpts.signal;
+    const onExternalAbort = () => controller.abort(externalSignal?.reason);
+    if (externalSignal) {
+      if (externalSignal.aborted) onExternalAbort();
+      else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
     }
-    throw error;
+    let response;
+    try {
+      response = await fetch("/api/v1" + path, {
+        ...fetchOpts,
+        headers,
+        body: data,
+        credentials: "same-origin",
+        signal: controller.signal
+      });
+    } catch (netErr) {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+      if (externalSignal?.aborted && !timedOut) throw netErr;
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 700));
+        continue;
+      }
+      const message = friendlyNetworkMessage(netErr, timedOut);
+      const wrapped = new Error(message);
+      wrapped.status = 0;
+      wrapped.transient = true;
+      try { apiErrorHook?.({ method, path, status: 0, durationMs: Date.now() - startedAt, message }); } catch {}
+      throw wrapped;
+    }
+    clearTimeout(timer);
+    if (externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      if (attempt < maxAttempts && TRANSIENT_STATUSES.has(response.status)) {
+        await new Promise((r) => setTimeout(r, 700));
+        continue;
+      }
+      const detail = Array.isArray(result.detail)
+        ? result.detail.map((entry) => entry.msg || "请检查输入").slice(0, 3).join("、")
+        : (typeof result.detail === "string" ? result.detail : "");
+      const message = friendlyStatusMessage(response.status, detail);
+      const error = new Error(message);
+      error.status = response.status;
+      error.transient = TRANSIENT_STATUSES.has(response.status);
+      if (response.status !== 401 && !String(path).startsWith("/feedback")) {
+        try { apiErrorHook?.({ method, path, status: response.status, durationMs: Date.now() - startedAt, message }); } catch {}
+      }
+      throw error;
+    }
+    return result;
   }
-  return result;
 }
 
 export function post(path, body, key = "") {
@@ -354,15 +423,59 @@ export function uploadMarkup(summary = "拖入文件或点击添加") {
   return `<label class="button upload-zone" data-upload-zone>${icon("upload")} ${e(summary)} <input type="file" data-upload accept=".docx,.pptx,.xlsx,.pdf,.txt,.md" multiple></label>`;
 }
 
+let uploadInFlight = false;
+
 export async function uploadSelected(files, assignment = "", target = "") {
-  const uploaded = [];
-  for (const file of files) {
-    const form = new FormData();
-    form.append("file", file);
-    if (assignment) form.append("assignment_id", assignment);
-    uploaded.push(await api(target || "/files", {method:"POST",body:form}));
+  const list = Array.from(files || []);
+  if (!list.length) return [];
+  for (const file of list) {
+    const ext = String(file.name || "").split(".").pop().toLowerCase();
+    if (!UPLOAD_EXTENSIONS.has(ext)) {
+      throw new Error(`「${file.name || "文件"}」格式不支持，请选择 Word、PPT、Excel、PDF、TXT 或 Markdown`);
+    }
+    if (!file.size) {
+      throw new Error(`「${file.name || "文件"}」为空文件，无法上传`);
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      throw new Error(`「${file.name || "文件"}」大小（${formatBytes(file.size)}）超过 12 MB 上限，无法上传`);
+    }
   }
-  return uploaded;
+  if (uploadInFlight) {
+    throw new Error("正在上传其他文件，请稍候片刻再试");
+  }
+  uploadInFlight = true;
+  const uploaded = [];
+  try {
+    for (let i = 0; i < list.length; i += 1) {
+      const file = list[i];
+      toastMessage(
+        list.length > 1 ? `正在上传（${i + 1}/${list.length}）：${file.name}` : `正在上传：${file.name}`,
+        "info"
+      );
+      let lastError = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const form = new FormData();
+        form.append("file", file);
+        if (assignment) form.append("assignment_id", assignment);
+        try {
+          uploaded.push(await api(target || "/files", { method: "POST", body: form, timeoutMs: 120_000 }));
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt < 2 && err?.transient) {
+            await new Promise((r) => setTimeout(r, 800));
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (lastError) throw lastError;
+    }
+    return uploaded;
+  } finally {
+    uploadInFlight = false;
+  }
 }
 
 export function saveDraft(key, data) {

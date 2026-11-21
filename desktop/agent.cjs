@@ -223,9 +223,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
       });
     } catch (error) {
       if (error?.name === "TimeoutError" || error?.code === "ETIMEDOUT" || error?.code === "UND_ERR_CONNECT_TIMEOUT") {
-        throw new Error("模型服务响应超时，请稍后重试");
+        throw Object.assign(new Error("模型服务响应超时，请稍后重试"), { code: "NETWORK_ERROR" });
       }
-      throw new Error("无法连接模型服务，请检查网络连接后重试");
+      throw Object.assign(new Error("无法连接模型服务，请检查网络连接后重试"), { code: "NETWORK_ERROR" });
     }
     if (!response.ok) {
       let payload = {};
@@ -242,10 +242,26 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
 
   async function freshModels() {
     const origin = getOrigin();
-    return listModelsWithRefresh(
-      async (force) => (await getCredential(origin, { force })).credential,
-      fetchModels
-    );
+    let lastCredential = null;
+    try {
+      return await listModelsWithRefresh(
+        async (force) => {
+          lastCredential = (await getCredential(origin, { force })).credential;
+          return lastCredential;
+        },
+        fetchModels
+      );
+    } catch (error) {
+      const originV1 = origin ? `${origin.replace(/\/+$/, "")}/v1` : "";
+      const staleHost = Boolean(originV1 && lastCredential?.baseUrl && lastCredential.baseUrl !== originV1);
+      if (staleHost && (error?.status === 451 || error?.code === "NETWORK_ERROR")) {
+        const refreshed = (await getCredential(origin, { force: true })).credential;
+        if (refreshed?.baseUrl && refreshed.baseUrl !== lastCredential.baseUrl) {
+          return fetchModels(refreshed);
+        }
+      }
+      throw error;
+    }
   }
 
   const readFreshModels = dependencies.freshModels || freshModels;
@@ -375,8 +391,24 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
 
   async function usage() {
     try {
-      const { credential } = await getCredential();
-      return await requestUsage(credential, (url, options) => net.fetch(url, options));
+      const origin = getOrigin();
+      const fetchFn = (url, options) => net.fetch(url, options);
+      const first = await getCredentialImpl(origin);
+      const result = await readUsage(first.credential, fetchFn);
+      const shouldRefresh = result?.state === "blocked" ||
+        result?.state === "unauthorized" ||
+        (result?.state === "unavailable" && origin && first.credential?.baseUrl !== `${origin.replace(/\/+$/, "")}/v1`);
+      if (shouldRefresh) {
+        try {
+          const refreshed = await getCredentialImpl(origin, { force: true });
+          if (refreshed?.credential &&
+              (refreshed.credential.baseUrl !== first.credential?.baseUrl ||
+               refreshed.credential.apiKey !== first.credential?.apiKey)) {
+            return await readUsage(refreshed.credential, fetchFn);
+          }
+        } catch {}
+      }
+      return result;
     } catch {
       return { state: "unavailable" };
     }

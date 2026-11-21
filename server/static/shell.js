@@ -260,7 +260,7 @@ export function syncUpdateUi() {
         <span class="update-banner-dot is-pulse" aria-hidden="true"></span>
         <strong>${info.status === "verifying" ? `正在校验 ${e(ver)}` : `正在下载 ${e(ver)}（${pct}%）`}</strong>
         <span>${info.status === "verifying" ? "校验文件完整性…" : `${e(isDelta ? "增量更新" : "完整包")}${e(speed)}`}</span>
-        <span class="update-banner-bar"><i style="width:${pct}%"></i></span>
+        <progress class="update-banner-progress" max="100" value="${Math.round(pct)}" aria-label="更新下载进度"></progress>
       </div>
       <div class="update-banner-actions">
         ${info.status === "downloading" ? '<button type="button" class="text-button" data-act="update-cancel">取消</button>' : ""}

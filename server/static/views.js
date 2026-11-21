@@ -427,9 +427,7 @@ export function renderUpdatePanelBody() {
         <strong>${status === "verifying" ? `正在校验 ${e(latest)}` : `正在下载 ${e(latest)}`}</strong>
         <span class="update-pill">${e(isDelta ? "增量更新" : "完整更新")} · ${pct}%</span>
       </div>
-      <div class="update-progress" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
-        <div class="update-progress-fill" style="width:${pct}%"></div>
-      </div>
+      <progress class="update-progress" max="100" value="${Math.round(pct)}" aria-label="更新下载进度"></progress>
       <p class="update-meta">${e(progressMeta)}</p>
       ${status === "downloading" ? `<div class="actions">${button("取消下载", "update-cancel", { icon: "x" })}</div>` : ""}
     </div>`;

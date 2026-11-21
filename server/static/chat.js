@@ -347,7 +347,7 @@ function renderSidebarQuota(slot, result, { loading = false } = {}) {
           <div class="quota-dock-tools">${refreshBtn}</div>
         </div>
         <div class="quota-skeleton-row"></div>
-        <div class="quota-track"><span class="quota-fill" style="width:32%"></span></div>
+        <div class="quota-track"><span class="quota-fill is-skeleton"></span></div>
       </div>
       <button type="button" class="quota-dock-compact" data-act="usage-refresh" title="正在获取模型额度…" aria-label="刷新模型额度" disabled>
         <span class="quota-ring-label">…</span>
@@ -359,6 +359,7 @@ function renderSidebarQuota(slot, result, { loading = false } = {}) {
   if (result?.state !== "available" || !result.usage) {
     const messages = {
       unauthorized: "凭证已失效，请重新登录",
+      blocked: "当前网络受限，请重试或重新登录",
       unavailable: "暂无法获取额度",
       invalid: "额度数据异常"
     };
@@ -1757,11 +1758,11 @@ export async function attachFiles(files, input) {
   const controls = chatForm()?.querySelectorAll("button[type=submit]");
   controls?.forEach((control) => { control.disabled = true; });
   try {
-    for (const file of files) {
-      const [added] = await uploadSelected([file], workspace.task?.id || "");
-      updateSources(workspace, (sources) => [...sources, added]);
+    const addedList = await uploadSelected(files, workspace.task?.id || "");
+    if (addedList.length) {
+      updateSources(workspace, (sources) => [...sources, ...addedList]);
+      toastMessage("附件已加入会话", "success");
     }
-    if (files.length) toastMessage("附件已加入会话", "success");
   } finally {
     syncChatSubmit(chatForm(), workspace);
     if (input) input.value = "";

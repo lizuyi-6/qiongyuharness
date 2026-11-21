@@ -161,7 +161,7 @@ class ZaochangAuthTest(unittest.TestCase):
             with store.database() as db:
                 user = db.one("SELECT id,email,subject,name,department,role,enabled,source FROM users WHERE id=?", (user_id,))
                 self.assertEqual(tuple(user), (
-                    user_id, "new.hire@example.com", "auto-subject", "新入职员工", "", "employee", 1, "auto"
+                    user_id, "new.hire@example.com", "auto-subject", "新入职员工", "运营", "employee", 1, "auto"
                 ))
                 event = db.one("SELECT type,payload FROM events WHERE actor_id=? AND type='user.auto_enrolled'", (user_id,))
                 self.assertEqual(event["type"], "user.auto_enrolled")
@@ -177,7 +177,7 @@ class ZaochangAuthTest(unittest.TestCase):
             self.assertEqual(fallback.status_code, 303, fallback.text)
             with store.database() as db:
                 fallback_user = db.one("SELECT name,role,department FROM users WHERE email=?", ("fallback@example.com",))
-                self.assertEqual(tuple(fallback_user), ("fallback", "employee", ""))
+                self.assertEqual(tuple(fallback_user), ("fallback", "employee", "运营"))
 
             conflict, _, _ = self.oidc_login("changed-auto-subject", "new.hire@example.com", True, code="auto-conflict")
             self.assertEqual(conflict.status_code, 403)
@@ -482,6 +482,82 @@ class ZaochangAuthTest(unittest.TestCase):
                 self.assertEqual(db.one("SELECT name FROM users WHERE id='legacy'")["name"], "Legacy")
         finally:
             store.DATA = old_data
+
+
+    def test_sub2api_same_origin_proxy_returns_office_base_url_and_streams(self):
+        real_client = httpx.AsyncClient
+        seen = []
+
+        def handler(request: httpx.Request):
+            seen.append((request.method, str(request.url), dict(request.headers), request.content))
+            if request.url.path == "/api/v1/admin/provision/user-key":
+                return httpx.Response(200, json={
+                    "user_id": 61, "user_created": True, "key_id": 91,
+                    "key_created": True, "key": "sk-emp-proxy-test", "group_id": 22,
+                    "subscription_id": 6, "subscription_created": True,
+                })
+            if request.url.path == "/v1/models":
+                return httpx.Response(200, json={"data": [{"id": "glm-5.3"}]})
+            if request.url.path == "/v1/usage":
+                return httpx.Response(200, json={"mode": "quota_limited", "rate_limits": []})
+            if request.url.path == "/v1/chat/completions":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/event-stream"},
+                    content=b"data: {\"id\":\"1\"}\n\ndata: [DONE]\n\n",
+                )
+            return httpx.Response(404, json={"detail": "unexpected"})
+
+        env = {
+            "QO_PUBLIC_ORIGIN": "https://office.aethernettech.dev",
+            "QO_SUB2API_URL": "https://aethernettech.dev",
+            "QO_SUB2API_PROXY_UPSTREAM": "http://127.0.0.1:8081",
+            "QO_SUB2API_PROVISION_KEY": "adm_sc_test_restricted-provision-key",
+            "QO_SUB2API_DEFAULT_GROUP_ID": "22",
+            "QO_SUB2API_KEY_NAME": "qiongyu-office",
+            "QO_SUB2API_RATE_LIMIT_5H_USD": "20",
+        }
+        with (
+            patch.object(sub2api, "DEMO", False),
+            patch.dict(os.environ, env),
+            patch.object(sub2api.httpx, "AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)),
+        ):
+            sub2api.validate_config()
+            with TestClient(app) as client:
+                client.cookies.set(identity.COOKIE, self.make_session("worker@example.com"))
+                cred = client.post("/api/v1/me/model-credential")
+                self.assertEqual(cred.status_code, 200, cred.text)
+                self.assertEqual(cred.json()["base_url"], "https://office.aethernettech.dev/v1")
+
+                # Missing bearer rejected
+                self.assertEqual(client.get("/v1/models").status_code, 401)
+                # Admin provision key rejected
+                self.assertEqual(client.get("/v1/models", headers={"Authorization": "Bearer adm_sc_secret"}).status_code, 403)
+
+                # Valid employee key proxies to loopback upstream without leaking session cookie
+                models_resp = client.get("/v1/models", headers={"Authorization": "Bearer sk-emp-proxy-test"})
+                self.assertEqual(models_resp.status_code, 200)
+                self.assertEqual(models_resp.json(), {"data": [{"id": "glm-5.3"}]})
+                self.assertEqual(models_resp.headers.get("x-accel-buffering"), "no")
+
+                usage_resp = client.get("/v1/usage", headers={"Authorization": "Bearer sk-emp-proxy-test"})
+                self.assertEqual(usage_resp.status_code, 200)
+                self.assertEqual(usage_resp.json()["mode"], "quota_limited")
+
+                sse_resp = client.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-emp-proxy-test"},
+                    json={"model": "glm-5.3", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                )
+                self.assertEqual(sse_resp.status_code, 200)
+                self.assertIn("text/event-stream", sse_resp.headers.get("content-type", ""))
+                self.assertIn("data: [DONE]", sse_resp.text)
+
+        proxy_calls = [item for item in seen if item[1].startswith("http://127.0.0.1:8081/v1/")]
+        self.assertEqual(len(proxy_calls), 3)
+        for _, _, hdrs, _ in proxy_calls:
+            self.assertNotIn("cookie", hdrs)
+            self.assertEqual(hdrs.get("authorization"), "Bearer sk-emp-proxy-test")
 
 
 if __name__ == "__main__":

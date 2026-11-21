@@ -384,6 +384,9 @@
   background: var(--ink-placeholder);
   animation: quota-pulse 1.2s ease-in-out infinite;
 }
+.quota-dock.is-loading .quota-fill.is-skeleton {
+  width: 32%;
+}
 
 .quota-skeleton-row {
   height: 14px;
@@ -941,18 +944,25 @@ main.content.view-entering {
 }
 .update-banner-dot.is-ready { background: var(--ok, #16a34a); }
 .update-banner-dot.is-pulse { animation: pulse-dot 1.3s ease-in-out infinite; }
-.update-banner-bar {
+.update-banner-progress {
+  appearance: none;
+  -webkit-appearance: none;
   width: 110px;
   height: 4px;
+  border: 0;
   border-radius: 999px;
   background: var(--line-strong);
   overflow: hidden;
-  display: inline-flex;
+  display: inline-block;
+  vertical-align: middle;
 }
-.update-banner-bar i {
-  display: block;
-  height: 100%;
+.update-banner-progress::-webkit-progress-bar {
+  background: var(--line-strong);
+  border-radius: 999px;
+}
+.update-banner-progress::-webkit-progress-value {
   background: var(--ink);
+  border-radius: 999px;
   transition: width 180ms linear;
 }
 .update-banner-actions {
@@ -1020,6 +1030,9 @@ main.content.view-entering {
   white-space: pre-wrap;
 }
 .update-progress {
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
   width: 100%;
   height: 6px;
   border-radius: 999px;
@@ -1027,8 +1040,11 @@ main.content.view-entering {
   border: 1px solid var(--line);
   overflow: hidden;
 }
-.update-progress-fill {
-  height: 100%;
+.update-progress::-webkit-progress-bar {
+  background: var(--bg-subtle);
+  border-radius: 999px;
+}
+.update-progress::-webkit-progress-value {
   background: var(--ink);
   border-radius: 999px;
   transition: width 180ms linear;
