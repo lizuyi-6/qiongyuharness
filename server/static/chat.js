@@ -1,4 +1,4 @@
-import { active, api, badge, button, cleanErrorMessage, copyText, deadline, e, fileMarkup, icon, modal, outputWarnings, post, readDraft, saveDraft,
+import { active, api, badge, button, cleanErrorMessage, copyText, deadline, dialog, e, fileMarkup, go, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, selectionSummaryText, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
@@ -1052,20 +1052,37 @@ export function conversationNav(workspace) {
         : ""}
     </div>
       <button type="button" class="button ghost history-trigger" data-act="chat-history" title="最近会话" aria-label="最近会话">${icon("history")}</button>
-      <div class="recent-sessions">${workspace.conversations.map((session) => {
+      <div class="recent-sessions" data-recent-sessions>${workspace.conversations.map((session) => {
         const selected = state.route[0] === "chat" && state.route[1] === session.id;
         const running = Boolean(activeTurnFor(session.id));
-        return `<button type="button" class="session-link ${selected ? "active" : ""} ${running ? "is-running" : ""}" data-act="route" data-id="chat/${e(session.id)}"
-          title="${e(session.title)}${running ? "（正在执行）" : ""}" ${selected ? 'aria-current="page"' : ""}>
-          ${icon("message")}<span>${e(session.title)}</span>${running ? '<i class="session-running-dot" aria-label="正在执行"></i>' : ""}</button>`;
-      }).join("")}</div>` : ""}
+        const pinned = Boolean(session.pinned);
+        return `<div class="session-row ${selected ? "active" : ""} ${pinned ? "is-pinned" : ""} ${running ? "is-running" : ""}" draggable="true" data-session-row data-session-id="${e(session.id)}" data-pinned="${pinned ? "1" : "0"}">
+          <button type="button" class="session-link ${selected ? "active" : ""} ${running ? "is-running" : ""}" data-act="route" data-id="chat/${e(session.id)}"
+            title="${e(session.title)}${pinned ? "（已置顶）" : ""}${running ? "（正在执行）" : ""} · 可拖拽排序或拖入下方删除，右键更多操作" ${selected ? 'aria-current="page"' : ""}>
+            ${icon(pinned ? "pin" : "message")}<span>${e(session.title)}</span>${running ? '<i class="session-running-dot" aria-label="正在执行"></i>' : ""}
+          </button>
+          <div class="session-row-actions">
+            <button type="button" class="session-act-btn" data-act="session-menu" data-id="${e(session.id)}" title="置顶、重命名或更多" aria-label="会话操作菜单">${icon("more")}</button>
+            <button type="button" class="session-act-btn is-danger" data-act="session-delete" data-id="${e(session.id)}" title="删除会话" aria-label="删除会话">${icon("trash")}</button>
+          </div>
+        </div>`;
+      }).join("")}</div>
+      <div class="session-trash-zone" data-session-trash-zone aria-hidden="true">
+        ${icon("trash")}<span data-session-trash-label>拖到此处删除会话</span>
+      </div>` : ""}
   </div>`;
 }
 
 export function showConversationHistory() {
   const sessions = state.chatWorkspace?.conversations || state.conversations || [];
   modal("最近会话", `<div class="stack-sm">${sessions.map((session) =>
-    button(session.title, "route", { id: "chat/" + session.id, icon: "message" })).join("") || '<p class="hint">暂无历史会话</p>'}</div>`);
+    `<div class="session-history-row">
+      <button type="button" class="button session-history-open" data-act="route" data-id="chat/${e(session.id)}">${icon(session.pinned ? "pin" : "message")}<span>${e(session.title)}</span></button>
+      <button type="button" class="icon-button sm" data-act="session-pin" data-id="${e(session.id)}" title="${session.pinned ? "取消置顶" : "置顶"}">${icon("pin")}</button>
+      <button type="button" class="icon-button sm" data-act="session-rename" data-id="${e(session.id)}" title="重命名">${icon("edit")}</button>
+      <button type="button" class="icon-button sm" data-act="session-delete" data-id="${e(session.id)}" title="删除会话">${icon("trash")}</button>
+    </div>`
+  ).join("") || '<p class="hint">暂无历史会话</p>'}</div>`);
 }
 
 export async function copyReply(index, triggerButton = null) {
@@ -2726,4 +2743,359 @@ export async function discardCheckpoint() {
   workspace.checkpoint = null;
   document.querySelector("[data-checkpoint-card]")?.remove();
   toastMessage("已放弃任务断点", "info");
+}
+
+/* ================= 最近会话：拖拽删除、拖拽排序、置顶、重命名与右键菜单 ================= */
+let sessionMenuEl = null;
+let sessionDragInitialized = false;
+let draggingSessionId = "";
+let draggingSessionTitle = "";
+
+function findConversationSummary(sessionId) {
+  const list = state.chatWorkspace?.conversations || state.conversations || [];
+  return list.find((c) => c.id === sessionId) || null;
+}
+
+function replaceConversationsList(nextList) {
+  state.conversations = nextList;
+  if (state.chatWorkspace) state.chatWorkspace.conversations = nextList;
+  emitConversationsUpdated();
+}
+
+export function closeSessionContextMenu() {
+  if (sessionMenuEl) {
+    sessionMenuEl.remove();
+    sessionMenuEl = null;
+  }
+}
+
+export async function deleteConversation(sessionId) {
+  if (!sessionId) return false;
+  closeSessionContextMenu();
+  if (activeTurnFor(sessionId)) {
+    toastMessage("该会话正在执行中，请先停止生成后再删除", "error");
+    return false;
+  }
+  const existing = findConversationSummary(sessionId);
+  const title = existing?.title || "该会话";
+  await api("/conversations/" + encodeURIComponent(sessionId), { method: "DELETE" });
+  sessionCache.delete(sessionId);
+  try { await window.officeDesktop?.clearCheckpoint?.(sessionId); } catch {}
+  const prev = state.chatWorkspace?.conversations || state.conversations || [];
+  const next = prev.filter((c) => c.id !== sessionId);
+  replaceConversationsList(next);
+  if (state.route[0] === "chat" && state.route[1] === sessionId) {
+    if (state.chatWorkspace) {
+      state.chatWorkspace.session = null;
+      state.chatWorkspace.checkpoint = null;
+    }
+    go("chat");
+  } else if (dialog.open && dialog.querySelector(".session-history-row")) {
+    showConversationHistory();
+  }
+  toastMessage(`已删除会话「${title}」`, "success");
+  return true;
+}
+
+export async function togglePinConversation(sessionId) {
+  if (!sessionId) return;
+  closeSessionContextMenu();
+  const existing = findConversationSummary(sessionId);
+  const nextPinned = !Boolean(existing?.pinned);
+  await api("/conversations/" + encodeURIComponent(sessionId), {
+    method: "PATCH",
+    body: { pinned: nextPinned }
+  });
+  const refreshed = await api("/conversations");
+  if (Array.isArray(refreshed)) replaceConversationsList(refreshed);
+  if (dialog.open && dialog.querySelector(".session-history-row")) showConversationHistory();
+  toastMessage(nextPinned ? "已置顶该会话" : "已取消置顶", "success");
+}
+
+export function openRenameConversationModal(sessionId) {
+  if (!sessionId) return;
+  closeSessionContextMenu();
+  const existing = findConversationSummary(sessionId);
+  const currentTitle = existing?.title || "";
+  modal("重命名会话", `<form class="stack" data-form="session-rename" data-id="${e(sessionId)}">
+    <label class="field">会话标题
+      <input name="title" required maxlength="60" value="${e(currentTitle)}" placeholder="输入精炼的会话标题" autocomplete="off">
+    </label>
+    <div class="actions between">
+      ${typeof window.officeDesktop?.generateTitle === "function"
+        ? `<button type="button" class="text-button" data-act="session-ai-title" data-id="${e(sessionId)}">${icon("sparkles")}让 AI 自动命名</button>`
+        : "<span></span>"}
+      <div class="actions">
+        <button type="button" class="button" data-act="close-dialog">取消</button>
+        <button type="submit" class="button primary">保存名称</button>
+      </div>
+    </div>
+  </form>`);
+  const input = dialog.querySelector("form[data-form=session-rename] input[name=title]");
+  if (input) {
+    input.focus();
+    input.select();
+  }
+}
+
+export async function submitRenameConversation(form) {
+  const sessionId = form.dataset.id;
+  const title = String(new FormData(form).get("title") || "").trim();
+  if (!sessionId || !title) throw new Error("请输入会话标题");
+  const updated = await api("/conversations/" + encodeURIComponent(sessionId), {
+    method: "PATCH",
+    body: { title }
+  });
+  applyConversationTitleLocally(sessionId, updated.title || title);
+  dialog.close();
+  toastMessage("会话标题已更新", "success");
+  return updated;
+}
+
+export async function retitleSingleConversation(sessionId) {
+  if (!sessionId) return;
+  closeSessionContextMenu();
+  if (dialog.open && dialog.querySelector("form[data-form=session-rename]")) dialog.close();
+  toastMessage("正在由 AI 生成精炼标题…", "info");
+  const title = await generateConversationTitle(sessionId, { force: true });
+  if (title) toastMessage(`已更新标题为「${title}」`, "success");
+  else toastMessage("该会话暂无足够内容用于生成标题", "error");
+}
+
+export function openSessionContextMenu(sessionId, triggerOrPoint = null) {
+  if (!sessionId) return;
+  closeSessionContextMenu();
+  const existing = findConversationSummary(sessionId);
+  if (!existing) return;
+  const pinned = Boolean(existing.pinned);
+  const hasAiTitle = typeof window.officeDesktop?.generateTitle === "function";
+
+  const menu = document.createElement("div");
+  menu.className = "session-ctx-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = `
+    <button type="button" class="session-ctx-item" role="menuitem" data-act="session-pin" data-id="${e(sessionId)}">
+      ${icon("pin")}<span>${pinned ? "取消置顶" : "置顶会话"}</span>
+    </button>
+    <button type="button" class="session-ctx-item" role="menuitem" data-act="session-rename" data-id="${e(sessionId)}">
+      ${icon("edit")}<span>重命名</span>
+    </button>
+    ${hasAiTitle ? `<button type="button" class="session-ctx-item" role="menuitem" data-act="session-ai-title" data-id="${e(sessionId)}">
+      ${icon("sparkles")}<span>AI 智能命名</span>
+    </button>` : ""}
+    <div class="session-ctx-divider" role="separator"></div>
+    <button type="button" class="session-ctx-item is-danger" role="menuitem" data-act="session-delete" data-id="${e(sessionId)}">
+      ${icon("trash")}<span>删除会话</span>
+    </button>
+  `;
+  document.body.appendChild(menu);
+  sessionMenuEl = menu;
+
+  let x = 16;
+  let y = 16;
+  if (triggerOrPoint instanceof Element) {
+    const rect = triggerOrPoint.getBoundingClientRect();
+    x = rect.right + 4;
+    y = rect.top;
+  } else if (triggerOrPoint && typeof triggerOrPoint.clientX === "number") {
+    x = triggerOrPoint.clientX + 2;
+    y = triggerOrPoint.clientY + 2;
+  }
+  const menuRect = menu.getBoundingClientRect();
+  if (x + menuRect.width > window.innerWidth - 10) {
+    x = Math.max(10, window.innerWidth - menuRect.width - 10);
+  }
+  if (y + menuRect.height > window.innerHeight - 10) {
+    y = Math.max(10, window.innerHeight - menuRect.height - 10);
+  }
+  menu.style.left = `${Math.round(x)}px`;
+  menu.style.top = `${Math.round(y)}px`;
+}
+
+async function commitSessionReorder(draggedId, targetId, placeAfter) {
+  if (!draggedId || !targetId || draggedId === targetId) return;
+  const current = [...(state.chatWorkspace?.conversations || state.conversations || [])];
+  const fromIdx = current.findIndex((c) => c.id === draggedId);
+  const targetObj = current.find((c) => c.id === targetId);
+  if (fromIdx < 0 || !targetObj) return;
+
+  const [moved] = current.splice(fromIdx, 1);
+  const nextPinned = Boolean(targetObj.pinned);
+  const pinnedChanged = Boolean(moved.pinned) !== nextPinned;
+  moved.pinned = nextPinned;
+
+  const toIdx = current.findIndex((c) => c.id === targetId);
+  if (toIdx < 0) return;
+  current.splice(placeAfter ? toIdx + 1 : toIdx, 0, moved);
+  replaceConversationsList(current);
+
+  try {
+    if (pinnedChanged) {
+      await api("/conversations/" + encodeURIComponent(draggedId), {
+        method: "PATCH",
+        body: { pinned: nextPinned }
+      });
+    }
+    const refreshed = await api("/conversations/reorder", {
+      method: "PUT",
+      body: { ids: current.map((c) => c.id) }
+    });
+    if (Array.isArray(refreshed)) replaceConversationsList(refreshed);
+  } catch (error) {
+    toastMessage(cleanErrorMessage(error, "保存会话排序失败"), "error");
+    try {
+      const fallback = await api("/conversations");
+      if (Array.isArray(fallback)) replaceConversationsList(fallback);
+    } catch {}
+  }
+}
+
+function clearSessionDragHighlights() {
+  document.querySelectorAll("[data-session-row].is-drop-before, [data-session-row].is-drop-after, [data-session-row].is-dragging")
+    .forEach((el) => el.classList.remove("is-drop-before", "is-drop-after", "is-dragging"));
+  const trash = document.querySelector("[data-session-trash-zone]");
+  if (trash) {
+    trash.classList.remove("is-over");
+    const label = trash.querySelector("[data-session-trash-label]");
+    if (label) label.textContent = "拖到此处删除会话";
+  }
+}
+
+export function initSessionDragAndMenu() {
+  if (sessionDragInitialized) return;
+  sessionDragInitialized = true;
+
+  document.addEventListener("contextmenu", (event) => {
+    const row = event.target.closest?.("[data-session-row]");
+    if (!row) return;
+    event.preventDefault();
+    const id = row.dataset.sessionId;
+    if (id) openSessionContextMenu(id, event);
+  });
+
+  document.addEventListener("dblclick", (event) => {
+    const link = event.target.closest?.("[data-session-row] .session-link");
+    if (!link) return;
+    const row = link.closest("[data-session-row]");
+    const id = row?.dataset.sessionId;
+    if (id) {
+      event.preventDefault();
+      openRenameConversationModal(id);
+    }
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (!sessionMenuEl) return;
+    if (sessionMenuEl.contains(event.target) || event.target.closest?.("[data-act=session-menu]")) return;
+    closeSessionContextMenu();
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeSessionContextMenu();
+  });
+  window.addEventListener("resize", closeSessionContextMenu);
+  window.addEventListener("scroll", (event) => {
+    if (sessionMenuEl && !sessionMenuEl.contains(event.target)) closeSessionContextMenu();
+  }, true);
+
+  document.addEventListener("dragstart", (event) => {
+    const row = event.target.closest?.("[data-session-row]");
+    if (!row) return;
+    if (event.target.closest?.(".session-row-actions")) {
+      event.preventDefault();
+      return;
+    }
+    const id = row.dataset.sessionId || "";
+    if (!id) return;
+    closeSessionContextMenu();
+    draggingSessionId = id;
+    draggingSessionTitle = findConversationSummary(id)?.title || "";
+    row.classList.add("is-dragging");
+    document.body.classList.add("is-dragging-session");
+    try {
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("application/x-qo-session", id);
+      event.dataTransfer.setData("text/plain", draggingSessionTitle || id);
+    } catch {}
+  });
+
+  document.addEventListener("dragover", (event) => {
+    if (!draggingSessionId) return;
+    const trash = event.target.closest?.("[data-session-trash-zone]");
+    if (trash) {
+      event.preventDefault();
+      try { event.dataTransfer.dropEffect = "move"; } catch {}
+      document.querySelectorAll("[data-session-row].is-drop-before, [data-session-row].is-drop-after")
+        .forEach((el) => el.classList.remove("is-drop-before", "is-drop-after"));
+      trash.classList.add("is-over");
+      const label = trash.querySelector("[data-session-trash-label]");
+      if (label) label.textContent = draggingSessionTitle ? `松手删除「${draggingSessionTitle.slice(0, 12)}」` : "松手立即删除";
+      return;
+    }
+    const row = event.target.closest?.("[data-session-row]");
+    const activeTrash = document.querySelector("[data-session-trash-zone]");
+    if (activeTrash) {
+      activeTrash.classList.remove("is-over");
+      const label = activeTrash.querySelector("[data-session-trash-label]");
+      if (label) label.textContent = "拖到此处删除会话";
+    }
+    if (!row || row.dataset.sessionId === draggingSessionId) return;
+    event.preventDefault();
+    try { event.dataTransfer.dropEffect = "move"; } catch {}
+    const rect = row.getBoundingClientRect();
+    const after = event.clientY > rect.top + rect.height / 2;
+    document.querySelectorAll("[data-session-row].is-drop-before, [data-session-row].is-drop-after")
+      .forEach((el) => {
+        if (el !== row) el.classList.remove("is-drop-before", "is-drop-after");
+      });
+    row.classList.toggle("is-drop-before", !after);
+    row.classList.toggle("is-drop-after", after);
+  });
+
+  document.addEventListener("dragleave", (event) => {
+    if (!draggingSessionId) return;
+    const trash = event.target.closest?.("[data-session-trash-zone]");
+    if (trash && !trash.contains(event.relatedTarget)) {
+      trash.classList.remove("is-over");
+      const label = trash.querySelector("[data-session-trash-label]");
+      if (label) label.textContent = "拖到此处删除会话";
+    }
+  });
+
+  document.addEventListener("drop", (event) => {
+    if (!draggingSessionId) return;
+    const id = draggingSessionId;
+    const trash = event.target.closest?.("[data-session-trash-zone]");
+    if (trash) {
+      event.preventDefault();
+      event.stopPropagation();
+      draggingSessionId = "";
+      draggingSessionTitle = "";
+      document.body.classList.remove("is-dragging-session");
+      clearSessionDragHighlights();
+      void deleteConversation(id).catch((err) => toastMessage(cleanErrorMessage(err, "删除会话失败"), "error"));
+      return;
+    }
+    const row = event.target.closest?.("[data-session-row]");
+    if (row && row.dataset.sessionId && row.dataset.sessionId !== id) {
+      event.preventDefault();
+      event.stopPropagation();
+      const targetId = row.dataset.sessionId;
+      const rect = row.getBoundingClientRect();
+      const after = event.clientY > rect.top + rect.height / 2;
+      draggingSessionId = "";
+      draggingSessionTitle = "";
+      document.body.classList.remove("is-dragging-session");
+      clearSessionDragHighlights();
+      void commitSessionReorder(id, targetId, after);
+    }
+  });
+
+  document.addEventListener("dragend", () => {
+    if (!draggingSessionId && !document.body.classList.contains("is-dragging-session")) return;
+    draggingSessionId = "";
+    draggingSessionTitle = "";
+    document.body.classList.remove("is-dragging-session");
+    clearSessionDragHighlights();
+  });
 }

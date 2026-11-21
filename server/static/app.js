@@ -9,12 +9,13 @@ import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm
 import { clearFeedbackCache, copyFeedbackLog, feedbackPage, initClientLogCapture, openFeedbackDetail,
   openFeedbackModal, quickUploadFeedback, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
 import { abortOrphanTurn, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, closeComposerPickers,
-  closeSlashMenu, copyReply, discardCheckpoint, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
-  loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
-  removeSource, resetChatState, resumeFailedTurn, retryTurn, runDesktopAgent, saveImageAutoPreference,
+  closeSessionContextMenu, closeSlashMenu, copyReply, deleteConversation, discardCheckpoint, generateImageFromComposer, handleSlashKeydown,
+  initSessionDragAndMenu, loadDesktopModelState, loadEarlier, loadWorkspace, openDeckInStudio, openImageLightbox,
+  openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
+  removeSource, resetChatState, resumeFailedTurn, retitleSingleConversation, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
-  showSources, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
-  syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer,
+  showSources, submitRenameConversation, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
+  syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer, togglePinConversation,
   toggleWorkspaceContext, triggerSlashMenu, updateSlashMenu, useExample, workspaceView } from "./chat.js";
 import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
@@ -560,6 +561,11 @@ async function onClick(event) {
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-auto-titles": await autoTitleRecentConversations({ force: true, limit: 15, triggerButton: target }); break;
+    case "session-menu": openSessionContextMenu(id, target); break;
+    case "session-delete": await deleteConversation(id); break;
+    case "session-pin": await togglePinConversation(id); break;
+    case "session-rename": openRenameConversationModal(id); break;
+    case "session-ai-title": await retitleSingleConversation(id); break;
     case "chat-earlier": await loadEarlier(); break;
     case "chat-cancel": await cancelActiveChat(); break;
     case "chat-resume": await resumeFailedTurn(target); break;
@@ -862,6 +868,8 @@ async function handleForm(event) {
     } else if (type === "feedback-update") {
       await saveFeedbackUpdate(form);
       if (state.route[0] === "feedback") await render(true);
+    } else if (type === "session-rename") {
+      await submitRenameConversation(form);
     } else if (type === "task-template") {
       const intent = event.submitter?.value || "draft";
       await saveTaskForm(form, intent);
@@ -1124,4 +1132,5 @@ setInterval(async () => {
 initClientLogCapture();
 applyTheme(getTheme());
 initCustomSelects();
+initSessionDragAndMenu();
 void startup();

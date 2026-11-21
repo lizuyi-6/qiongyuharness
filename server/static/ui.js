@@ -79,7 +79,10 @@ const paths = {
   move: '<path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20"/>',
   crop: '<rect x="5" y="5" width="14" height="14" rx="1.5" stroke-dasharray="3 2.5"/>',
   bug: '<path d="M8 7a4 4 0 0 1 8 0v1H8V7Z"/><rect x="6" y="8" width="12" height="11" rx="5"/><path d="M12 8v11M3 11h3m12 0h3M4 16l2.5-1M20 16l-2.5-1M9 4 7.5 2.5M15 4l1.5-1.5"/>',
-  flag: '<path d="M5 21V4h11l-1.5 4.5L16 13H5"/>'
+  flag: '<path d="M5 21V4h11l-1.5 4.5L16 13H5"/>',
+  trash: '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6m6 5v6m4-6v6"/>',
+  pin: '<path d="M12 17v5M9 4h6l-1 5 3 3v2H7v-2l3-3-1-5Z"/>',
+  more: '<circle cx="6" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="1.3" fill="currentColor" stroke="none"/>'
 };
 
 const THEME_KEY = "qo-theme";
@@ -168,7 +171,8 @@ export const eventLabels = {
   "agent.completed":"完成文稿协助", "agent.failed":"文稿协助失败", "schedule.created":"启动重复计划",
   "schedule.updated":"更新重复计划", "auth.login":"企业身份登录", "image.started":"启动图片生成",
   "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片",
-  "feedback.submitted":"提交问题反馈", "feedback.updated":"更新反馈状态"
+  "feedback.submitted":"提交问题反馈", "feedback.updated":"更新反馈状态",
+  "conversation.deleted":"删除办公会话"
 };
 
 export function badge(value) {

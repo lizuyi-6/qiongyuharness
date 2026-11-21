@@ -261,18 +261,61 @@ def public_turn(row):
 
 
 def conversation_summary(row):
-    return {name: row[name] for name in ("id", "assignment_id", "project_id", "title", "updated_at")}
+    keys = row.keys() if hasattr(row, "keys") else ()
+    return {
+        "id": row["id"],
+        "assignment_id": row["assignment_id"],
+        "project_id": row["project_id"],
+        "title": row["title"],
+        "updated_at": row["updated_at"],
+        "pinned": bool(row["pinned"]) if "pinned" in keys else False,
+        "sort_order": row["sort_order"] if "sort_order" in keys else None,
+    }
+
+
+class ConversationPatch(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    pinned: bool | None = None
+
+
+class ConversationReorder(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+def _list_user_conversations(db, user_id: str):
+    rows = db.all("""SELECT c.* FROM office_conversations c LEFT JOIN assignments a ON a.id=c.assignment_id
+                   LEFT JOIN office_project_members m ON m.project_id=c.project_id AND m.user_id=c.owner_id
+                   WHERE c.owner_id=? AND (c.assignment_id IS NULL OR a.assignee_id=?)
+                   AND (c.project_id IS NULL OR m.user_id IS NOT NULL)
+                   ORDER BY c.pinned DESC, CASE WHEN c.sort_order IS NULL THEN 0 ELSE 1 END ASC, c.sort_order ASC, c.updated_at DESC LIMIT 60""",
+                  (user_id, user_id))
+    return [conversation_summary(row) for row in rows]
 
 
 @router.get("")
 def list_threads(user: User):
     with database() as db:
-        rows = db.all("""SELECT c.* FROM office_conversations c LEFT JOIN assignments a ON a.id=c.assignment_id
-                       LEFT JOIN office_project_members m ON m.project_id=c.project_id AND m.user_id=c.owner_id
-                       WHERE c.owner_id=? AND (c.assignment_id IS NULL OR a.assignee_id=?)
-                       AND (c.project_id IS NULL OR m.user_id IS NOT NULL)
-                       ORDER BY c.updated_at DESC LIMIT 60""", (user["id"], user["id"]))
-    return [conversation_summary(row) for row in rows]
+        return _list_user_conversations(db, user["id"])
+
+
+@router.put("/reorder")
+def reorder_threads(body: ConversationReorder, user: User):
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for raw_id in body.ids:
+        cid = str(raw_id or "").strip()
+        if cid and cid not in seen_set:
+            seen_set.add(cid)
+            seen.append(cid)
+    if not seen:
+        fail(422, "排序列表不能为空")
+    with database(write=True) as db:
+        for idx, cid in enumerate(seen):
+            db.execute(
+                "UPDATE office_conversations SET sort_order=? WHERE id=? AND owner_id=?",
+                ((idx + 1) * 10, cid, user["id"]),
+            )
+        return _list_user_conversations(db, user["id"])
 
 
 @router.post("")
@@ -381,6 +424,48 @@ def update_title_route(key: str, body: TitleUpdate, user: User):
         db.execute("UPDATE office_conversations SET title=? WHERE id=?", (cleaned, key))
         updated = owned_thread(db, key, user)
     return conversation_summary(updated)
+
+
+@router.patch("/{key}")
+def patch_thread_route(key: str, body: ConversationPatch, user: User):
+    with database(write=True) as db:
+        current = owned_thread(db, key, user)
+        next_title = current["title"]
+        if body.title is not None:
+            cleaned = _clean_session_title(body.title)
+            if len(cleaned) < 1:
+                fail(422, "标题不能为空")
+            next_title = cleaned
+        next_pinned = int(bool(body.pinned)) if body.pinned is not None else int(bool(current["pinned"]))
+        if body.pinned is not None and bool(body.pinned) != bool(current["pinned"]):
+            db.execute(
+                "UPDATE office_conversations SET title=?, pinned=?, sort_order=NULL WHERE id=?",
+                (next_title, next_pinned, key),
+            )
+        else:
+            db.execute(
+                "UPDATE office_conversations SET title=?, pinned=? WHERE id=?",
+                (next_title, next_pinned, key),
+            )
+        updated = owned_thread(db, key, user)
+    return conversation_summary(updated)
+
+
+@router.delete("/{key}")
+def delete_thread_route(key: str, user: User):
+    with database(write=True) as db:
+        current = owned_thread(db, key, user)
+        stale_before = instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=40))
+        running = db.one(
+            "SELECT id FROM office_turns WHERE conversation_id=? AND status='running' AND created_at>?",
+            (key, stale_before),
+        )
+        if running:
+            fail(409, "该会话正在执行中，请先停止生成后再删除")
+        db.execute("DELETE FROM office_turns WHERE conversation_id=?", (key,))
+        db.execute("DELETE FROM office_conversations WHERE id=? AND owner_id=?", (key, user["id"]))
+        audit(db, "conversation.deleted", user["id"], conversation_id=key, title=current["title"])
+    return {"ok": True, "id": key}
 
 
 def demo_decision(message, mode, task, sources, recent, latest):

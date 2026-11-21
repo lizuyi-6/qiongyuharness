@@ -21,17 +21,55 @@
 .workspace-nav .history-trigger { display: none; width: 100%; }
 
 .recent-sessions {
-  max-height: 216px;
+  max-height: 224px;
   overflow-y: auto;
   overflow-x: hidden;
   display: grid;
   gap: 2px;
   min-width: 0;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
 }
+.recent-sessions:hover {
+  scrollbar-color: var(--line-strong) transparent;
+}
+.recent-sessions::-webkit-scrollbar { width: 4px; }
+.recent-sessions::-webkit-scrollbar-track { background: transparent; }
+.recent-sessions::-webkit-scrollbar-thumb { background: transparent; border-radius: 999px; }
+.recent-sessions:hover::-webkit-scrollbar-thumb { background: var(--line-strong); }
+
+.session-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: var(--radius);
+  transition: background var(--t-fast), opacity var(--t-fast), transform var(--t-fast);
+}
+.session-row.is-dragging {
+  opacity: 0.42;
+}
+.session-row.is-drop-before::after,
+.session-row.is-drop-after::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--hairline);
+  pointer-events: none;
+  z-index: 4;
+}
+.session-row.is-drop-before::after { top: -1px; }
+.session-row.is-drop-after::after { bottom: -1px; }
+
 .session-link {
   position: relative;
   display: flex;
   align-items: center;
+  flex: 1;
   width: 100%;
   min-width: 0;
   gap: 7px;
@@ -43,7 +81,14 @@
   text-align: left;
   color: var(--ink-2);
   font-size: 12.5px;
-  transition: background var(--t-fast), color var(--t-fast);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), padding-right var(--t-fast);
+}
+.session-row:hover .session-link,
+.session-row:focus-within .session-link {
+  background: var(--bg-hover);
+  color: var(--ink);
+  padding-right: 48px;
 }
 .session-link::before {
   content: "";
@@ -66,11 +111,153 @@
   white-space: nowrap;
 }
 .session-link svg { width: 13px; height: 13px; color: var(--ink-3); flex: none; }
-.session-link:hover { background: var(--bg-hover); color: var(--ink); }
-.session-link:hover::before { transform: scaleY(0.45); opacity: 0.4; }
+.session-row.is-pinned .session-link svg { color: var(--ink); }
+.session-link:hover::before,
+.session-row:hover .session-link::before { transform: scaleY(0.45); opacity: 0.4; }
 .session-link.active { background: var(--bg-selected); color: var(--ink); font-weight: 560; }
 .session-link.active svg { color: var(--ink); }
 .session-link.active::before { transform: scaleY(1); opacity: 1; }
+
+.session-row-actions {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-fast);
+}
+.session-row:hover .session-row-actions,
+.session-row:focus-within .session-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+body.is-dragging-session .session-row-actions {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+.session-act-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.session-act-btn svg { width: 13px; height: 13px; }
+.session-act-btn:hover { background: var(--bg-selected); color: var(--ink); }
+.session-act-btn.is-danger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger);
+}
+
+/* 拖拽删除投放区：拖动会话时平滑展开 */
+.session-trash-zone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  max-height: 0;
+  margin-top: 0;
+  padding: 0 8px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  border: 1.5px dashed transparent;
+  border-radius: var(--radius);
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 560;
+  transition: max-height 180ms var(--ease-line), margin-top 180ms var(--ease-line),
+    padding 180ms var(--ease-line), opacity 160ms ease, background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+.session-trash-zone svg { width: 14px; height: 14px; flex: none; transition: transform 150ms ease; }
+body.is-dragging-session .session-trash-zone {
+  max-height: 44px;
+  margin-top: 6px;
+  padding: 9px 10px;
+  opacity: 1;
+  pointer-events: auto;
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  background: color-mix(in srgb, var(--danger) 6%, var(--bg-page));
+}
+body.is-dragging-session .session-trash-zone.is-over {
+  border-style: solid;
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg-page));
+  transform: scale(1.015);
+}
+body.is-dragging-session .session-trash-zone.is-over svg {
+  transform: scale(1.18) rotate(-8deg);
+}
+
+/* 会话右键/更多操作浮层菜单 */
+.session-ctx-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 152px;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: calc(var(--radius) + 2px);
+  background: var(--bg-page);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+  display: grid;
+  gap: 2px;
+  animation: item-rise 120ms var(--ease-line) both;
+}
+.session-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: calc(var(--radius) - 2px);
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.session-ctx-item svg { width: 13.5px; height: 13.5px; color: var(--ink-3); flex: none; }
+.session-ctx-item:hover { background: var(--bg-hover); }
+.session-ctx-item:hover svg { color: var(--ink); }
+.session-ctx-item.is-danger { color: var(--danger); }
+.session-ctx-item.is-danger svg { color: var(--danger); }
+.session-ctx-item.is-danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.session-ctx-divider {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--line);
+}
+
+.session-history-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.session-history-open {
+  flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+}
+.session-history-open span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .session-running-dot {
   width: 6px;
   height: 6px;

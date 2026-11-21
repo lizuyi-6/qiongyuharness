@@ -80,6 +80,7 @@ CREATE INDEX IF NOT EXISTS office_project_context_project ON office_project_cont
 CREATE TABLE IF NOT EXISTS office_conversations (
  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
  assignment_id TEXT REFERENCES assignments(id), project_id TEXT REFERENCES office_projects(id), title TEXT NOT NULL,
+ pinned INTEGER NOT NULL DEFAULT 0, sort_order INTEGER,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS office_conversations_owner ON office_conversations(owner_id, updated_at);
@@ -254,6 +255,8 @@ def initialize():
             db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS roster_blocked INTEGER NOT NULL DEFAULT 0")
             db.execute("ALTER TABLE auth_flows ADD COLUMN IF NOT EXISTS port INTEGER")
             db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS project_id TEXT REFERENCES office_projects(id)")
+            db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS sort_order INTEGER")
         else:
             user_columns = {row["name"] for row in db.all("PRAGMA table_info(users)")}
             if "enabled" not in user_columns:
@@ -269,8 +272,13 @@ def initialize():
             flow_columns = {row["name"] for row in db.all("PRAGMA table_info(auth_flows)")}
             if "port" not in flow_columns:
                 db.execute("ALTER TABLE auth_flows ADD COLUMN port INTEGER")
-        if not DSN and "project_id" not in {row["name"] for row in db.all("PRAGMA table_info(office_conversations)")}:
-            db.execute("ALTER TABLE office_conversations ADD COLUMN project_id TEXT REFERENCES office_projects(id)")
+            conv_columns = {row["name"] for row in db.all("PRAGMA table_info(office_conversations)")}
+            if "project_id" not in conv_columns:
+                db.execute("ALTER TABLE office_conversations ADD COLUMN project_id TEXT REFERENCES office_projects(id)")
+            if "pinned" not in conv_columns:
+                db.execute("ALTER TABLE office_conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            if "sort_order" not in conv_columns:
+                db.execute("ALTER TABLE office_conversations ADD COLUMN sort_order INTEGER")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_subject_unique ON users(subject)")
         users = [(user_id, None, None, name, department, role, True) for user_id, name, department, role in DEMO_USERS] if DEMO else []

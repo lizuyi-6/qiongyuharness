@@ -90,7 +90,14 @@
   flex-direction: column;
   gap: 2px;
   padding: 2px 0 8px;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
 }
+.sidebar-nav:hover { scrollbar-color: var(--line-strong) transparent; }
+.sidebar-nav::-webkit-scrollbar { width: 4px; }
+.sidebar-nav::-webkit-scrollbar-track { background: transparent; }
+.sidebar-nav::-webkit-scrollbar-thumb { background: transparent; border-radius: 999px; }
+.sidebar-nav:hover::-webkit-scrollbar-thumb { background: var(--line-strong); }
 
 .nav-group {
   margin-top: 10px;
@@ -516,6 +523,7 @@
 .app-shell.sidebar-collapsed .id-copy,
 .app-shell.sidebar-collapsed .identity > svg,
 .app-shell.sidebar-collapsed .recent-sessions,
+.app-shell.sidebar-collapsed .session-trash-zone,
 .app-shell.sidebar-collapsed .new-session-label { display: none; }
 .app-shell.sidebar-collapsed .nav { justify-content: center; padding: 7px 0; }
 .app-shell.sidebar-collapsed .identity { justify-content: center; padding: 5px 0; }

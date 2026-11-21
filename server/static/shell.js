@@ -171,7 +171,7 @@ export function syncSidebarConversations() {
   const conversations = state.chatWorkspace?.conversations || state.conversations || [];
   const activeId = state.route[0] === "chat" ? (state.route[1] || "") : "";
   const running = runningConversationIds();
-  const sig = JSON.stringify([activeId, running, conversations.map((c) => [c.id, c.title])]);
+  const sig = JSON.stringify([activeId, running, conversations.map((c) => [c.id, c.title, Boolean(c.pinned)])]);
   if (sig === lastConversationsSig) return;
   lastConversationsSig = sig;
 
