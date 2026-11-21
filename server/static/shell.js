@@ -83,7 +83,7 @@ export function ensureShell() {
           <span class="avatar">${e(person.name.slice(-2))}</span>
           <span class="id-copy">
             <strong>${e(person.name)}</strong>
-            <small>${e(person.department || "未分配")} · ${e(roles[person.role])}</small>
+            <small>${person.department ? `${e(person.department)} · ` : ""}${e(roles[person.role])}</small>
           </span>
           ${icon("down")}
         </button>

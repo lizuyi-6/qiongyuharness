@@ -520,11 +520,11 @@ export function settingsView() {
          <span class="avatar lg">${e(state.me.name.slice(-2))}</span>
          <div>
            <h3>${e(state.me.name)}</h3>
-           <p>${e(state.me.department || "未分配")} · ${e(roles[state.me.role])}</p>
+           <p>${state.me.department ? `${e(state.me.department)} · ` : ""}${e(roles[state.me.role])}</p>
          </div>
        </div>
        <div>
-         <div class="engine-card-row"><span>所属部门</span><strong>${e(state.me.department || "未分配")}</strong></div>
+         <div class="engine-card-row"><span>所属部门</span><strong>${e(state.me.department || "未设置部门")}</strong></div>
          <div class="engine-card-row"><span>权限角色</span><strong>${e(roles[state.me.role])}</strong></div>
          <div class="engine-card-row"><span>组织时区</span><strong class="mono">${e(state.me.timezone)}</strong></div>
          <div class="engine-card-row"><span>外观主题</span><strong>${getTheme() === "dark" ? "深色 · 白线" : "浅色 · 黑线"}</strong></div>

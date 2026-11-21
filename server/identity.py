@@ -216,10 +216,17 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
                 name = name_value.strip() if isinstance(name_value, str) else ""
                 if not name:
                     name = email.split("@", 1)[0]
+                default_dept = os.getenv("QO_DEFAULT_DEPARTMENT", "").strip()
+                if not default_dept:
+                    org_row = db.one(
+                        "SELECT department FROM users WHERE source='roster' AND enabled=1 AND department<>'' ORDER BY CASE WHEN role='admin' THEN 0 ELSE 1 END LIMIT 1"
+                    )
+                    if org_row and org_row["department"]:
+                        default_dept = str(org_row["department"]).strip()
                 if email_user:
                     db.execute(
-                        "UPDATE users SET subject=?,name=?,department='',role='employee',enabled=1,source='auto',roster_blocked=0 WHERE id=?",
-                        (subject, name, email_user["id"]),
+                        "UPDATE users SET subject=?,name=?,department=?,role='employee',enabled=1,source='auto',roster_blocked=0 WHERE id=?",
+                        (subject, name, default_dept, email_user["id"]),
                     )
                     user_id = email_user["id"]
                     newly_enrolled = email_user["source"] != "auto" or not email_user["enabled"]
@@ -229,7 +236,7 @@ async def auth_callback(request: Request, state: str = "", code: str = ""):
                     db.execute(
                         "INSERT INTO users(id,email,subject,name,department,role,enabled,source,roster_blocked) "
                         "VALUES(?,?,?,?,?,'employee',1,'auto',0)",
-                        (user_id, email, subject, name, ""),
+                        (user_id, email, subject, name, default_dept),
                     )
                     newly_enrolled = True
                     subject_was_unbound = True

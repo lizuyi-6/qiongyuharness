@@ -649,7 +649,7 @@ async function onClick(event) {
       modal("账户与身份", `<div class="stack">
         <div class="profile-banner">
           <span class="avatar lg">${e(state.me.name.slice(-2))}</span>
-          <div><h3>${e(state.me.name)}</h3><p>${e(state.me.department || "未分配部门")} · ${e(roles[state.me.role])}</p></div>
+          <div><h3>${e(state.me.name)}</h3><p>${state.me.department ? `${e(state.me.department)} · ` : ""}${e(roles[state.me.role])}</p></div>
         </div>
         ${state.config.demo ? '<p class="hint">切换演示身份以体验员工、主管、审阅人与管理员视角。</p>' : ""}
         ${state.config.demo ? `<div class="demo-roster">${demoUsers.filter((u) => u[0] !== state.me.id).map(([person, name, role]) => `
