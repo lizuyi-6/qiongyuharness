@@ -21,7 +21,6 @@ PROXY_FORWARD_REQ_HEADERS = (
     "openai-beta",
     "x-request-id",
     "idempotency-key",
-    "user-agent",
 )
 PROXY_FORWARD_RESP_HEADERS = (
     "content-type",
@@ -264,11 +263,16 @@ async def _proxy_v1(request: Request, endpoint: str):
     if request.url.query:
         target_url = f"{target_url}?{request.url.query}"
 
-    forward_headers = {"Accept-Encoding": "identity"}
+    forward_headers = {
+        "Accept-Encoding": "identity",
+        "User-Agent": USER_AGENT,
+    }
     for name in PROXY_FORWARD_REQ_HEADERS:
         val = request.headers.get(name)
         if val:
-            forward_headers[name] = val
+            safe_val = val.encode("ascii", "ignore").decode("ascii").strip()
+            if safe_val:
+                forward_headers[name] = safe_val
 
     body = await request.body() if request.method in {"POST", "PUT", "PATCH"} else None
     client = httpx.AsyncClient(timeout=PROXY_TIMEOUT, trust_env=False)

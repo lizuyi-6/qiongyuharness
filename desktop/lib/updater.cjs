@@ -74,6 +74,173 @@ function psQuote(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
+function psEncodedCommand(script) {
+  return Buffer.from(String(script), "utf16le").toString("base64");
+}
+
+function buildDeltaNodeScript() {
+  return [
+    '"use strict";',
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const { spawn, spawnSync } = require("node:child_process");',
+    '',
+    'const configPath = process.argv[2];',
+    'if (!configPath) process.exit(2);',
+    'const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));',
+    'const logPath = cfg.logPath || path.join(path.dirname(configPath), "last-update.log");',
+    'function log(msg) {',
+    '  try { fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${msg}\\r\\n`, "utf8"); } catch {}',
+    '}',
+    'function sleep(ms) {',
+    '  return new Promise((resolve) => setTimeout(resolve, ms));',
+    '}',
+    'function isPidAlive(pid) {',
+    '  if (!Number.isInteger(pid) || pid <= 0) return false;',
+    '  try { process.kill(pid, 0); return true; } catch (err) { return err && err.code === "EPERM"; }',
+    '}',
+    'function forceKillTree(pid, exePath) {',
+    '  const sysRoot = process.env.SystemRoot || "C:\\\\Windows";',
+    '  const taskkill = path.join(sysRoot, "System32", "taskkill.exe");',
+    '  if (Number.isInteger(pid) && pid > 0) {',
+    '    try { spawnSync(taskkill, ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 5000 }); } catch {}',
+    '  }',
+    '  const exeName = path.basename(exePath || "");',
+    '  if (exeName && exeName.toLowerCase().endsWith(".exe")) {',
+    '    try { spawnSync(taskkill, ["/IM", exeName, "/T", "/F"], { windowsHide: true, timeout: 5000 }); } catch {}',
+    '  }',
+    '}',
+    'async function launchApp(exePath) {',
+    '  if (!exePath || !fs.existsSync(exePath)) {',
+    '    log("launch skipped: exe missing " + exePath);',
+    '    return false;',
+    '  }',
+    '  const exeDir = path.dirname(exePath);',
+    '  // Method 1: Direct CreateProcessW via Node spawn (native UTF-16 Chinese path support)',
+    '  try {',
+    '    const child = spawn(exePath, [], { cwd: exeDir, detached: true, windowsHide: false, stdio: "ignore" });',
+    '    child.unref();',
+    '    log("spawn direct pid=" + String(child.pid || 0));',
+    '    await sleep(1200);',
+    '    if (child.pid && isPidAlive(child.pid)) {',
+    '      log("direct launch confirmed alive pid=" + child.pid);',
+    '      return true;',
+    '    }',
+    '  } catch (err) {',
+    '    log("direct launch failed: " + (err && err.message || err));',
+    '  }',
+    '  // Method 2: Windows explorer.exe interactive shell launch',
+    '  try {',
+    '    const sysRoot = process.env.SystemRoot || "C:\\\\Windows";',
+    '    const explorer = path.join(sysRoot, "explorer.exe");',
+    '    const child = spawn(explorer, [exePath], { cwd: exeDir, detached: true, windowsHide: false, stdio: "ignore" });',
+    '    child.unref();',
+    '    log("fallback explorer.exe launch issued");',
+    '    await sleep(1500);',
+    '    return true;',
+    '  } catch (err) {',
+    '    log("explorer launch failed: " + (err && err.message || err));',
+    '  }',
+    '  // Method 3: PowerShell Start-Process via UTF-16LE EncodedCommand',
+    '  try {',
+    '    const sysRoot = process.env.SystemRoot || "C:\\\\Windows";',
+    '    const ps = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");',
+    '    const q = (s) => "\'" + String(s).replace(/\'/g, "\'\'") + "\'";',
+    '    const cmd = `Start-Process -FilePath ${q(exePath)} -WorkingDirectory ${q(exeDir)} -WindowStyle Normal`;',
+    '    const enc = Buffer.from(cmd, "utf16le").toString("base64");',
+    '    spawnSync(ps, ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc], { windowsHide: true, timeout: 10000 });',
+    '    log("fallback powershell Start-Process issued");',
+    '    return true;',
+    '  } catch (err) {',
+    '    log("powershell launch failed: " + (err && err.message || err));',
+    '  }',
+    '  return false;',
+    '}',
+    'async function main() {',
+    '  try { fs.writeFileSync(logPath, "", "utf8"); } catch {}',
+    '  log("delta updater started version=" + cfg.version + " targetPid=" + cfg.pid);',
+    '  if (cfg.startedFlagPath) {',
+    '    try { fs.writeFileSync(cfg.startedFlagPath, String(process.pid), "utf8"); } catch {}',
+    '  }',
+    '  // Wait for old app process to exit cleanly',
+    '  for (let i = 0; i < 40; i += 1) {',
+    '    if (!isPidAlive(cfg.pid)) break;',
+    '    await sleep(200);',
+    '  }',
+    '  if (isPidAlive(cfg.pid)) {',
+    '    log("old pid still alive after 8s, forcing kill");',
+    '    forceKillTree(cfg.pid, cfg.exePath);',
+    '    await sleep(600);',
+    '  } else {',
+    '    // Give child GPU/Renderer processes and single-instance mutex time to release',
+    '    await sleep(700);',
+    '  }',
+    '  fs.mkdirSync(cfg.backupDir, { recursive: true });',
+    '  const backedUp = [];',
+    '  try {',
+    '    for (const rel of cfg.files || []) {',
+    '      const parts = String(rel).split("/");',
+    '      let src = path.join(cfg.stagedDir, ...parts) + ".payload";',
+    '      if (!fs.existsSync(src)) src = path.join(cfg.stagedDir, ...parts);',
+    '      if (!fs.existsSync(src)) throw new Error("Missing staged file: " + rel);',
+    '      const dst = path.join(cfg.resourcesDir, ...parts);',
+    '      const bak = path.join(cfg.backupDir, ...parts);',
+    '      fs.mkdirSync(path.dirname(dst), { recursive: true });',
+    '      if (fs.existsSync(dst)) {',
+    '        fs.mkdirSync(path.dirname(bak), { recursive: true });',
+    '        fs.copyFileSync(dst, bak);',
+    '        backedUp.push(rel);',
+    '      }',
+    '      let copied = false;',
+    '      let lastErr = null;',
+    '      for (let attempt = 0; attempt < 25; attempt += 1) {',
+    '        try {',
+    '          fs.copyFileSync(src, dst);',
+    '          copied = true;',
+    '          break;',
+    '        } catch (err) {',
+    '          lastErr = err;',
+    '          if (attempt === 6) forceKillTree(cfg.pid, cfg.exePath);',
+    '          await sleep(300);',
+    '        }',
+    '      }',
+    '      if (!copied) throw new Error("Failed to replace " + rel + ": " + (lastErr && lastErr.message || "locked"));',
+    '      log("replaced " + rel);',
+    '    }',
+    '    const meta = JSON.stringify({ version: cfg.version, mode: "delta", applied_at: new Date().toISOString() });',
+    '    fs.writeFileSync(cfg.appliedPath, meta, "utf8");',
+    '    try { fs.rmSync(cfg.stagedDir, { recursive: true, force: true }); } catch {}',
+    '    try { fs.rmSync(cfg.backupDir, { recursive: true, force: true }); } catch {}',
+    '    if (cfg.patchFile) { try { fs.rmSync(cfg.patchFile, { force: true }); } catch {} }',
+    '    if (cfg.errorLogPath) { try { fs.rmSync(cfg.errorLogPath, { force: true }); } catch {} }',
+    '    log("delta update applied successfully");',
+    '  } catch (err) {',
+    '    const msg = (err && err.message) || String(err);',
+    '    log("update failed, rolling back: " + msg);',
+    '    if (cfg.errorLogPath) {',
+    '      try { fs.writeFileSync(cfg.errorLogPath, new Date().toISOString() + " " + msg, "utf8"); } catch {}',
+    '    }',
+    '    for (const rel of backedUp) {',
+    '      try {',
+    '        const parts = String(rel).split("/");',
+    '        const bak = path.join(cfg.backupDir, ...parts);',
+    '        const dst = path.join(cfg.resourcesDir, ...parts);',
+    '        if (fs.existsSync(bak)) fs.copyFileSync(bak, dst);',
+    '      } catch {}',
+    '    }',
+    '  }',
+    '  await launchApp(cfg.exePath);',
+    '  if (cfg.startedFlagPath) { try { fs.rmSync(cfg.startedFlagPath, { force: true }); } catch {} }',
+    '  log("delta updater finished");',
+    '}',
+    'main().catch((err) => {',
+    '  log("fatal: " + (err && err.stack || err));',
+    '  process.exit(1);',
+    '});',
+    ''
+  ].join("\r\n");
+}
+
 function buildDeltaApplyScript({ pid, resourcesDir, stagedDir, backupDir, exePath, appliedPath, errorLogPath, patchFile, files, version }) {
   const relList = files.map((file) => psQuote(file)).join(", ");
   return [
@@ -154,7 +321,15 @@ function buildDeltaApplyScript({ pid, resourcesDir, stagedDir, backupDir, exePat
     "}",
     "if (Test-Path -LiteralPath $ExePath) {",
     "  $ExeDir = Split-Path -Parent $ExePath",
-    "  Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal",
+    "  try {",
+    "    $started = Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal -PassThru",
+    "    Start-Sleep -Milliseconds 1000",
+    "    if (-not $started -or $started.HasExited) {",
+    "      Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList $ExePath",
+    "    }",
+    "  } catch {",
+    "    try { Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList $ExePath } catch {}",
+    "  }",
     "}",
     ""
   ].join("\r\n");
@@ -185,7 +360,15 @@ function buildFullApplyScript({ pid, installerPath, exePath, appliedPath, versio
     "  Set-Content -LiteralPath $AppliedPath -Value $meta -Encoding UTF8",
     "  Remove-Item -LiteralPath $InstallerPath -Force -ErrorAction SilentlyContinue",
     "  $ExeDir = Split-Path -Parent $ExePath",
-    "  Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal",
+    "  try {",
+    "    $started = Start-Process -FilePath $ExePath -WorkingDirectory $ExeDir -WindowStyle Normal -PassThru",
+    "    Start-Sleep -Milliseconds 1000",
+    "    if (-not $started -or $started.HasExited) {",
+    "      Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList $ExePath",
+    "    }",
+    "  } catch {",
+    "    try { Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList $ExePath } catch {}",
+    "  }",
     "} elseif (Test-Path -LiteralPath $InstallerPath) {",
     "  Start-Process -FilePath $InstallerPath",
     "}",
@@ -658,6 +841,57 @@ function createDesktopUpdater({
     }
   }
 
+  async function waitForFile(filePath, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(filePath)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    }
+    return fs.existsSync(filePath);
+  }
+
+  async function launchPowerShellScriptDetached(powershellExe, scriptPath) {
+    // 使用 UTF-16LE Base64 -EncodedCommand 启动引导器，彻底避免 .vbs ASCII 截断中文用户名/路径及杀软拦截 wscript.exe
+    const launchCmd = [
+      `$ps = ${psQuote(powershellExe)}`,
+      `$script = ${psQuote(scriptPath)}`,
+      "$args = @('-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $script)",
+      "$launched = $false",
+      "try {",
+      "  $cmdLine = '\"' + $ps + '\" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"' + $script + '\"'",
+      "  $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine } -ErrorAction Stop",
+      "  if ($res -and $res.ReturnValue -eq 0) { $launched = $true }",
+      "} catch {}",
+      "if (-not $launched) {",
+      "  Start-Process -FilePath $ps -ArgumentList $args -WindowStyle Hidden",
+      "}"
+    ].join("\r\n");
+    const encoded = psEncodedCommand(launchCmd);
+    await new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      const child = spawnImpl(powershellExe, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle", "Hidden",
+        "-ExecutionPolicy", "Bypass",
+        "-EncodedCommand", encoded
+      ], {
+        detached: false,
+        windowsHide: true,
+        stdio: "ignore"
+      });
+      child.once?.("exit", done);
+      child.once?.("error", done);
+      setTimeout(done, 4000);
+    });
+  }
+
   async function installUpdate() {
     if (state.status !== "ready" || !readyArtifact) {
       throw new Error("尚未准备好可安装的更新包");
@@ -672,68 +906,81 @@ function createDesktopUpdater({
     updateState({ status: "installing", error: "" });
     const appliedPath = path.join(updatesDir, "last-applied.json");
     const errorLogPath = path.join(updatesDir, "last-error.log");
-    const scriptPath = path.join(updatesDir, `apply-${readyArtifact.mode}-${readyArtifact.version}.ps1`);
+    const updateLogPath = path.join(updatesDir, "last-update.log");
+    const startedFlagPath = path.join(updatesDir, `started-${readyArtifact.version}.flag`);
+    await fsp.mkdir(updatesDir, { recursive: true });
+    await fsp.rm(startedFlagPath, { force: true }).catch(() => {});
 
-    let scriptContent;
+    let launchedByNode = false;
     if (readyArtifact.mode === "delta") {
-      const backupDir = path.join(updatesDir, `backup-${readyArtifact.version}`);
-      scriptContent = buildDeltaApplyScript({
-        pid: process.pid,
-        resourcesDir,
-        stagedDir: readyArtifact.stagedDir,
-        backupDir,
-        exePath,
-        appliedPath,
-        errorLogPath,
-        patchFile: readyArtifact.patchPath,
-        files: readyArtifact.files,
-        version: readyArtifact.version
-      });
-    } else {
-      scriptContent = buildFullApplyScript({
-        pid: process.pid,
-        installerPath: readyArtifact.installerPath,
-        exePath,
-        appliedPath,
-        version: readyArtifact.version
-      });
+      const bundledNodeExe = dependencies.bundledNodeExe || path.join(resourcesDir, "qo-runtime", "node", "node.exe");
+      if (bundledNodeExe && fs.existsSync(bundledNodeExe)) {
+        const backupDir = path.join(updatesDir, `backup-${readyArtifact.version}`);
+        const nodeScriptPath = path.join(updatesDir, `apply-delta-${readyArtifact.version}.cjs`);
+        const configPath = path.join(updatesDir, `apply-delta-${readyArtifact.version}.json`);
+        await fsp.writeFile(nodeScriptPath, buildDeltaNodeScript(), { encoding: "utf8" });
+        await fsp.writeFile(configPath, JSON.stringify({
+          pid: process.pid,
+          resourcesDir,
+          stagedDir: readyArtifact.stagedDir,
+          backupDir,
+          exePath,
+          appliedPath,
+          errorLogPath,
+          logPath: updateLogPath,
+          startedFlagPath,
+          patchFile: readyArtifact.patchPath,
+          files: readyArtifact.files,
+          version: readyArtifact.version
+        }, null, 2), { encoding: "utf8" });
+        const child = spawnImpl(bundledNodeExe, [nodeScriptPath, configPath], {
+          cwd: updatesDir,
+          detached: true,
+          windowsHide: true,
+          stdio: "ignore"
+        });
+        child.unref?.();
+        launchedByNode = await waitForFile(startedFlagPath, 2000);
+      }
     }
 
-    // 写入 UTF-8 BOM，确保 Windows PowerShell 5.1 正确解析中文路径（如 穹驭办公.exe）
-    await fsp.writeFile(scriptPath, `\uFEFF${scriptContent}`, { encoding: "utf8" });
+    if (!launchedByNode) {
+      const scriptPath = path.join(updatesDir, `apply-${readyArtifact.mode}-${readyArtifact.version}.ps1`);
+      let scriptContent;
+      if (readyArtifact.mode === "delta") {
+        const backupDir = path.join(updatesDir, `backup-${readyArtifact.version}`);
+        scriptContent = buildDeltaApplyScript({
+          pid: process.pid,
+          resourcesDir,
+          stagedDir: readyArtifact.stagedDir,
+          backupDir,
+          exePath,
+          appliedPath,
+          errorLogPath,
+          patchFile: readyArtifact.patchPath,
+          files: readyArtifact.files,
+          version: readyArtifact.version
+        });
+      } else {
+        scriptContent = buildFullApplyScript({
+          pid: process.pid,
+          installerPath: readyArtifact.installerPath,
+          exePath,
+          appliedPath,
+          version: readyArtifact.version
+        });
+      }
 
-    const sysRoot = process.env.SystemRoot || "C:\\Windows";
-    const powershellExe = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const wscriptExe = path.join(sysRoot, "System32", "wscript.exe");
-    const vbsPath = path.join(updatesDir, `launch-${readyArtifact.mode}-${readyArtifact.version}.vbs`);
-    // 使用 Windows 原生 GUI 子系统 wscript.exe 启动隐藏的 PowerShell，避免 powershell.exe 在 DETACHED_PROCESS + stdio:ignore 下无控制台句柄直接退出
-    if (fs.existsSync(wscriptExe)) {
-      const psCmd = `"${powershellExe}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`;
-      const vbsContent = `CreateObject("WScript.Shell").Run "${psCmd.replace(/"/g, '""')}", 0, False\r\n`;
-      await fsp.writeFile(vbsPath, vbsContent, { encoding: "ascii" });
-      const child = spawnImpl(wscriptExe, ["//B", "//Nologo", vbsPath], {
-        detached: true,
-        windowsHide: true,
-        stdio: "ignore"
-      });
-      child.unref?.();
-    } else {
-      const child = spawnImpl(powershellExe, [
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy", "Bypass",
-        "-File", scriptPath
-      ], {
-        detached: false,
-        windowsHide: true,
-        stdio: "ignore"
-      });
-      child.unref?.();
+      // 写入 UTF-8 BOM，确保 Windows PowerShell 5.1 正确解析中文路径（如中文用户名和 穹驭办公.exe）
+      await fsp.writeFile(scriptPath, `\uFEFF${scriptContent}`, { encoding: "utf8" });
+      const sysRoot = process.env.SystemRoot || "C:\\Windows";
+      const powershellExe = path.join(sysRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      await launchPowerShellScriptDetached(powershellExe, scriptPath);
     }
 
     setTimeout(() => {
       quitApplication?.();
-    }, 220);
+    }, 180);
     return snapshot();
   }
 
@@ -755,11 +1002,13 @@ function createDesktopUpdater({
 module.exports = {
   DELTA_FORMAT,
   buildDeltaApplyScript,
+  buildDeltaNodeScript,
   buildFullApplyScript,
   computeRuntimeHash,
   createDesktopUpdater,
   isAllowedPatchPath,
   isNewerVersion,
+  psEncodedCommand,
   sha256Buffer,
   sha256File,
   unpackAndVerifyDeltaPatch

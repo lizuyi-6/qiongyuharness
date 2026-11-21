@@ -534,8 +534,15 @@ class ZaochangAuthTest(unittest.TestCase):
                 # Admin provision key rejected
                 self.assertEqual(client.get("/v1/models", headers={"Authorization": "Bearer adm_sc_secret"}).status_code, 403)
 
-                # Valid employee key proxies to loopback upstream without leaking session cookie
-                models_resp = client.get("/v1/models", headers={"Authorization": "Bearer sk-emp-proxy-test"})
+                # Valid employee key proxies to loopback upstream without leaking session cookie,
+                # and tolerates raw UTF-8 bytes decoded as latin-1 in User-Agent (Electron "穹驭办公/0.2.22")
+                models_resp = client.get(
+                    "/v1/models",
+                    headers=[
+                        (b"authorization", b"Bearer sk-emp-proxy-test"),
+                        (b"user-agent", "Mozilla/5.0 穹驭办公/0.2.22 Electron/45.3.4".encode("utf-8")),
+                    ],
+                )
                 self.assertEqual(models_resp.status_code, 200)
                 self.assertEqual(models_resp.json(), {"data": [{"id": "glm-5.3"}]})
                 self.assertEqual(models_resp.headers.get("x-accel-buffering"), "no")
