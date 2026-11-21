@@ -243,14 +243,94 @@ function objectOptionLabel(item, counters) {
 
 const RENDER_SCALE = 1.6;
 const HANDLE_RADIUS = 5.5;
+const deckMetaCache = new Map();
+const slideSceneCache = new Map();
+const decodedImageCache = new Map();
+const imageLoadInFlight = new Map();
+
+function lruSet(map, key, value, maxEntries) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > maxEntries) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
+function loadCachedImage(src) {
+  if (!src) return Promise.resolve(null);
+  if (decodedImageCache.has(src)) {
+    const img = decodedImageCache.get(src);
+    decodedImageCache.delete(src);
+    decodedImageCache.set(src, img);
+    return Promise.resolve(img);
+  }
+  if (imageLoadInFlight.has(src)) return imageLoadInFlight.get(src);
+  const promise = new Promise((resolve) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.src = src;
+    image.decode().then(() => {
+      lruSet(decodedImageCache, src, image, 80);
+      resolve(image);
+    }).catch(() => {
+      if (image.complete && image.naturalWidth > 0) {
+        lruSet(decodedImageCache, src, image, 80);
+        resolve(image);
+      } else {
+        resolve(null);
+      }
+    }).finally(() => {
+      imageLoadInFlight.delete(src);
+    });
+  });
+  imageLoadInFlight.set(src, promise);
+  return promise;
+}
+
+function getImmediateSceneImages(scene) {
+  let hasPending = false;
+  const images = (scene?.objects || []).map((shape) => {
+    if (!shape.image) return null;
+    const hit = decodedImageCache.get(shape.image);
+    if (hit) return hit;
+    hasPending = true;
+    return null;
+  });
+  return { images, hasPending };
+}
 
 async function decodeSceneImages(scene) {
-  return Promise.all(scene.objects.map(async (shape) => {
-    if (!shape.image) return null;
-    const image = new Image();
-    image.src = shape.image;
-    try { await image.decode(); return image; } catch { return null; }
-  }));
+  return Promise.all((scene?.objects || []).map((shape) => loadCachedImage(shape.image)));
+}
+
+async function fetchSlideScene(fileId, number) {
+  const key = `${fileId}:${number}`;
+  if (slideSceneCache.has(key)) {
+    const cached = slideSceneCache.get(key);
+    slideSceneCache.delete(key);
+    slideSceneCache.set(key, cached);
+    return cached;
+  }
+  const data = await api("/files/" + encodeURIComponent(fileId) + "/slides/" + number);
+  lruSet(slideSceneCache, key, data, 60);
+  return data;
+}
+
+function prefetchAdjacentSlides(fileId, currentPage, total) {
+  const targets = [];
+  if (currentPage < total) targets.push(currentPage + 1);
+  if (currentPage > 1) targets.push(currentPage - 1);
+  for (const num of targets) {
+    void fetchSlideScene(fileId, num)
+      .then((nextScene) => {
+        if (!nextScene?.objects) return;
+        for (const obj of nextScene.objects) {
+          if (obj.image) void loadCachedImage(obj.image);
+        }
+      })
+      .catch(() => {});
+  }
 }
 
 function effectiveRect(shape, overrides) {
@@ -867,8 +947,6 @@ export function mountDeck() {
 
   async function loadPptxPage(fileId, number) {
     const ticket = ++epoch;
-    scene = null;
-    decodedImages = [];
     activeRegion = null;
     activeShapeIds = [];
     activeLabel = "";
@@ -879,8 +957,13 @@ export function mountDeck() {
     action.disabled = true;
     syncModeUi();
     syncPager(number);
-    if (loading) { loading.textContent = "正在渲染幻灯片…"; loading.hidden = false; }
-    const next = await api("/files/" + encodeURIComponent(fileId) + "/slides/" + number);
+    const cacheKey = `${fileId}:${number}`;
+    const isCached = slideSceneCache.has(cacheKey);
+    if (!isCached && loading) {
+      loading.textContent = "正在渲染幻灯片…";
+      loading.hidden = false;
+    }
+    const next = await fetchSlideScene(fileId, number);
     if (!panel.isConnected || ticket !== epoch) return;
     scene = next;
     const counters = { image: 0, shape: 0 };
@@ -910,13 +993,16 @@ export function mountDeck() {
         activeLabel = selected.label || "";
       }
     }
-    decodedImages = await decodeSceneImages(next);
-    if (!panel.isConnected || ticket !== epoch) return;
+    // 增量秒绘：先立即画出所有矢量排版、文字与已缓存图片，未解码图片后台并行补绘，告别白屏等待
+    const immediate = getImmediateSceneImages(next);
+    decodedImages = immediate.images;
     redrawCanvas(false);
     canvas.hidden = false;
-    canvas.classList.remove("fading");
-    void canvas.offsetWidth;
-    canvas.classList.add("fading");
+    if (!isCached) {
+      canvas.classList.remove("fading");
+      void canvas.offsetWidth;
+      canvas.classList.add("fading");
+    }
     if (loading) loading.hidden = true;
     canvas.setAttribute("aria-label", `第 ${number} 页预览（支持框选修改或拖动排版）`);
     shape.disabled = false;
@@ -928,6 +1014,15 @@ export function mountDeck() {
         ? `已${activeLabel || "圈选区域"}，可在左侧直接输入修改要求（支持换图、改字、调排版）。`
         : "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。");
     remember(currentWorkspace, { deck: { fileId, page: number } });
+
+    if (immediate.hasPending) {
+      void decodeSceneImages(next).then((fullImages) => {
+        if (!panel.isConnected || ticket !== epoch || scene !== next) return;
+        decodedImages = fullImages;
+        redrawCanvas(false);
+      });
+    }
+    prefetchAdjacentSlides(fileId, number, totalPages);
   }
 
   async function loadPptxFile(fileId, preferred = 1) {
@@ -941,8 +1036,15 @@ export function mountDeck() {
     canvas.hidden = true;
     if (strip) strip.replaceChildren();
     syncPager(0);
-    if (loading) { loading.textContent = "正在加载演示文稿…"; loading.hidden = false; }
-    const result = await api("/files/" + encodeURIComponent(fileId) + "/slides");
+    let result = deckMetaCache.get(fileId);
+    if (!result) {
+      if (loading) { loading.textContent = "正在加载演示文稿…"; loading.hidden = false; }
+      result = await api("/files/" + encodeURIComponent(fileId) + "/slides");
+      lruSet(deckMetaCache, fileId, result, 16);
+      if (result?.first_page && result.first_page.page === 1) {
+        lruSet(slideSceneCache, `${fileId}:1`, result.first_page, 60);
+      }
+    }
     if (!panel.isConnected || ticket !== epoch) return;
     totalPages = result.pages.length;
     rebuildChoices(page, result.pages.map((slide) => ({ text: `${slide.page}. ${slide.title}`, value: String(slide.page) })));
