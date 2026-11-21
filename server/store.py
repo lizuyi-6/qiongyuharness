@@ -111,6 +111,35 @@ CREATE TABLE IF NOT EXISTS idempotency (
  fingerprint TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL,
  PRIMARY KEY(actor_id, action, key)
 );
+CREATE TABLE IF NOT EXISTS feedback_reports (
+ id TEXT PRIMARY KEY,
+ reporter_id TEXT NOT NULL REFERENCES users(id),
+ reporter_name TEXT NOT NULL,
+ reporter_email TEXT NOT NULL DEFAULT '',
+ reporter_department TEXT NOT NULL DEFAULT '',
+ reporter_role TEXT NOT NULL DEFAULT '',
+ category TEXT NOT NULL DEFAULT 'bug',
+ title TEXT NOT NULL,
+ description TEXT NOT NULL DEFAULT '',
+ error_message TEXT NOT NULL DEFAULT '',
+ conversation_id TEXT NOT NULL DEFAULT '',
+ conversation_title TEXT NOT NULL DEFAULT '',
+ route TEXT NOT NULL DEFAULT '',
+ client_version TEXT NOT NULL DEFAULT '',
+ server_version TEXT NOT NULL DEFAULT '',
+ platform TEXT NOT NULL DEFAULT '',
+ log_summary TEXT NOT NULL DEFAULT '',
+ log_data TEXT NOT NULL DEFAULT '',
+ log_size INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'open',
+ admin_note TEXT NOT NULL DEFAULT '',
+ handled_by TEXT REFERENCES users(id),
+ handled_at TEXT,
+ created_at TEXT NOT NULL,
+ updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS feedback_reports_created ON feedback_reports(created_at);
+CREATE INDEX IF NOT EXISTS feedback_reports_reporter ON feedback_reports(reporter_id, created_at);
 """
 
 DEMO_USERS = [

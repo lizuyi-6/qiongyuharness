@@ -11,6 +11,7 @@ export const views = {
   admin: ["任务管理", "tasks"],
   review: ["审核队列", "check"],
   audit: ["审计记录", "audit"],
+  feedback: ["问题反馈", "bug"],
   settings: ["设置", "sliders"],
   task: ["任务详情", "docx"]
 };
@@ -451,6 +452,7 @@ export function renderUpdatePanelBody() {
       <div class="actions">
         ${button("重试检查", "update-check", { icon: "refresh" })}
         ${info?.hasFull && info?.latestVersion ? button(`改用完整安装包（${formatBytes(info.fullSize)}）`, "update-download-full", { icon: "download" }) : ""}
+        <button type="button" class="button sm" data-act="feedback-quick-upload" data-source="update" data-error="${e(info?.error || "客户端更新失败")}">${icon("upload")}<span>一键上传日志</span></button>
       </div>
     </div>`;
   }
@@ -515,7 +517,10 @@ export function settingsView() {
          ${isDesktopApp ? `<div class="engine-card-row"><span>客户端版本</span><strong class="mono">${e(desktopVersion || "桌面版")}</strong></div>` : ""}
          ${serverVersion ? `<div class="engine-card-row"><span>工作台版本</span><strong class="mono">${e(serverVersion)}</strong></div>` : ""}
        </div>
-       <div class="actions">${button("检测服务状态", "check-engine", { icon: "refresh" })}</div>
+       <div class="actions">
+         ${button("检测服务状态", "check-engine", { icon: "refresh" })}
+         ${button("问题反馈 / 上传日志", "feedback-open", { icon: "bug" })}
+       </div>
        <div data-update-panel>${updateBody}</div>
      </section>
    </div>`;

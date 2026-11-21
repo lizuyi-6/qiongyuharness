@@ -98,7 +98,10 @@ function unavailableRole(config, models, role) {
   return `智能分工不可用：未开放模型 ${config.roles[role]}（角色：${PIPELINE_ROLE_LABELS[role]}）`;
 }
 
-function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, dependencies = {} }) {
+function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger = null, dependencies = {} }) {
+  const logInfo = (scope, msg, meta) => { try { logger?.info?.(scope, msg, meta); } catch {} };
+  const logWarn = (scope, msg, meta) => { try { logger?.warn?.(scope, msg, meta); } catch {} };
+  const logError = (scope, msg, meta) => { try { logger?.error?.(scope, msg, meta); } catch {} };
   const credentialRoot = path.join(app.getPath("userData"), "qo-model-credentials");
   const runtimePaths = resolveRuntimePaths(app.isPackaged ? process.resourcesPath : undefined, __dirname);
   const activeRuns = new Set();
@@ -415,10 +418,19 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         if (recordedSteps[recordedSteps.length - 1] !== event.label) {
           recordedSteps.push(event.label);
           if (recordedSteps.length > 60) recordedSteps.shift();
+          logInfo("agent.step", event.label, { conversationId: conversationId || undefined, runId: job.run_id || undefined });
         }
       }
       emit(event);
     };
+    logInfo("agent.run", "runAgent started", {
+      model: job.model,
+      conversationId: conversationId || "",
+      runId: job.run_id || "",
+      resume: resumeRequested,
+      imageTool: job.image_tool === true,
+      pptCheck: job.ppt_check === true
+    });
 
     let resumedCheckpoint = null;
     if (resumeRequested && origin && conversationId) {
@@ -835,6 +847,13 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           completedResult: finalPayload,
           error: ""
         });
+        logInfo("agent.run", "pipeline runAgent completed", {
+          conversationId: conversationId || "",
+          runId: job.run_id || "",
+          model: finalPayload.model || job.model,
+          durationMs: clockNow() - startedAt,
+          images: finalImages.length
+        });
         return finalPayload;
       }
       const singleResumeExtra = resumedCheckpoint
@@ -891,8 +910,24 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         completedResult: finalPayload,
         error: ""
       });
+      logInfo("agent.run", "runAgent completed", {
+        conversationId: conversationId || "",
+        runId: job.run_id || "",
+        model: finalPayload.model || job.model,
+        durationMs: clockNow() - startedAt,
+        images: finalImages.length
+      });
       return finalPayload;
     } catch (error) {
+      logError("agent.run", error?.message || "桌面执行失败", {
+        conversationId: conversationId || "",
+        runId: job.run_id || "",
+        model: job.model,
+        stage: checkpointState.stage,
+        durationMs: clockNow() - startedAt,
+        code: error?.code || "",
+        status: error?.status || ""
+      });
       const currentImages = imageBroker ? imageBroker.images : checkpointState.images;
       const newImagesToSave = imageBroker ? imageBroker.images.slice(initialUploadedImageCount) : [];
       if (error?.checkedDeck && typeof error.checkedDeck === "object") {

@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { startLoopbackCallback } = require("./lib/desktop-login.cjs");
+const { createDesktopLogger } = require("./lib/logger.cjs");
 const { createDesktopUpdater } = require("./lib/updater.cjs");
 const { createDesktopAgent } = require("./agent.cjs");
 
@@ -11,6 +12,19 @@ app.setName("穹驭办公");
 // 与安装器快捷方式写入的 AppUserModelID(= build.appId)一致，任务栏才会把窗口归到固定的快捷方式并用其图标。
 if (process.platform === "win32") app.setAppUserModelId("com.qiongyutech.office");
 app.setPath("userData", path.join(app.getPath("appData"), "QiongyuOffice"));
+const desktopLogger = createDesktopLogger({ logDir: path.join(app.getPath("userData"), "qo-logs") });
+desktopLogger.info("main", "application bootstrap", {
+  version: app.getVersion(),
+  platform: `${process.platform}/${process.arch}`,
+  electron: process.versions.electron || "",
+  node: process.versions.node || ""
+});
+process.on("uncaughtException", (error) => {
+  desktopLogger.error("main.uncaught", error?.message || "uncaughtException", error);
+});
+process.on("unhandledRejection", (reason) => {
+  desktopLogger.error("main.rejection", reason?.message || String(reason || "unhandledRejection"), reason instanceof Error ? reason : { reason: String(reason || "") });
+});
 let window;
 let tray;
 let origin;
@@ -52,6 +66,7 @@ function quitApplication() {
   }
   try { desktopAgent?.cancelAgent(); } catch {}
   try { desktopUpdater?.cancelDownload(); } catch {}
+  try { desktopLogger.flushSync(); } catch {}
   app.quit();
 }
 
@@ -295,6 +310,22 @@ ipcMain.handle("qo:clear-checkpoint", async (event, conversationId) => {
   return desktopAgent.clearCheckpoint(conversationId);
 });
 
+ipcMain.handle("qo:collect-logs", async (event, options = {}) => {
+  if (!trusted(event)) throw new Error("页面无权采集客户端日志");
+  const conversationId = typeof options?.conversationId === "string" ? options.conversationId : "";
+  const userId = typeof options?.userId === "string" ? options.userId : "";
+  let checkpointSummary = null;
+  if (conversationId && desktopAgent?.getCheckpoint) {
+    try { checkpointSummary = await desktopAgent.getCheckpoint(conversationId, userId); } catch {}
+  }
+  return desktopLogger.collectDiagnostics({
+    appVersion: app.getVersion(),
+    origin: origin || "",
+    updaterState: desktopUpdater?.getState?.() || null,
+    checkpointSummary
+  });
+});
+
 ipcMain.handle("qo:update-state", (event) => {
   if (!trusted(event)) throw new Error("页面无权读取更新状态");
   return desktopUpdater?.getState() || null;
@@ -378,6 +409,7 @@ app.whenReady().then(() => {
     app,
     getWindow: () => window,
     getOrigin: () => origin,
+    logger: desktopLogger,
     emit: (value) => {
       if (window && !window.isDestroyed()) window.webContents.send("qo:agent-event", value);
     }
@@ -388,10 +420,26 @@ app.whenReady().then(() => {
     getOrigin: () => origin,
     quitApplication,
     emit: (value) => {
+      if (value?.status === "error") {
+        desktopLogger.error("updater", value.error || "更新异常", { status: value.status, latestVersion: value.latestVersion || "" });
+      } else if (value?.status && ["available", "ready", "installing"].includes(value.status)) {
+        desktopLogger.info("updater", `update status: ${value.status}`, { latestVersion: value.latestVersion || "", mode: value.mode || "" });
+      }
       if (window && !window.isDestroyed()) window.webContents.send("qo:update-event", value);
     }
   });
   const content = window.webContents;
+  content.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    desktopLogger.error("renderer.load", `did-fail-load (${errorCode}): ${errorDescription}`, { url: validatedURL });
+  });
+  content.on("render-process-gone", (_event, details) => {
+    desktopLogger.error("renderer.gone", `render-process-gone: ${details?.reason || "unknown"}`, details);
+  });
+  content.on("console-message", (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      desktopLogger.log(level >= 3 ? "ERROR" : "WARN", "renderer.console", message, { source: sourceId, line });
+    }
+  });
   content.on("did-finish-load", () => {
     if (!origin) return;
     try {

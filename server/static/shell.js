@@ -25,7 +25,7 @@ function navItem(id) {
   const on = route === id;
   const [name, glyph] = views[id];
   return `<button class="nav ${on ? "active" : ""}" type="button" data-act="route" data-id="${id}" data-nav-id="${id}" title="${name}" ${on ? 'aria-current="page"' : ""}>
-    ${icon(glyph)}<span class="nav-text">${name}</span>${id === "today" ? '<span class="nav-count" data-today-count hidden></span>' : ""}${id === "settings" ? '<span class="nav-count update-badge" data-update-badge hidden>新</span>' : ""}
+    ${icon(glyph)}<span class="nav-text">${name}</span>${id === "today" ? '<span class="nav-count" data-today-count hidden></span>' : ""}${id === "settings" ? '<span class="nav-count update-badge" data-update-badge hidden>新</span>' : ""}${id === "feedback" ? '<span class="nav-count" data-feedback-count hidden></span>' : ""}
   </button>`;
 }
 
@@ -77,6 +77,7 @@ export function ensureShell() {
       </nav>
       <div class="sidebar-quota-slot" data-sidebar-quota hidden></div>
       <div class="sidebar-foot">
+        ${navItem("feedback")}
         ${navItem("settings")}
         <button type="button" class="identity" data-act="profile" aria-label="账户与身份" title="${e(person.name)}">
           <span class="avatar">${e(person.name.slice(-2))}</span>
@@ -102,6 +103,9 @@ export function ensureShell() {
           ${state.config?.demo ? '<button class="demo-mark" type="button" data-act="profile">演示环境</button>' : ""}
           <button class="search-button" type="button" data-act="search" aria-label="搜索任务或跳转页面">
             ${icon("search")}<span>搜索</span><kbd>Ctrl K</kbd>
+          </button>
+          <button class="icon-button bordered" type="button" data-act="feedback-open" aria-label="问题反馈与一键上传日志" title="问题反馈 / 一键上传日志">
+            ${icon("bug")}
           </button>
           <button class="icon-button bordered" type="button" data-act="toggle-theme" data-theme-toggle aria-label="切换浅色或深色外观" title="切换浅色 / 深色">
             ${icon(getTheme() === "dark" ? "sun" : "moon")}
@@ -143,8 +147,22 @@ export function syncShell() {
 
   syncSidebarConversations();
   syncTodayBadge();
+  syncFeedbackBadge();
   syncConnectionIndicator();
   syncUpdateUi();
+}
+
+export function syncFeedbackBadge() {
+  const badgeEl = root.querySelector("[data-feedback-count]");
+  if (!badgeEl) return;
+  const count = isManager() ? Number(state.feedbackOpenCount || 0) : 0;
+  if (!count) {
+    badgeEl.hidden = true;
+    return;
+  }
+  badgeEl.hidden = false;
+  badgeEl.textContent = count > 99 ? "99+" : String(count);
+  badgeEl.classList.add("warn");
 }
 
 export function syncSidebarConversations() {
@@ -338,6 +356,8 @@ function quickCommands() {
     { label: "我的项目", hint: "项目协作与共享资料", icon: "layers", act: "route", id: "projects" },
     { label: "我的文件", hint: "预览、修改与下载文件", icon: "folder", act: "route", id: "files" },
     { label: "任务历史", hint: "历史分派记录", icon: "history", act: "route", id: "history" },
+    { label: "问题反馈与日志", hint: "上报问题与查看诊断日志", icon: "bug", act: "route", id: "feedback" },
+    { label: "一键上传日志反馈", hint: "快速打包桌面与前端日志", icon: "upload", act: "feedback-open", id: "" },
     { label: "工作台设置", hint: "身份与模型连接状态", icon: "sliders", act: "route", id: "settings" }
   ];
   if (isManager()) {

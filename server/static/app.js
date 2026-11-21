@@ -2,10 +2,12 @@ import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, erro
   post, readDraft, roles, root, saveDraft, state, toastMessage, toggleTheme, uploadSelected, uuid } from "./ui.js";
 import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, historyView, loginView, pageHead, planSection,
   renderFilesList, settingsView, taskDetail, views } from "./views.js";
-import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator, syncShell,
+import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator, syncFeedbackBadge, syncShell,
   syncSidebarConversations, syncThemeToggle, syncTodayBadge, syncUpdateUi, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
+import { clearFeedbackCache, copyFeedbackLog, feedbackPage, initClientLogCapture, openFeedbackDetail,
+  openFeedbackModal, quickUploadFeedback, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
 import { abortOrphanTurn, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, closeComposerPickers,
   closeSlashMenu, copyReply, discardCheckpoint, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
   loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
@@ -128,14 +130,19 @@ function adminReset() {
   state.admin = { offset: 0, department: "", status: "", date: "" };
 }
 
+function feedbackReset() {
+  state.feedback = { scope: "auto", status: "", category: "", reporter_id: "", q: "", offset: 0 };
+}
+
 async function preloadSidebarData() {
   const me = state.me;
   if (!me) return;
   prefetchDesktopModels();
   try {
-    const [conversations, todayData] = await Promise.all([
+    const [conversations, todayData, feedbackData] = await Promise.all([
       api("/conversations").catch(() => null),
-      api("/me/today").catch(() => null)
+      api("/me/today").catch(() => null),
+      isManager() ? api("/feedback?scope=all&limit=1").catch(() => null) : Promise.resolve(null)
     ]);
     if (state.me !== me) return;
     if (Array.isArray(conversations)) {
@@ -149,6 +156,10 @@ async function preloadSidebarData() {
       if (todayData.today) state.me.today = todayData.today;
       syncTodayBadge();
     }
+    if (feedbackData?.counts) {
+      state.feedbackOpenCount = Number(feedbackData.counts.open || 0);
+      syncFeedbackBadge();
+    }
   } catch {}
 }
 
@@ -158,7 +169,10 @@ async function login(user) {
   resetChatState();
   sessionStorage.removeItem("qo-signed-out");
   clearAdmin();
+  clearFeedbackCache();
   unmountShell();
+  state.feedbackOpenCount = 0;
+  feedbackReset();
   state.agent = null;
   agentDesktopModels = {};
   state.chatWorkspace = null;
@@ -187,7 +201,10 @@ async function logout() {
   clearDrafts();
   resetChatState();
   clearAdmin();
+  clearFeedbackCache();
   unmountShell();
+  state.feedbackOpenCount = 0;
+  feedbackReset();
   sessionStorage.setItem("qo-signed-out", "1");
   state.me = null;
   state.agent = null;
@@ -349,6 +366,8 @@ async function render(keepScroll = false) {
       case "audit":
         if (state.me.role !== "admin") { go("today"); return; }
         content = await auditPage(); break;
+      case "feedback":
+        content = await feedbackPage(); break;
     }
     display(content, ticket, keepScroll);
   } catch (error) {
@@ -362,7 +381,7 @@ async function render(keepScroll = false) {
     } else if (keepScroll && !navigator.onLine && root.querySelector(".app-shell")) {
       syncConnectionIndicator();
     } else {
-      display(pageHead("工作台请求失败") + `<div class="panel pad stack"><p class="error">${e(error.message)}</p><div class="actions">${button("重试", "refresh", { cls: "primary", icon: "refresh" })}${button("返回今日任务", "route", { id: "today" })}</div></div>`, ticket, keepScroll);
+      display(pageHead("工作台请求失败") + `<div class="panel pad stack"><p class="error">${e(error.message)}</p><div class="actions">${button("重试", "refresh", { cls: "primary", icon: "refresh" })}<button type="button" class="button" data-act="feedback-quick-upload" data-source="page" data-error="${e(error.message || "工作台请求失败")}">${icon("upload")}<span>一键上传日志</span></button>${button("返回今日任务", "route", { id: "today" })}</div></div>`, ticket, keepScroll);
     }
   }
 }
@@ -755,6 +774,56 @@ async function onClick(event) {
     case "search":
       openCommandPalette();
       break;
+    case "feedback-open":
+      openFeedbackModal({
+        source: target.dataset.source || "",
+        conversationId: target.dataset.conversationId || "",
+        errorMessage: target.dataset.error || "",
+        useLastError: !target.dataset.error
+      });
+      break;
+    case "feedback-quick-upload": {
+      const created = await quickUploadFeedback({
+        source: target.dataset.source || "",
+        conversationId: target.dataset.conversationId || "",
+        errorMessage: target.dataset.error || ""
+      }, target);
+      if (created && isManager()) {
+        state.feedbackOpenCount = Number(state.feedbackOpenCount || 0) + 1;
+        syncFeedbackBadge();
+      }
+      if (state.route[0] === "feedback") await render(true);
+      break;
+    }
+    case "feedback-view":
+      await openFeedbackDetail(id);
+      break;
+    case "feedback-copy-log":
+      await copyFeedbackLog();
+      break;
+    case "feedback-scope":
+      state.feedback.scope = id || "auto";
+      state.feedback.reporter_id = "";
+      state.feedback.offset = 0;
+      await render();
+      break;
+    case "feedback-status":
+      state.feedback.status = id || "";
+      state.feedback.offset = 0;
+      await render();
+      break;
+    case "feedback-reset":
+      feedbackReset();
+      await render();
+      break;
+    case "feedback-prev":
+      state.feedback.offset = Math.max(0, (state.feedback.offset || 0) - 20);
+      await render();
+      break;
+    case "feedback-next":
+      state.feedback.offset = (state.feedback.offset || 0) + 20;
+      await render();
+      break;
   }
 }
 
@@ -774,6 +843,25 @@ async function handleForm(event) {
     if (type === "admin-filter") {
       state.admin = { status: values.status || "", department: values.department || "", date: values.date || "", offset: 0 };
       await render();
+    } else if (type === "feedback-filter") {
+      state.feedback = {
+        ...state.feedback,
+        reporter_id: values.reporter_id || "",
+        category: values.category || "",
+        q: (values.q || "").trim(),
+        offset: 0
+      };
+      await render();
+    } else if (type === "feedback-submit") {
+      const created = await submitFeedbackForm(form);
+      if (created && isManager()) {
+        state.feedbackOpenCount = Number(state.feedbackOpenCount || 0) + 1;
+        syncFeedbackBadge();
+      }
+      if (state.route[0] === "feedback") await render(true);
+    } else if (type === "feedback-update") {
+      await saveFeedbackUpdate(form);
+      if (state.route[0] === "feedback") await render(true);
     } else if (type === "task-template") {
       const intent = event.submitter?.value || "draft";
       await saveTaskForm(form, intent);
@@ -1033,6 +1121,7 @@ setInterval(async () => {
   finally { timerBusy = false; }
 }, 4000);
 
+initClientLogCapture();
 applyTheme(getTheme());
 initCustomSelects();
 void startup();

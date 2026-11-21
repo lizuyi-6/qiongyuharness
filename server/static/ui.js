@@ -24,7 +24,9 @@ export const state = {
   update: null,
   updateBannerDismissed: false,
   admin: { offset: 0, department: "", status: "", date: "" },
-  auditOffset: 0
+  auditOffset: 0,
+  feedback: { scope: "auto", status: "", category: "", reporter_id: "", q: "", offset: 0 },
+  feedbackOpenCount: 0
 };
 
 const paths = {
@@ -75,7 +77,9 @@ const paths = {
   slash: '<path d="M15 4 9 20"/>',
   maximize: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
   move: '<path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20"/>',
-  crop: '<rect x="5" y="5" width="14" height="14" rx="1.5" stroke-dasharray="3 2.5"/>'
+  crop: '<rect x="5" y="5" width="14" height="14" rx="1.5" stroke-dasharray="3 2.5"/>',
+  bug: '<path d="M8 7a4 4 0 0 1 8 0v1H8V7Z"/><rect x="6" y="8" width="12" height="11" rx="5"/><path d="M12 8v11M3 11h3m12 0h3M4 16l2.5-1M20 16l-2.5-1M9 4 7.5 2.5M15 4l1.5-1.5"/>',
+  flag: '<path d="M5 21V4h11l-1.5 4.5L16 13H5"/>'
 };
 
 const THEME_KEY = "qo-theme";
@@ -148,7 +152,8 @@ export const active = (status) => ["pending", "in_progress", "paused", "returned
 export const statuses = {
   pending:"待开始",in_progress:"进行中",paused:"已暂停",returned:"退回修改",submitted:"待审核",
   approved:"已验收",closed:"已关闭",revoked:"已撤销",scheduled:"待发布",
-  overdue:"已逾期",draft:"草稿",active:"运行中",finished:"已结束"
+  overdue:"已逾期",draft:"草稿",active:"运行中",finished:"已结束",
+  open:"待处理",resolved:"已解决"
 };
 export const labels = {docx:"Word",pptx:"PowerPoint",pdf:"PDF",xlsx:"Excel",txt:"文本",md:"Markdown",other:"综合"};
 export const priorities = {normal:"普通",high:"高优先级",urgent:"紧急"};
@@ -162,7 +167,8 @@ export const eventLabels = {
   "file.preview":"预览附件", "file.download":"下载附件", "agent.started":"启动文稿协助",
   "agent.completed":"完成文稿协助", "agent.failed":"文稿协助失败", "schedule.created":"启动重复计划",
   "schedule.updated":"更新重复计划", "auth.login":"企业身份登录", "image.started":"启动图片生成",
-  "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片"
+  "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片",
+  "feedback.submitted":"提交问题反馈", "feedback.updated":"更新反馈状态"
 };
 
 export function badge(value) {
@@ -276,6 +282,11 @@ export function errorIn(node, error) {
   target.textContent = cleanErrorMessage(error);
 }
 
+let apiErrorHook = null;
+export function setApiErrorHook(fn) {
+  apiErrorHook = typeof fn === "function" ? fn : null;
+}
+
 export async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
   let data = options.body;
@@ -283,7 +294,15 @@ export async function api(path, options = {}) {
     headers.set("Content-Type", "application/json");
     data = JSON.stringify(data);
   }
-  const response = await fetch("/api/v1" + path, { ...options, headers, body: data, credentials:"same-origin" });
+  const method = (options.method || "GET").toUpperCase();
+  const startedAt = Date.now();
+  let response;
+  try {
+    response = await fetch("/api/v1" + path, { ...options, headers, body: data, credentials:"same-origin" });
+  } catch (netErr) {
+    try { apiErrorHook?.({ method, path, status: 0, durationMs: Date.now() - startedAt, message: netErr?.message || "网络请求异常" }); } catch {}
+    throw netErr;
+  }
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
     const message = Array.isArray(result.detail)
@@ -291,6 +310,9 @@ export async function api(path, options = {}) {
       : result.detail || `工作台请求失败（${response.status}）`;
     const error = new Error(message);
     error.status = response.status;
+    if (response.status !== 401 && !String(path).startsWith("/feedback")) {
+      try { apiErrorHook?.({ method, path, status: response.status, durationMs: Date.now() - startedAt, message }); } catch {}
+    }
     throw error;
   }
   return result;

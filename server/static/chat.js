@@ -2,6 +2,7 @@ import { active, api, badge, button, cleanErrorMessage, copyText, deadline, e, f
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, selectionSummaryText, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
+import { feedbackErrorStrip, recordClientLog } from "./feedback.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
 const modelDraftKey = "chat/last-model";
@@ -1163,7 +1164,7 @@ function turnView(turn, index, canRetry = false) {
             <p class="running-note" role="status">上一次桌面执行未正常结束，当前会话被锁定。</p>
             <button type="button" class="button stop-button" data-act="chat-abort-orphan" data-id="${e(turn.id)}" data-kind="${e(turn.kind === "image" ? "image" : "turn")}">${icon("stop")}结束并解锁</button>
           </div>`
-        : turn.error ? `<p class="error">${e(reply)}</p>` : `<div class="response-copy md-body">${renderMarkdown(reply)}</div>`}
+        : turn.error ? `<p class="error">${e(reply)}</p>${feedbackErrorStrip(reply, { source: "chat", conversationId: state.chatWorkspace?.session?.id || "" })}` : `<div class="response-copy md-body">${renderMarkdown(reply)}</div>`}
       ${pipeline && pipelineLabel ? `<div class="pipeline-result">
         <div class="pipeline-result-status"><span class="pipeline-badge ${pipeline.verdict === "fail" ? "failed" : pipeline.verdict === "skipped" ? "skipped" : "passed"}">${e(pipelineLabel)}</span>
           <span class="pipeline-review">${e(reviewLabels[pipeline.review] || "复核：未知")}</span></div>
@@ -1213,6 +1214,7 @@ function checkpointCardMarkup(workspace) {
     ${preserved.length ? `<div class="checkpoint-chips">${preserved.map((item) => `<span class="checkpoint-chip">${icon("checkPlain")}<span>${e(item)}</span></span>`).join("")}</div>` : ""}
     <div class="checkpoint-actions">
       <button type="button" class="button primary sm checkpoint-resume-btn" data-act="chat-resume" ${canResume ? "" : "disabled"}>${icon("play")}${cp.hasCompletedResult ? "直接重新保存" : "从断点续跑"}</button>
+      <button type="button" class="button sm" data-act="feedback-quick-upload" data-source="checkpoint" data-conversation-id="${e(sessionId)}" data-error="${e(errorText || title)}" title="一键打包并上传日志与断点状态">${icon("upload")}<span>一键上传日志</span></button>
       <button type="button" class="text-button" data-act="chat-discard-checkpoint">放弃断点</button>
     </div>
   </aside>`;
@@ -2555,6 +2557,7 @@ async function runConversationTurn({
     sessionCache.delete(threadId);
     emitConversationsUpdated();
     const cleanedMessage = cleanErrorMessage(error, "本轮执行失败");
+    recordClientLog("error", "chat", cleanedMessage, { conversationId: threadId, resume: Boolean(resume) });
     if (error instanceof Error) error.message = cleanedMessage;
     else error = new Error(cleanedMessage);
     if (state.me?.id === user) {
@@ -2571,7 +2574,13 @@ async function runConversationTurn({
       node?.querySelector(".running-pulse")?.remove();
       node?.querySelector(".response-mark")?.classList.remove("is-working");
       const current = node?.querySelector(".running-note");
-      if (current) { current.textContent = cleanedMessage; current.classList.add("error"); }
+      if (current) {
+        current.textContent = cleanedMessage;
+        current.classList.add("error");
+        if (!workspace.checkpoint && !node.querySelector(".feedback-inline-bar")) {
+          current.insertAdjacentHTML("afterend", feedbackErrorStrip(cleanedMessage, { source: "chat", conversationId: threadId }));
+        }
+      }
       if (workspace.checkpoint) syncCheckpointCardDom(workspace);
       const currentForm = chatForm();
       if (!workspace.checkpoint && currentForm?.elements?.message && !resume) {
