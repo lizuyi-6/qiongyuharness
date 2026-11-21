@@ -704,13 +704,93 @@ class DeckSpec(BaseModel):
         )
 
 
+def _parse_coord(value: Any, default: float, axis_size: float) -> tuple[float, bool]:
+    """解析坐标数值，同时识别显式百分号（如 '88%'）。返回 (数值, 是否显式百分比)。"""
+    if isinstance(value, str) and "%" in value:
+        num = _to_float(value, -9999.0)
+        if num > -9990.0:
+            return (num / 100.0) * axis_size, True
+    return _to_float(value, default), False
+
+
+def _detect_coord_scale(raw_slides: list[Any]) -> tuple[float, float]:
+    """自动识别 AI 输出的坐标系单位（英寸 / 0-100 百分比 / 1920x1080 / 1280x720 / 960x540 / 1000x562.5）。"""
+    xs: list[float] = []
+    ys: list[float] = []
+    rights: list[float] = []
+    bottoms: list[float] = []
+    out_of_inch = 0
+    total = 0
+
+    for slide_item in raw_slides[:30]:
+        if not isinstance(slide_item, dict):
+            continue
+        raw_els = slide_item.get("elements")
+        if not isinstance(raw_els, list):
+            continue
+        for el in raw_els[:120]:
+            if not isinstance(el, dict):
+                continue
+            raw_type = str(el.get("type") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            el_type = _ELEMENT_TYPE_ALIASES.get(raw_type)
+            if not el_type:
+                continue
+            rx, x_pct = _parse_coord(el.get("x", el.get("left")), 0.0, SLIDE_W)
+            ry, y_pct = _parse_coord(el.get("y", el.get("top")), 0.0, SLIDE_H)
+            rw, w_pct = _parse_coord(el.get("w", el.get("width")), 1.0, SLIDE_W)
+            rh, h_pct = _parse_coord(el.get("h", el.get("height")), 0.02 if el_type == "line" else 0.5, SLIDE_H)
+            if x_pct or y_pct or w_pct or h_pct:
+                continue
+            total += 1
+            right = rx + max(0.0, rw)
+            bottom = ry + max(0.0, rh)
+            xs.append(rx)
+            ys.append(ry)
+            rights.append(right)
+            bottoms.append(bottom)
+            if right > 14.5 or bottom > 8.5 or rx > 13.8 or ry > 7.9:
+                out_of_inch += 1
+
+    if total == 0 or out_of_inch == 0:
+        return 1.0, 1.0
+    # 偶发一两个微小越界元素仍属于英寸坐标系；只有大面积超界才判定为非英寸坐标系
+    if out_of_inch < max(2, int(total * 0.2)):
+        return 1.0, 1.0
+
+    max_right = max(rights)
+    max_bottom = max(bottoms)
+    # 1) 0-100 百分比坐标系（最常见：x/y/w/h 落在 0..100）
+    if max_right <= 108.0 and max_bottom <= 108.0 and (max_right > 15.0 or max_bottom > 9.0):
+        return SLIDE_W / 100.0, SLIDE_H / 100.0
+    # 2) 1920x1080 像素坐标系
+    if 1350.0 < max_right <= 2100.0 and 760.0 < max_bottom <= 1200.0:
+        return SLIDE_W / 1920.0, SLIDE_H / 1080.0
+    # 3) 1600x900 像素坐标系
+    if 1350.0 < max_right <= 1700.0 and 760.0 < max_bottom <= 980.0:
+        return SLIDE_W / 1600.0, SLIDE_H / 900.0
+    # 4) 1280x720 像素坐标系
+    if 1050.0 < max_right <= 1350.0 and 580.0 < max_bottom <= 780.0:
+        return SLIDE_W / 1280.0, SLIDE_H / 720.0
+    # 5) 1000x562.5 或 960x540 坐标系
+    if 600.0 < max_right <= 1050.0 and 350.0 < max_bottom <= 620.0:
+        ref_w = 1000.0 if max_right > 975.0 else 960.0
+        ref_h = ref_w * (SLIDE_H / SLIDE_W)
+        return SLIDE_W / ref_w, SLIDE_H / ref_h
+    # 6) 通用超界放大坐标系兜底
+    scale_x = SLIDE_W / max_right if max_right > 14.5 else 1.0
+    scale_y = SLIDE_H / max_bottom if max_bottom > 8.5 else 1.0
+    return scale_x, scale_y
+
+
 def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec:
-    """对 AI 输出的自由画布 JSON 做强容错归一化，避免因轻微越界、null 值或别名导致整份 PPT 失败。"""
+    """对 AI 输出的自由画布 JSON 做强容错归一化，自动换算误用的百分比/像素坐标系，避免因别名或越界导致空白页。"""
     if not isinstance(raw, dict):
         fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
     raw_slides = raw.get("slides")
     if not isinstance(raw_slides, list) or not raw_slides:
         fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
+
+    coord_sx, coord_sy = _detect_coord_scale(raw_slides)
 
     raw_design = raw.get("design") if isinstance(raw.get("design"), dict) else {}
     raw_palette = raw_design.get("palette") if isinstance(raw_design.get("palette"), dict) else {}
@@ -760,13 +840,23 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
             el_type = _ELEMENT_TYPE_ALIASES.get(raw_type)
             if not el_type:
                 continue
-            x = _clamp(_to_float(el.get("x"), 0.0), -2.0, 15.0)
-            y = _clamp(_to_float(el.get("y"), 0.0), -2.0, 9.5)
-            w = _clamp(_to_float(el.get("w", el.get("width")), 1.0), 0.015, 16.0)
-            h = _clamp(_to_float(el.get("h", el.get("height")), 0.02 if el_type == "line" else 0.5), 0.015, 10.0)
+            rx, x_pct = _parse_coord(el.get("x", el.get("left")), 0.0, SLIDE_W)
+            ry, y_pct = _parse_coord(el.get("y", el.get("top")), 0.0, SLIDE_H)
+            rw, w_pct = _parse_coord(el.get("w", el.get("width")), 1.0, SLIDE_W)
+            rh, h_pct = _parse_coord(el.get("h", el.get("height")), 0.02 if el_type == "line" else 0.5, SLIDE_H)
+            sx = 1.0 if x_pct else coord_sx
+            sy = 1.0 if y_pct else coord_sy
+            sw = 1.0 if w_pct else coord_sx
+            sh = 1.0 if h_pct else coord_sy
+            x = _clamp(rx * sx, -2.0, 15.0)
+            y = _clamp(ry * sy, -2.0, 9.5)
+            w = _clamp(rw * sw, 0.015, 16.0)
+            h = _clamp(rh * sh, 0.015, 10.0)
             if el_type == "line" and el.get("x2") is not None and el.get("y2") is not None:
-                x2 = _to_float(el.get("x2"), x + w)
-                y2 = _to_float(el.get("y2"), y)
+                rx2, x2_pct = _parse_coord(el.get("x2"), rx + rw, SLIDE_W)
+                ry2, y2_pct = _parse_coord(el.get("y2"), ry, SLIDE_H)
+                x2 = rx2 * (1.0 if x2_pct else coord_sx)
+                y2 = ry2 * (1.0 if y2_pct else coord_sy)
                 x, y = min(x, x2), min(y, y2)
                 w = _clamp(abs(x2 - x), 0.015, 16.0)
                 h = _clamp(abs(y2 - y), 0.015, 10.0)
@@ -777,6 +867,8 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 if r_val > 0.5:
                     r_val = min(0.5, r_val / max(1.0, min(w, h) * 72.0))
                 radius = _clamp(r_val, 0.0, 0.5)
+                if el_type == "rect" and radius > 0.001:
+                    el_type = "round_rect"
 
             align_raw = str(el.get("align") or "left").strip().lower()
             align = align_raw if align_raw in {"left", "center", "right"} else "left"
@@ -858,16 +950,19 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 if not chart_items:
                     continue
 
+            raw_fill = el.get("fill") or el.get("background") or el.get("bg") or el.get("fill_color") or el.get("background_color")
+            raw_border = el.get("border") or el.get("stroke") or el.get("border_color")
+            raw_color = el.get("color") or (el.get("text_color") if el_type == "text" else None) or el.get("font_color")
             elements.append(SlideElement(
                 type=el_type,
                 x=x,
                 y=y,
                 w=w,
                 h=h,
-                fill=el.get("fill") if isinstance(el.get("fill"), str) else None,
+                fill=raw_fill if isinstance(raw_fill, str) else None,
                 gradient=gradient,
                 opacity=_coerce_opacity(el.get("opacity")),
-                border=el.get("border") if isinstance(el.get("border"), str) else (el.get("stroke") if isinstance(el.get("stroke"), str) else None),
+                border=raw_border if isinstance(raw_border, str) else None,
                 border_width=_clamp(_to_float(el.get("border_width", el.get("stroke_width")), 1.0), 0.0, 12.0),
                 radius=radius,
                 shadow=bool(el.get("shadow")),
@@ -875,7 +970,7 @@ def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec
                 size=_clamp(_to_float(el.get("size", el.get("font_size")), 16.0), 8.0, 120.0),
                 bold=bool(el.get("bold") or str(el.get("font_weight") or "").lower() in {"bold", "600", "700", "800"}),
                 italic=bool(el.get("italic")),
-                color=el.get("color") if isinstance(el.get("color"), str) else None,
+                color=raw_color if isinstance(raw_color, str) else None,
                 font=_coerce_str(el.get("font"), 60) or None,
                 align=align,
                 valign=valign,

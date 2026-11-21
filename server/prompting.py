@@ -97,7 +97,8 @@ PPTX_GUIDE = """
    - 演进路线 / 架构流程页：横向卡片式时间轴（带年份胶囊 + 顶部强调色条 + 完整里程碑卡）或上下分层架构图，确保每一格文字清晰（>=13pt）不拥挤。
    - 深色反转收尾/战略页：深色背景 + 左侧大号核心洞察金句 + 右侧 3 条编号落地建议。
 
-### 二、自由画布原语（13.333 × 7.5 英寸，安全正文区 x:0.68–12.65, y:0.42–6.85）
+### 二、自由画布原语（严格使用英寸浮点数：宽 13.333 × 高 7.5 英寸！严禁使用 0–100 百分比或像素！）
+- **坐标系铁律**：所有 `x, y, w, h` 必须是 **英寸**（安全正文区 `x: 0.68–12.65`, `y: 0.42–6.85`，全宽约 `11.97`，单列卡片宽约 `3.7–5.8`），绝对不能写 `x: 6, w: 88, y: 92` 这类百分比数值！
 - `rect` / `round_rect` / `ellipse` / `line`：`{type, x, y, w, h, fill?, gradient?:{from,to,angle?}, opacity?, border?, border_width?, radius?, shadow?:true}`
 - `text`：`{type:"text", x, y, w, h, text, size, bold?, italic?, color, align?, valign?, line_spacing?}`
 - `image`：`{type:"image", x, y, w, h, image_index, fit?("cover"|"contain"), radius?}`（系统自动高清圆角裁切）

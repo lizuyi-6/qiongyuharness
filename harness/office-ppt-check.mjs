@@ -102,6 +102,10 @@ function checkDeck(args) {
         issues.push(`第 ${page} 页元素 #${eIdx + 1}(${type}) 坐标或尺寸无效`);
         return;
       }
+      if (x > 14.0 || y > 8.0 || x + w > 14.5 || y + h > 8.5) {
+        issues.push(`第 ${page} 页元素 #${eIdx + 1}(${type}) 坐标 (${x}, ${y}, ${w}×${h}) 严重超出 13.333×7.5 英寸画布！请确认未误用 0–100 百分比或像素单位，所有 x/y/w/h 必须是英寸浮点数`);
+        return;
+      }
       if (type === "text") {
         if (y < 1.35) hasHeaderText = true;
         if (x < 0.25 || x + w > SLIDE_W - 0.25 || y < 0.2 || y + h > SLIDE_H - 0.15) {
