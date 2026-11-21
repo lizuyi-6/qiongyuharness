@@ -1,4 +1,4 @@
-import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, errorIn, fileMarkup, getTheme, go, icon, initCustomSelects, isManager, isReview, modal,
+import { active, api, applyTheme, button, cleanErrorMessage, clearDrafts, copyText, dialog, e, errorIn, extractDroppedFiles, fileMarkup, getTheme, go, icon, initCustomSelects, isManager, isReview, modal,
   post, readDraft, roles, root, saveDraft, state, toastMessage, toggleTheme, uploadSelected, uuid } from "./ui.js";
 import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, filterFiles, historyView, loginView, pageHead, planSection,
   renderFilesBulkBar, renderFilesList, settingsView, taskDetail, views } from "./views.js";
@@ -7,12 +7,12 @@ import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator,
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { clearFeedbackCache, copyFeedbackLog, feedbackPage, initClientLogCapture, openFeedbackDetail,
-  openFeedbackModal, quickUploadFeedback, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
-import { abortOrphanTurn, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, closeComposerPickers,
-  closeSessionContextMenu, closeSlashMenu, copyReply, deleteConversation, discardCheckpoint, generateImageFromComposer, handleSlashKeydown,
+  openFeedbackModal, quickUploadFeedback, recordClientLog, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
+import { abortOrphanTurn, applyQueuedGuidanceNow, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, clearQueuedGuidance, closeComposerPickers,
+  closeSessionContextMenu, closeSlashMenu, copyReply, deleteConversation, discardCheckpoint, enqueueGuidanceFromForm, generateImageFromComposer, handleSlashKeydown,
   initSessionDragAndMenu, loadDesktopModelState, loadEarlier, loadWorkspace, openDeckInStudio, openImageLightbox,
   openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
-  removeSource, resetChatState, resumeFailedTurn, retitleSingleConversation, retryTurn, runDesktopAgent, saveImageAutoPreference,
+  removeQueuedGuidance, removeSource, resetChatState, resumeFailedTurn, retitleSingleConversation, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
   showSources, submitRenameConversation, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
   syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer, togglePinConversation,
@@ -573,6 +573,9 @@ async function onClick(event) {
     case "session-ai-title": await retitleSingleConversation(id); break;
     case "chat-earlier": await loadEarlier(); break;
     case "chat-cancel": await cancelActiveChat(); break;
+    case "chat-guidance-remove": removeQueuedGuidance(id); break;
+    case "chat-guidance-clear": clearQueuedGuidance(); break;
+    case "chat-guidance-apply-now": await applyQueuedGuidanceNow(); break;
     case "chat-resume": await resumeFailedTurn(target); break;
     case "chat-discard-checkpoint": await discardCheckpoint(); break;
     case "chat-abort-orphan": await abortOrphanTurn(id, target.dataset.kind || "turn", target); break;
@@ -898,7 +901,12 @@ async function handleForm(event) {
   const form = event.target;
   if (!form.matches("form[data-form]")) return;
   event.preventDefault();
-  if (form.dataset.busy) return;
+  if (form.dataset.busy) {
+    if (form.dataset.form === "conversation") {
+      enqueueGuidanceFromForm(form);
+    }
+    return;
+  }
   form.dataset.busy = "1";
   const controls = [...form.querySelectorAll("button[type=submit]")];
   controls.forEach((node) => { node.disabled = true; });
@@ -1131,33 +1139,85 @@ document.addEventListener("change", (event) => {
     return;
   }
   if (!event.target.matches("[data-upload]")) return;
-  handleUpload([...event.target.files], event.target).catch((error) => toastMessage(error.message, "error"));
+  handleUpload([...event.target.files], event.target).catch((error) => {
+    const msg = cleanErrorMessage(error, "上传失败");
+    recordClientLog("error", "upload", msg);
+    toastMessage(msg, "error");
+  });
 });
+function eventHasExternalFiles(event) {
+  const types = [...(event.dataTransfer?.types || [])];
+  if (types.includes("application/x-qo-session")) return false;
+  return types.includes("Files");
+}
 document.addEventListener("dragover", (event) => {
-  const hasFiles = [...(event.dataTransfer?.types || [])].includes("Files");
-  const zone = event.target.closest("[data-upload-zone]");
-  if (zone) { event.preventDefault(); zone.classList.add("drag"); return; }
-  const chatZone = hasFiles && event.target.closest("[data-chat-dropzone]");
-  if (chatZone) { event.preventDefault(); chatZone.classList.add("drag-over"); }
+  const hasFiles = eventHasExternalFiles(event);
+  if (!hasFiles) return;
+  event.preventDefault();
+  try { event.dataTransfer.dropEffect = "copy"; } catch {}
+  const zone = event.target?.closest?.("[data-upload-zone]");
+  if (zone) { zone.classList.add("drag"); return; }
+  const filesZone = event.target?.closest?.("[data-files-dropzone]");
+  if (filesZone) { filesZone.classList.add("drag-over"); return; }
+  const chatZone = event.target?.closest?.("[data-chat-dropzone]") || document.querySelector("[data-chat-dropzone]");
+  if (chatZone) chatZone.classList.add("drag-over");
 });
 document.addEventListener("dragleave", (event) => {
-  event.target.closest("[data-upload-zone]")?.classList.remove("drag");
-  const chatZone = event.target.closest("[data-chat-dropzone]");
+  event.target?.closest?.("[data-upload-zone]")?.classList.remove("drag");
+  const filesZone = event.target?.closest?.("[data-files-dropzone]");
+  if (filesZone && !filesZone.contains(event.relatedTarget)) filesZone.classList.remove("drag-over");
+  const chatZone = event.target?.closest?.("[data-chat-dropzone]");
   if (chatZone && !chatZone.contains(event.relatedTarget)) chatZone.classList.remove("drag-over");
 });
 document.addEventListener("drop", (event) => {
-  const zone = event.target.closest("[data-upload-zone]");
-  if (zone) {
-    event.preventDefault();
-    zone.classList.remove("drag");
-    handleUpload([...event.dataTransfer.files], zone.querySelector("input")).catch((error) => toastMessage(error.message, "error"));
+  const hasFiles = eventHasExternalFiles(event);
+  document.querySelectorAll(".drag, .drag-over").forEach((el) => el.classList.remove("drag", "drag-over"));
+  if (!hasFiles) return;
+  event.preventDefault();
+  let dropped;
+  try {
+    dropped = extractDroppedFiles(event.dataTransfer);
+  } catch (error) {
+    const msg = cleanErrorMessage(error, "无法读取拖入的文件");
+    recordClientLog("error", "upload", msg);
+    toastMessage(msg, "error");
     return;
   }
-  const chatZone = event.target.closest("[data-chat-dropzone]");
-  if (chatZone && event.dataTransfer?.files?.length) {
-    event.preventDefault();
-    chatZone.classList.remove("drag-over");
-    attachFiles([...event.dataTransfer.files]).catch((error) => toastMessage(error.message, "error"));
+  if (!dropped.length) return;
+  const zone = event.target?.closest?.("[data-upload-zone]");
+  if (zone) {
+    handleUpload(dropped, zone.querySelector("input")).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传失败");
+      recordClientLog("error", "upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
+  const filesZone = event.target?.closest?.("[data-files-dropzone]");
+  if (filesZone) {
+    handleUpload(dropped, null).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传失败");
+      recordClientLog("error", "upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
+  const chatZone = event.target?.closest?.("[data-chat-dropzone]") || document.querySelector("[data-chat-dropzone]");
+  if (chatZone) {
+    attachFiles(dropped).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传失败");
+      recordClientLog("error", "upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
+  // 兜底：在任意已登录页面拖入文件，直接上传到「我的文件」
+  if (state.me) {
+    handleUpload(dropped, null).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传失败");
+      recordClientLog("error", "upload", msg);
+      toastMessage(msg, "error");
+    });
   }
 });
 document.addEventListener("keydown", (event) => {

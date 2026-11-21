@@ -159,7 +159,7 @@ export const statuses = {
   overdue:"已逾期",draft:"草稿",active:"运行中",finished:"已结束",
   open:"待处理",resolved:"已解决"
 };
-export const labels = {docx:"Word",pptx:"PowerPoint",pdf:"PDF",xlsx:"Excel",txt:"文本",md:"Markdown",png:"图片",jpg:"图片",jpeg:"图片",webp:"图片",other:"综合"};
+export const labels = {docx:"Word",pptx:"PowerPoint",pdf:"PDF",xlsx:"Excel",txt:"文本",md:"Markdown",csv:"CSV",png:"图片",jpg:"图片",jpeg:"图片",webp:"图片",other:"综合"};
 export const priorities = {normal:"普通",high:"高优先级",urgent:"紧急"};
 export const roles = {admin:"超级管理员",manager:"部门主管",employee:"员工",reviewer:"审阅人"};
 export const eventLabels = {
@@ -295,7 +295,7 @@ export function setApiErrorHook(fn) {
 }
 
 const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
-const UPLOAD_EXTENSIONS = new Set(["docx", "pptx", "xlsx", "pdf", "txt", "md"]);
+const UPLOAD_EXTENSIONS = new Set(["docx", "pptx", "xlsx", "pdf", "txt", "md", "csv", "png", "jpg", "jpeg", "webp"]);
 const TRANSIENT_STATUSES = new Set([408, 502, 503, 504]);
 
 function friendlyNetworkMessage(err, timedOut) {
@@ -420,42 +420,87 @@ export function fileMarkup(file, opts = {}) {
 }
 
 export function uploadMarkup(summary = "拖入文件或点击添加") {
-  return `<label class="button upload-zone" data-upload-zone>${icon("upload")} ${e(summary)} <input type="file" data-upload accept=".docx,.pptx,.xlsx,.pdf,.txt,.md" multiple></label>`;
+  return `<label class="button upload-zone" data-upload-zone>${icon("upload")} ${e(summary)} <input type="file" data-upload accept=".docx,.pptx,.xlsx,.pdf,.txt,.md,.csv,.png,.jpg,.jpeg,.webp" multiple></label>`;
 }
 
 let uploadInFlight = false;
 
+export function extractDroppedFiles(dataTransfer) {
+  const rawFiles = Array.from(dataTransfer?.files || []);
+  const items = Array.from(dataTransfer?.items || []);
+  let skippedDirs = 0;
+  const files = [];
+  if (items.length) {
+    for (const item of items) {
+      if (item.kind !== "file") continue;
+      let isDir = false;
+      try {
+        const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+        if (entry?.isDirectory) isDir = true;
+      } catch {}
+      if (isDir) {
+        skippedDirs += 1;
+        continue;
+      }
+      const f = typeof item.getAsFile === "function" ? item.getAsFile() : null;
+      if (f) files.push(f);
+    }
+  }
+  const picked = files.length || skippedDirs ? files : rawFiles;
+  if (!picked.length && skippedDirs > 0) {
+    throw new Error("暂不支持直接拖入文件夹，请选择文件夹内的具体文档或图片");
+  }
+  return picked;
+}
+
+async function materializeFile(file) {
+  const name = String(file?.name || "文件");
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  if (!UPLOAD_EXTENSIONS.has(ext)) {
+    throw new Error(`「${name}」格式不支持，请选择 Word、PPT、Excel、PDF、TXT、Markdown、CSV 或常见图片`);
+  }
+  if (typeof file.size === "number" && file.size > MAX_UPLOAD_BYTES) {
+    throw new Error(`「${name}」大小（${formatBytes(file.size)}）超过 12 MB 上限，无法上传`);
+  }
+  let buf;
+  try {
+    buf = await file.arrayBuffer();
+  } catch {
+    throw new Error(`无法读取本地文件「${name}」（可能是文件夹、正被 WPS/Office 独占打开或云盘文件未下载），请关闭占用后重试`);
+  }
+  if (!buf || buf.byteLength === 0) {
+    throw new Error(`「${name}」为空文件或不可读（如文件夹/快捷方式），无法上传`);
+  }
+  if (buf.byteLength > MAX_UPLOAD_BYTES) {
+    throw new Error(`「${name}」大小（${formatBytes(buf.byteLength)}）超过 12 MB 上限，无法上传`);
+  }
+  return new File([buf], name, { type: file.type || "application/octet-stream", lastModified: file.lastModified || Date.now() });
+}
+
 export async function uploadSelected(files, assignment = "", target = "") {
   const list = Array.from(files || []);
   if (!list.length) return [];
-  for (const file of list) {
-    const ext = String(file.name || "").split(".").pop().toLowerCase();
-    if (!UPLOAD_EXTENSIONS.has(ext)) {
-      throw new Error(`「${file.name || "文件"}」格式不支持，请选择 Word、PPT、Excel、PDF、TXT 或 Markdown`);
-    }
-    if (!file.size) {
-      throw new Error(`「${file.name || "文件"}」为空文件，无法上传`);
-    }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      throw new Error(`「${file.name || "文件"}」大小（${formatBytes(file.size)}）超过 12 MB 上限，无法上传`);
-    }
-  }
   if (uploadInFlight) {
     throw new Error("正在上传其他文件，请稍候片刻再试");
   }
   uploadInFlight = true;
   const uploaded = [];
   try {
-    for (let i = 0; i < list.length; i += 1) {
-      const file = list[i];
+    // 第一时间将所有 File 完整读入内存，避免 Electron/Chromium 拖放句柄失效触发 408 / Failed to fetch
+    const materialized = [];
+    for (const file of list) {
+      materialized.push(await materializeFile(file));
+    }
+    for (let i = 0; i < materialized.length; i += 1) {
+      const file = materialized[i];
       toastMessage(
-        list.length > 1 ? `正在上传（${i + 1}/${list.length}）：${file.name}` : `正在上传：${file.name}`,
+        materialized.length > 1 ? `正在上传（${i + 1}/${materialized.length}）：${file.name}` : `正在上传：${file.name}`,
         "info"
       );
       let lastError = null;
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         const form = new FormData();
-        form.append("file", file);
+        form.append("file", file, file.name);
         if (assignment) form.append("assignment_id", assignment);
         try {
           uploaded.push(await api(target || "/files", { method: "POST", body: form, timeoutMs: 120_000 }));

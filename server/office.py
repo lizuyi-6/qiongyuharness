@@ -37,9 +37,16 @@ MIMES = {
     "pdf": "application/pdf",
     "txt": "text/plain; charset=utf-8",
     "md": "text/markdown; charset=utf-8",
+    "csv": "text/csv; charset=utf-8",
     "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
 }
-UPLOAD_EXTENSIONS = frozenset({"docx", "pptx", "xlsx", "pdf", "txt", "md"})
+IMAGE_EXTENSIONS = frozenset({"png", "jpg", "jpeg", "webp"})
+TEXT_EXTENSIONS = frozenset({"txt", "md", "csv"})
+UPLOAD_EXTENSIONS = frozenset({"docx", "pptx", "xlsx", "pdf", "txt", "md", "csv", "png", "jpg", "jpeg", "webp"})
+DANGEROUS_EMBED_EXTS = (".exe", ".dll", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".ps1", ".scr", ".msi", ".hta", ".com", ".pif", ".jar")
 INVALID_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 WP = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 DRAW = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -122,24 +129,31 @@ def check_zip(data, ext):
                 or required[ext] not in names or "[Content_Types].xml" not in names):
                 raise ValueError
             for info in infos:
-                path = PurePosixPath(info.filename)
-                low = info.filename.lower()
-                if (path.is_absolute() or ".." in path.parts or "\\" in info.filename
-                    or info.flag_bits & 1 or "vbaproject" in low or "/activex/" in low or "/embeddings/" in low
-                    or low.startswith("_xmlsignatures/") or "/externallinks/" in low):
+                norm_name = info.filename.replace("\\", "/")
+                path = PurePosixPath(norm_name)
+                low = norm_name.lower()
+                if (path.is_absolute() or ".." in path.parts
+                    or info.flag_bits & 1 or "vbaproject" in low or "/activex/" in low
+                    or low.startswith("_xmlsignatures/")):
+                    raise ValueError
+                if "/embeddings/" in low and low.endswith(DANGEROUS_EMBED_EXTS):
                     raise ValueError
                 if low.endswith(".rels"):
                     for rel in parse_xml(zf.read(info)):
                         if rel.get("TargetMode", "").lower() == "external":
                             target = rel.get("Target", "").lower()
-                            if not rel.get("Type", "").endswith("/hyperlink") or not target.startswith(("https://", "http://", "mailto:")):
+                            rel_type = rel.get("Type", "").lower()
+                            if rel_type.endswith("/hyperlink"):
+                                if not target.startswith(("https://", "http://", "mailto:")):
+                                    raise ValueError
+                            elif not rel_type.endswith("/externallinkpath"):
                                 raise ValueError
             expected = next((node.get("ContentType") for node in parse_xml(zf.read("[Content_Types].xml"))
                              if node.get("PartName") == f"/{required[ext]}"), None)
             if expected != expected_type[ext]:
                 raise ValueError
     except (BadZipFile, ValueError, etree.XMLSyntaxError, KeyError, RuntimeError, NotImplementedError):
-        fail(422, "Office 文件格式无效，或包含宏、外部对象、嵌入对象或签名")
+        fail(422, "Office 文件格式无效，或已加密/包含宏（VBA）与不安全外部对象")
 
 
 def scan(data, target):
@@ -163,20 +177,43 @@ def scan(data, target):
         fail(503, "文件扫描服务暂不可用")
 
 
+def decode_text_bytes(data: bytes) -> str:
+    for enc in ("utf-8-sig", "gb18030", "utf-16"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    fail(422, "文本文件编码不受支持，请保存为 UTF-8 或 GBK 后重试")
+
+
+def verify_image(data: bytes, ext: str):
+    if ext == "png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        fail(422, "PNG 图片格式无效")
+    if ext in {"jpg", "jpeg"} and not data.startswith(b"\xff\xd8\xff"):
+        fail(422, "JPG 图片格式无效")
+    if ext == "webp" and not (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"):
+        fail(422, "WEBP 图片格式无效")
+    if PilImage is not None:
+        try:
+            with PilImage.open(BytesIO(data)) as im:
+                im.verify()
+        except Exception:
+            fail(422, "图片文件已损坏或格式不受支持")
+
+
 def verify(name, data, scanner=""):
     name = safe_name(name)
     ext = name.rsplit(".", 1)[-1].lower()
     if ext not in UPLOAD_EXTENSIONS or not data or len(data) > MAX_FILE:
-        fail(422, "请选择支持的文档格式，单个文件最多 12 MB")
+        fail(422, "请选择支持的文档或图片格式（Word/PPT/Excel/PDF/TXT/MD/CSV/PNG/JPG/WEBP），单个文件最多 12 MB")
     if ext in {"docx", "pptx", "xlsx"}:
         check_zip(data, ext)
-    if ext == "pdf" and not data.startswith(b"%PDF-"):
+    elif ext == "pdf" and not data.startswith(b"%PDF-"):
         fail(422, "PDF 文件格式无效")
-    if ext in {"txt", "md"}:
-        try:
-            data.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            fail(422, "文本附件需使用 UTF-8 编码")
+    elif ext in TEXT_EXTENSIONS:
+        decode_text_bytes(data)
+    elif ext in IMAGE_EXTENSIONS:
+        verify_image(data, ext)
     scan(data, scanner)
     return name, ext
 
@@ -201,9 +238,52 @@ def nodes_for(root, namespace):
             yield nodes
 
 
+def _extract_xlsx(data: bytes, limit: int = 16000) -> str:
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    parts: list[str] = []
+    size = 0
+    try:
+        with ZipFile(BytesIO(data)) as zf:
+            names = zf.namelist()
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                sroot = parse_xml(zf.read("xl/sharedStrings.xml"))
+                for si in sroot.iter(f"{ns}si"):
+                    shared.append("".join(t.text or "" for t in si.iter(f"{ns}t")))
+            sheets = sorted(n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n))
+            for idx, sheet_name in enumerate(sheets[:6], 1):
+                parts.append(f"【工作表 {idx}】")
+                root = parse_xml(zf.read(sheet_name))
+                for row in root.iter(f"{ns}row"):
+                    cells: list[str] = []
+                    for c in row.iter(f"{ns}c"):
+                        ctype = c.get("t", "")
+                        if ctype == "inlineStr":
+                            val = "".join(t.text or "" for t in c.iter(f"{ns}t"))
+                        else:
+                            v = c.find(f"{ns}v")
+                            raw = (v.text or "").strip() if v is not None else ""
+                            if ctype == "s" and raw.isdigit() and int(raw) < len(shared):
+                                val = shared[int(raw)]
+                            else:
+                                val = raw
+                        cells.append(val.replace("\t", " ").replace("\n", " ").strip())
+                    if any(cells):
+                        line = " | ".join(cells)
+                        parts.append(line)
+                        size += len(line) + 1
+                        if size >= limit:
+                            return "\n".join(parts)[:limit]
+    except Exception:
+        return ""
+    return "\n".join(parts)[:limit]
+
+
 def extract(data, ext, limit=16000):
-    if ext in {"txt", "md"}:
-        return data.decode("utf-8-sig")[:limit]
+    if ext in TEXT_EXTENSIONS:
+        return decode_text_bytes(data)[:limit]
+    if ext == "xlsx":
+        return _extract_xlsx(data, limit)
     if ext == "pdf":
         try:
             from pypdf import PdfReader

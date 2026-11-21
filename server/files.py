@@ -178,10 +178,10 @@ def image(key: str, user: User):
         row = file_for(db, user, key)
         if row["owner_id"] != user["id"]:
             fail(404, "图片不存在")
-        if row["extension"] != "png":
+        if row["extension"] not in {"png", "jpg", "jpeg", "webp"}:
             fail(404, "图片不存在")
         audit(db, "file.image", user["id"], row["assignment_id"], row["template_id"], artifact_id=key)
-    return Response(bytes(row["data"]), media_type="image/png", headers={
+    return Response(bytes(row["data"]), media_type=MIMES.get(row["extension"], "image/png"), headers={
         "Content-Disposition": "inline",
         "Cache-Control": "private, max-age=0",
     })
@@ -273,8 +273,8 @@ def collect_sources(db, user, task, material_ids):
         own_upload = row["owner_id"] == user["id"] and row["label"] != "material" and row["assignment_id"] in {assignment_id, None}
         if not (task_material or own_upload):
             fail(403, "请选择当前任务或已上传到工作台的资料")
-        if row["extension"] not in {"docx", "pptx", "txt", "md", "pdf"}:
-            fail(422, "当前可提取正文的资料包括 Word、PPT、PDF、TXT 和 Markdown")
+        if row["extension"] not in {"docx", "pptx", "xlsx", "txt", "md", "csv", "pdf"}:
+            fail(422, "当前可提取正文的资料包括 Word、PPT、Excel、PDF、TXT、Markdown 和 CSV")
         data.append((row["name"], *file_type(row)))
     return data
 

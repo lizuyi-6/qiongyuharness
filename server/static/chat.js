@@ -4,7 +4,8 @@ import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip,
 import { renderMarkdown } from "./markdown.js";
 import { feedbackErrorStrip, recordClientLog } from "./feedback.js";
 
-const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
+const readable = new Set(["docx", "pptx", "xlsx", "pdf", "txt", "md", "csv"]);
+const imageExts = new Set(["png", "jpg", "jpeg", "webp"]);
 const modelDraftKey = "chat/last-model";
 const PIPELINE_MODEL = "qo:pipeline";
 const imageAutoPreferenceKey = "qo/chat/allow-agent-images";
@@ -13,6 +14,8 @@ let usageRequestId = 0;
 
 // 按 threadId 跟踪正在运行的对话/生图任务，避免切换页面销毁 DOM 后丢失进度与锁定状态。
 const activeTurns = new Map();
+// 按 threadId 跟踪思考过程中用户追加的引导消息队列。
+const queuedGuidance = new Map();
 const modelCache = new Map();
 const modelInFlight = new Map();
 const sessionCache = new Map();
@@ -129,6 +132,7 @@ export function resetChatState() {
     try { void live.cancel?.(); } catch {}
   }
   activeTurns.clear();
+  queuedGuidance.clear();
   modelCache.clear();
   modelInFlight.clear();
   sessionCache.clear();
@@ -856,15 +860,139 @@ export function canSubmitChat(workspace = state.chatWorkspace) {
 
 export function syncChatSubmit(form = chatForm(), workspace = state.chatWorkspace) {
   if (!form) return;
-  const disabled = Boolean(form.dataset.busy) || !canSubmitChat(workspace);
+  const isBusy = Boolean(form.dataset.busy);
+  const threadId = currentLiveThreadId(workspace);
+  const live = activeTurnFor(threadId);
+  const hasText = Boolean(form.elements?.message?.value?.trim());
+  const canQueue = Boolean(isBusy && live && live.kind !== "image" && hasText);
+  const disabled = isBusy ? !canQueue : !canSubmitChat(workspace);
   form.querySelectorAll('button[type="submit"]').forEach((control) => {
     control.disabled = disabled;
+    control.classList.toggle("is-queue-mode", Boolean(isBusy && live && live.kind !== "image"));
+    control.classList.toggle("ready", hasText && !disabled);
+    control.title = isBusy && live && live.kind !== "image" ? "追加引导（Enter）" : "发送（Enter）";
+    control.setAttribute("aria-label", isBusy && live && live.kind !== "image" ? "追加引导信息" : "发送消息");
   });
   const resumeBtn = document.querySelector(".checkpoint-resume-btn");
   if (resumeBtn) {
     const canResume = !form.dataset.busy && (canSubmitChat(workspace) || Boolean(workspace?.checkpoint?.hasCompletedResult));
     resumeBtn.disabled = !canResume;
   }
+}
+
+function currentLiveThreadId(workspace = state.chatWorkspace) {
+  const direct = workspace?.session?.id
+    || (state.route[0] === "chat" && state.route[1] && !["task", "project"].includes(state.route[1]) ? state.route[1] : "");
+  if (direct && activeTurns.has(direct)) return direct;
+  const userId = state.me?.id;
+  if (direct) return direct;
+  for (const [id, live] of activeTurns.entries()) {
+    if (!userId || live.userId === userId) return id;
+  }
+  return "";
+}
+
+function guidanceListFor(threadId) {
+  if (!threadId) return [];
+  return queuedGuidance.get(threadId) || [];
+}
+
+function guidanceQueueMarkup(threadId) {
+  const items = guidanceListFor(threadId);
+  if (!items.length) return "";
+  const live = activeTurnFor(threadId);
+  const canRedirect = Boolean(live && live.kind !== "image" && live.canCancel && !live.cancelling);
+  return `<div class="guidance-queue-card" role="region" aria-label="已追加引导队列">
+    <div class="guidance-queue-head">
+      <span class="guidance-queue-title">${icon("sparkles")}<strong>已追加 ${items.length} 条引导</strong><small>本轮完成后将自动发给 AI 继续处理</small></span>
+      <div class="guidance-queue-actions">
+        ${canRedirect ? `<button type="button" class="button sm primary" data-act="chat-guidance-apply-now" title="中止当前思考并合并原要求与追加引导立刻重做">${icon("refresh")}立即按补充重做</button>` : ""}
+        <button type="button" class="text-button" data-act="chat-guidance-clear">清空</button>
+      </div>
+    </div>
+    <ul class="guidance-queue-list">${items.map((item, idx) => `
+      <li class="guidance-queue-item">
+        <span class="guidance-queue-idx">${idx + 1}</span>
+        <span class="guidance-queue-text">${e(item.text)}</span>
+        <button type="button" class="guidance-queue-del" data-act="chat-guidance-remove" data-id="${e(item.id)}" aria-label="移除该条引导" title="移除">${icon("x")}</button>
+      </li>`).join("")}
+    </ul>
+  </div>`;
+}
+
+function syncGuidanceDom(threadId = currentLiveThreadId()) {
+  const slot = document.querySelector("[data-chat-guidance]");
+  if (!slot) return;
+  slot.innerHTML = guidanceQueueMarkup(threadId);
+}
+
+export function enqueueGuidanceFromForm(form = chatForm()) {
+  const workspace = state.chatWorkspace;
+  const textarea = form?.elements?.message;
+  const text = textarea?.value?.trim() || "";
+  if (!text) return false;
+  const threadId = currentLiveThreadId(workspace);
+  const live = activeTurnFor(threadId);
+  if (!threadId || !live || live.kind === "image") {
+    toastMessage("当前正在生成图片，请稍候完成后再发送", "info");
+    return false;
+  }
+  const list = [...guidanceListFor(threadId)];
+  if (list.length >= 6) {
+    toastMessage("单轮最多追加 6 条引导，可先点「立即按补充重做」或精简后提交", "error");
+    return false;
+  }
+  list.push({ id: uuid(), text, createdAt: Date.now() });
+  queuedGuidance.set(threadId, list);
+  textarea.value = "";
+  syncComposerGrow(textarea);
+  syncGuidanceDom(threadId);
+  syncChatSubmit(form, workspace);
+  toastMessage("已追加引导，本轮完成后自动发给 AI（也可点「立即按补充重做」）", "success");
+  return true;
+}
+
+export function removeQueuedGuidance(id) {
+  const threadId = currentLiveThreadId();
+  if (!threadId || !id) return;
+  const next = guidanceListFor(threadId).filter((item) => item.id !== id);
+  if (next.length) queuedGuidance.set(threadId, next);
+  else queuedGuidance.delete(threadId);
+  syncGuidanceDom(threadId);
+}
+
+export function clearQueuedGuidance() {
+  const threadId = currentLiveThreadId();
+  if (!threadId) return;
+  queuedGuidance.delete(threadId);
+  syncGuidanceDom(threadId);
+}
+
+export async function applyQueuedGuidanceNow() {
+  const threadId = currentLiveThreadId();
+  const live = activeTurnFor(threadId);
+  const items = guidanceListFor(threadId);
+  if (!live || !items.length) return;
+  if (!live.canCancel || typeof live.cancel !== "function") {
+    toastMessage("当前执行模式不支持中途改向，将在本轮完成后自动按引导继续", "info");
+    return;
+  }
+  live.redirectGuidance = items.map((item) => item.text);
+  queuedGuidance.delete(threadId);
+  syncGuidanceDom(threadId);
+  toastMessage("正在按追加引导重新规划执行…", "info");
+  await cancelActiveChat();
+}
+
+function formatMergedGuidanceMessage(baseMessage, guidanceTexts) {
+  const lines = guidanceTexts.map((t, i) => `${i + 1}. ${t}`).join("\n");
+  if (!baseMessage) return guidanceTexts.length === 1 ? guidanceTexts[0] : lines;
+  return `${baseMessage}\n\n【思考过程中追加的补充引导（请严格结合以下最新要求执行）】\n${lines}`;
+}
+
+function formatFollowUpGuidanceMessage(guidanceTexts) {
+  if (guidanceTexts.length === 1) return guidanceTexts[0];
+  return `请结合以下补充引导继续调整完善：\n${guidanceTexts.map((t, i) => `${i + 1}. ${t}`).join("\n")}`;
 }
 
 function draftFor(workspace) {
@@ -1398,6 +1526,7 @@ function composer(workspace) {
   <form class="chat-composer" data-form="conversation" aria-label="发送消息">
     <div class="slash-menu" data-slash-menu hidden role="listbox" aria-label="快捷指令"></div>
     ${blocked ? '<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>' : ""}
+    <div class="guidance-queue" data-chat-guidance>${guidanceQueueMarkup(workspace.session?.id || "")}</div>
     <div class="attached-files" data-chat-selection>${selectionChip(draft.selection)}</div>
     <div class="attached-files" data-chat-selected>${selectedFiles(draft.selected || [])}</div>
     <div class="composer-grow" data-composer-grow data-replicated-value="${e(draftText + "\n")}">
@@ -1407,7 +1536,7 @@ function composer(workspace) {
     <div class="composer-actions">
       <div class="composer-tools">
         <label class="composer-tool upload-zone" data-upload-zone title="添加附件（也可直接拖拽文件到页面）" aria-label="添加附件">
-          ${icon("clip")}<input type="file" data-upload accept=".docx,.pptx,.xlsx,.pdf,.txt,.md" multiple>
+          ${icon("clip")}<input type="file" data-upload accept=".docx,.pptx,.xlsx,.pdf,.txt,.md,.csv,.png,.jpg,.jpeg,.webp" multiple>
         </label>
         <button type="button" class="composer-tool ${selectedCount ? "has-value" : ""}" data-act="chat-sources" data-sources-btn title="引用已有资料" aria-label="引用资料">
           ${icon("folder")}<span class="tool-badge" data-sources-count ${selectedCount ? "" : "hidden"}>${selectedCount}</span>
@@ -1471,7 +1600,7 @@ export function workspaceView(workspace) {
         <div class="drop-overlay-box">
           ${icon("upload")}
           <strong>松开鼠标，作为参考资料加入当前会话</strong>
-          <span>支持 Word、PowerPoint、PDF、TXT、Markdown</span>
+          <span>支持 Word、PowerPoint、Excel、PDF、TXT、Markdown、CSV 及常见图片</span>
         </div>
       </div>
       <header class="thread-header">
@@ -1690,6 +1819,10 @@ export function retryTurn(index) {
 }
 
 export function saveWorkspaceInput(form) {
+  if (form?.dataset?.busy) {
+    syncChatSubmit(form, state.chatWorkspace);
+    return;
+  }
   writeDraft(state.chatWorkspace, form);
 }
 
@@ -1749,20 +1882,40 @@ export function removeSource(id) {
 
 export async function attachFiles(files, input) {
   const workspace = state.chatWorkspace;
+  if (!workspace) throw new Error("请先打开会话后再添加附件");
   if (chatForm()?.dataset.busy) throw new Error("请等待当前请求执行结束");
   const existing = draftFor(workspace).selected || [];
-  if (existing.length + files.length > 8) throw new Error("每轮最多添加 8 份参考资料");
-  if (files.some((file) => !readable.has(file.name.split(".").pop().toLowerCase()))) {
-    throw new Error("支持引用 Word、PowerPoint、PDF、TXT 和 Markdown");
+  const docFiles = [];
+  const imgFiles = [];
+  for (const file of files) {
+    const ext = String(file?.name || "").includes(".") ? file.name.split(".").pop().toLowerCase() : "";
+    if (readable.has(ext)) docFiles.push(file);
+    else if (imageExts.has(ext)) imgFiles.push(file);
+    else throw new Error(`「${file?.name || "文件"}」格式不支持，请选择 Word、PowerPoint、Excel、PDF、TXT、Markdown、CSV 或常见图片`);
   }
+  if (existing.length + docFiles.length > 8) throw new Error("每轮最多添加 8 份参考资料");
   const controls = chatForm()?.querySelectorAll("button[type=submit]");
   controls?.forEach((control) => { control.disabled = true; });
   try {
-    const addedList = await uploadSelected(files, workspace.task?.id || "");
-    if (addedList.length) {
-      updateSources(workspace, (sources) => [...sources, ...addedList]);
-      toastMessage("附件已加入会话", "success");
+    const allUploaded = await uploadSelected([...docFiles, ...imgFiles], workspace.task?.id || "");
+    const addedDocs = allUploaded.filter((item) => readable.has(String(item.extension || "").toLowerCase()));
+    const addedImgs = allUploaded.filter((item) => imageExts.has(String(item.extension || "").toLowerCase()));
+    if (addedDocs.length) {
+      updateSources(workspace, (sources) => [...sources, ...addedDocs]);
     }
+    if (addedDocs.length && addedImgs.length) {
+      toastMessage(`已加入 ${addedDocs.length} 份参考资料，${addedImgs.length} 张图片已保存到「我的文件」`, "success");
+    } else if (addedDocs.length) {
+      toastMessage("附件已加入会话", "success");
+    } else if (addedImgs.length) {
+      toastMessage("图片已上传到「我的文件」（当前会话参考资料仅支持文档与表格）", "success");
+    }
+  } catch (error) {
+    recordClientLog("error", "upload", cleanErrorMessage(error, "拖拽上传失败"), {
+      count: files.length,
+      names: files.slice(0, 4).map((f) => f?.name || "")
+    });
+    throw error;
   } finally {
     syncChatSubmit(chatForm(), workspace);
     if (input) input.value = "";
@@ -1871,8 +2024,18 @@ function startProgress(form, live) {
 function setComposerLocked(form, locked, workspace = state.chatWorkspace) {
   if (!form?.isConnected) return;
   if (locked) closeComposerPickers();
-  for (const field of form.querySelectorAll("textarea, select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source], button[data-act=slash-trigger], button[data-act=chat-generate-image], button[data-act=picker-toggle]")) {
+  const threadId = currentLiveThreadId(workspace);
+  const live = activeTurnFor(threadId);
+  const allowGuidanceTyping = Boolean(locked && (!live || live.kind !== "image"));
+  for (const field of form.querySelectorAll("select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source], button[data-act=slash-trigger], button[data-act=chat-generate-image], button[data-act=picker-toggle]")) {
     field.disabled = locked;
+  }
+  const textarea = form.elements?.message;
+  if (textarea) {
+    textarea.disabled = locked && !allowGuidanceTyping;
+    textarea.placeholder = allowGuidanceTyping
+      ? "AI 正在思考，可随时输入补充要求或调整方向（Enter 追加引导）…"
+      : "描述你想完成的工作，输入 / 唤起指令…";
   }
   if (!locked) {
     const modelSelect = form.querySelector("[data-chat-model]");
@@ -1886,6 +2049,7 @@ function setComposerLocked(form, locked, workspace = state.chatWorkspace) {
   } else {
     syncChatSubmit(form, workspace);
   }
+  syncGuidanceDom(threadId);
 }
 
 function syncLiveCanvas(live) {
@@ -2461,6 +2625,7 @@ async function runConversationTurn({
   emitConversationsUpdated();
 
   const initialInView = () => Boolean(form?.isConnected && state.me?.id === user);
+  let pendingAutoNext = null;
   if (form) {
     form.dataset.busy = "1";
     setComposerLocked(form, true, workspace);
@@ -2568,10 +2733,36 @@ async function runConversationTurn({
     if (!workspace.task && !workspace.project && looksLikeRawTitle(curTitle)) {
       void generateConversationTitle(threadId, { force: true }).catch(() => {});
     }
+    const followups = guidanceListFor(threadId);
+    if (followups.length && state.me?.id === user) {
+      queuedGuidance.delete(threadId);
+      syncGuidanceDom(threadId);
+      pendingAutoNext = {
+        kind: "followup",
+        message: formatFollowUpGuidanceMessage(followups.map((item) => item.text)),
+        mode: payload.mode,
+        selected: [],
+        selection: null
+      };
+    }
   } catch (error) {
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);
     emitConversationsUpdated();
+    const redirectTexts = Array.isArray(live.redirectGuidance) && live.redirectGuidance.length ? live.redirectGuidance : null;
+    if (redirectTexts && state.me?.id === user) {
+      if (isViewingThread(threadId, user)) {
+        setCanvasLiveState({ active: false });
+        findLiveProgress(threadId)?.remove();
+      }
+      pendingAutoNext = {
+        kind: "redirect",
+        message: formatMergedGuidanceMessage(message, redirectTexts),
+        mode: payload.mode,
+        selected,
+        selection: payload.selection || draft.selection || null
+      };
+    } else {
     const cleanedMessage = cleanErrorMessage(error, "本轮执行失败");
     recordClientLog("error", "chat", cleanedMessage, { conversationId: threadId, resume: Boolean(resume) });
     if (error instanceof Error) error.message = cleanedMessage;
@@ -2609,6 +2800,7 @@ async function runConversationTurn({
       const stopped = cleanedMessage.startsWith("已停止生成");
       toastMessage(stopped ? "后台会话已停止" : `后台会话未完成（已保存断点）：${cleanedMessage}`, stopped ? "info" : "error");
     }
+    }
   } finally {
     activeTurns.delete(threadId);
     emitConversationsUpdated();
@@ -2622,6 +2814,37 @@ async function runConversationTurn({
         delete currentForm.dataset.busy;
         setComposerLocked(currentForm, false, state.chatWorkspace);
       }
+    }
+    if (pendingAutoNext && state.me?.id === user) {
+      const nextJob = pendingAutoNext;
+      queueMicrotask(() => {
+        if (state.me?.id !== user || activeTurnFor(threadId)) return;
+        const targetWorkspace = state.chatWorkspace?.session?.id === threadId ? state.chatWorkspace : workspace;
+        const targetForm = isViewingThread(threadId, user) ? chatForm() : null;
+        const nextPayload = {
+          message: nextJob.message,
+          mode: nextJob.selection ? "auto" : (nextJob.mode || "auto"),
+          material_ids: (nextJob.selected || []).map((file) => file.id),
+          ...(nextJob.selection ? { selection: nextJob.selection } : {})
+        };
+        toastMessage(
+          nextJob.kind === "redirect" ? "已结合追加引导重新开始执行" : "正在按刚才追加的引导继续处理…",
+          "info"
+        );
+        void runConversationTurn({
+          workspace: targetWorkspace,
+          form: targetForm,
+          message: nextJob.message,
+          payload: nextPayload,
+          selected: nextJob.selected || [],
+          draft: draftFor(targetWorkspace),
+          allowAiImages,
+          resume: false,
+          rethrowToForm: false
+        }).catch((err) => {
+          toastMessage(cleanErrorMessage(err, "追加引导执行失败"), "error");
+        });
+      });
     }
   }
 }

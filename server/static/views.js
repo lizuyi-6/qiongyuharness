@@ -321,7 +321,8 @@ export function filesView(items) {
   ];
   return `${pageHead("我的文件", "",
     `<div class="actions">${uploadMarkup("上传文件")}${button("新建文稿", "route", { id: "agent", icon: "plus", cls: "primary" })}</div>`)}
-  <section class="stack">
+  <section class="stack files-dropzone" data-files-dropzone>
+    <div class="files-drop-hint" aria-hidden="true">${icon("upload")}<span>松开鼠标，立即上传到「我的文件」</span></div>
     <div class="files-toolbar">
       <div class="tabs" role="group" aria-label="按文件类型筛选">
         ${kinds.map(([key, label]) => `<button type="button" class="tab ${state.filesFilter === key ? "active" : ""}" data-act="files-filter" data-id="${key}">${e(label)}</button>`).join("")}

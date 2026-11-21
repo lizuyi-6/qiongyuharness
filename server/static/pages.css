@@ -368,6 +368,30 @@
   border-radius: 6px;
   object-fit: contain;
 }
+.files-dropzone {
+  position: relative;
+  min-height: 360px;
+  border-radius: var(--radius-lg, 12px);
+  transition: outline-color 140ms ease, background 140ms ease;
+}
+.files-drop-hint {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1.5px dashed var(--hairline, var(--ink));
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 560;
+  pointer-events: none;
+}
+.files-drop-hint svg { width: 16px; height: 16px; }
+.files-dropzone.drag-over .files-drop-hint {
+  display: flex;
+}
 
 /* 问题反馈与一键上传日志 */
 .feedback-inline-bar {
