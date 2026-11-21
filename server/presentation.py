@@ -20,10 +20,21 @@ router = APIRouter(prefix="/api/v1/files")
 PRESENTATION = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 
+class RegionBox(BaseModel):
+    """圈选矩形区域（16:9 自由画布英寸坐标：x, y, w, h）"""
+    x: float = Field(ge=-1.0, le=14.5)
+    y: float = Field(ge=-1.0, le=8.5)
+    w: float = Field(gt=0.05, le=15.0)
+    h: float = Field(gt=0.05, le=9.0)
+
+
 class Selection(BaseModel):
     file_id: str = Field(min_length=1,max_length=100)
     slide: int = Field(ge=1, le=160)
     shape_id: int | None = Field(default=None, ge=1)
+    shape_ids: list[int] = Field(default_factory=list, max_length=60)
+    region: RegionBox | None = None
+    label: str | None = Field(default=None, max_length=120)
 
 
 class Replacement(BaseModel):
@@ -172,6 +183,10 @@ def selected_layout(prs,page):
             if picture.content_type in {"image/png","image/jpeg","image/gif"} and len(picture.blob)<=image_budget:
                 item["image"]="data:"+picture.content_type+";base64,"+base64.b64encode(picture.blob).decode()
                 image_budget-=len(picture.blob)
+            item["kind"] = "image"
+            item["selectable"] = True
+            if item["width"] >= 920 and item["height"] >= 500:
+                item["is_background"] = True
         if shape.has_text_frame and shape.text.strip():
             first_p=next((p for p in shape.text_frame.paragraphs if p.text.strip()), None)
             first=next((run for p in shape.text_frame.paragraphs for run in p.runs if run.text.strip()),None)
@@ -190,7 +205,11 @@ def selected_layout(prs,page):
             item.update(text=shape.text[:900], size=round(int(pt)*scale,2), bold=bool(font and font.bold),
                         color=color_value(font.color,"#182231") if font else "#182231",
                         align=align, valign=valign,
+                        kind="text", selectable=True,
                         editable=editable_text(shape) is not None)
+        if not item.get("kind"):
+            item["kind"] = "shape"
+            item["selectable"] = True
         if item.get("text") or item.get("image") or item["fill"] or item.get("gradient") or item.get("border"):
             objects.append(item)
     bg=slide.background.fill

@@ -384,6 +384,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       selection: checkpointMeta.selection !== undefined ? checkpointMeta.selection : (resumedCheckpoint?.selection || null),
       model: job.model,
       allowImageTool: job.image_tool === true,
+      imageIndexOffset: Number.isInteger(job.image_index_offset) && job.image_index_offset > 0
+        ? job.image_index_offset
+        : (Number.isInteger(resumedCheckpoint?.imageIndexOffset) && resumedCheckpoint.imageIndexOffset > 0 ? resumedCheckpoint.imageIndexOffset : 0),
       stage: resumedCheckpoint?.stage || (pipelineRequested ? "understand" : "single_execute"),
       brief: resumedCheckpoint?.brief || null,
       tier: resumedCheckpoint?.tier || "standard",
@@ -663,6 +666,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           deadlineAt: startedAt + (pipelineRequested ? DEADLINE_MS : STAGE_TIMEOUT_MS),
           now: clockNow,
           initialImages: checkpointState.images,
+          indexOffset: checkpointState.imageIndexOffset || 0,
           onImageGenerated: (_img, _index, allImages) => {
             void persistCheckpoint({ images: allImages });
           }
@@ -701,7 +705,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         });
       }
       const extraSystemParts = [];
-      if (imageBroker) extraSystemParts.push(IMAGE_TOOL_INSTRUCTIONS);
+      if (imageBroker) {
+        const offset = checkpointState.imageIndexOffset || 0;
+        extraSystemParts.push(offset > 0
+          ? `${IMAGE_TOOL_INSTRUCTIONS} 当前 PPT 已包含 1 至 ${offset} 号历史配图可直接复用；若需修改或替换图片请调用 office_image_generate，新生成图片的 image_index 将自动从 ${offset + 1} 开始编号。`
+          : IMAGE_TOOL_INSTRUCTIONS);
+      }
       if (searchBroker && webSearchRequired) extraSystemParts.push(buildSearchToolInstructions(searchBroker.serverTime || serverTime));
       const effectiveSystem = extraSystemParts.length ? `${job.system}\n\n${extraSystemParts.join("\n\n")}` : job.system;
       const collectImages = () => {

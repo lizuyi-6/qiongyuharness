@@ -56,10 +56,12 @@ async function createImageBroker({
   deadlineAt,
   now = Date.now,
   initialImages = [],
+  indexOffset = 0,
   onImageGenerated = () => {}
 }) {
   const hasLimit = Number.isInteger(maxImages) && maxImages >= 1;
   const validLimit = maxImages === null || maxImages === undefined || maxImages === 0 || maxImages === Infinity || hasLimit;
+  const safeOffset = Number.isInteger(indexOffset) && indexOffset > 0 ? indexOffset : 0;
   if (typeof generate !== "function" || typeof model !== "string" || !/^gpt-image-/.test(model) ||
       !validLimit || !Number.isFinite(deadlineAt) || typeof now !== "function") {
     throw new TypeError("生图 broker 参数无效");
@@ -129,7 +131,7 @@ async function createImageBroker({
           !QUALITIES.has(image.quality) || typeof image.png_base64 !== "string") {
         throw new Error("生图返回内容无效");
       }
-      const index = images.length + 1;
+      const index = safeOffset + images.length + 1;
       const stored = { ...image };
       images.push(stored);
       try { onImageGenerated(stored, index, images.map((item) => ({ ...item }))); } catch {}

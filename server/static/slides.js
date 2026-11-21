@@ -38,8 +38,20 @@ export function studioArtifacts(session) {
   return [...seen.values()];
 }
 
+export function selectionSummaryText(selection) {
+  if (!selection) return "";
+  const pageText = `第 ${selection.slide} 页`;
+  if (selection.label) return `${pageText} · ${selection.label}`;
+  if (selection.region) return `${pageText} · 圈选区域`;
+  if (Array.isArray(selection.shape_ids) && selection.shape_ids.length > 1) {
+    return `${pageText} · 选中 ${selection.shape_ids.length} 个元素`;
+  }
+  if (selection.shape_id) return `${pageText} · 选中元素`;
+  return `${pageText} · 整页自由修改`;
+}
+
 export function selectionChip(selection) {
-  return selection ? `<span class="attached-file">第 ${selection.slide} 页${selection.shape_id ? " · 选中文本框" : " · 整页文字"}
+  return selection ? `<span class="attached-file">${e(selectionSummaryText(selection))}
     <button type="button" data-act="slides-clear" aria-label="清除选区">×</button></span>` : "";
 }
 
@@ -132,11 +144,12 @@ export function deckPanel(workspace) {
       <div class="deck-dock">
         <div class="deck-dock-row">
           <select class="deck-shape-select" data-deck-shape aria-label="选择修改范围" disabled>
-            <option value="">整页的可编辑文字</option>
+            <option value="">整页自由修改（含图片、排版与文字）</option>
           </select>
+          <button type="button" class="button sm ghost" data-deck-clear-box hidden>清除框选</button>
           ${button("引用选区", "slides-target", { cls: "primary sm", disabled: true })}
         </div>
-        <p class="hint deck-note" data-deck-note role="status">点击画布中任意文本框，自动选中并在左侧直接对话修改。</p>
+        <p class="hint deck-note" data-deck-note role="status">在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。</p>
       </div>
     </div>
   </section>`;
@@ -182,11 +195,48 @@ function traceShapePath(ctx, shape, left, top, width, height) {
   }
 }
 
-async function art(canvas, scene, selected) {
+const SLIDE_W_IN = 13.333;
+const SLIDE_H_IN = 7.5;
+
+function boxesIntersect(a, b) {
+  return a.left < b.left + b.width && a.left + a.width > b.left && a.top < b.top + b.height && a.top + a.height > b.top;
+}
+
+function normalizeBox(p1, p2, maxW, maxH) {
+  const left = Math.max(0, Math.min(maxW, Math.min(p1.x, p2.x)));
+  const top = Math.max(0, Math.min(maxH, Math.min(p1.y, p2.y)));
+  const right = Math.max(0, Math.min(maxW, Math.max(p1.x, p2.x)));
+  const bottom = Math.max(0, Math.min(maxH, Math.max(p1.y, p2.y)));
+  return { left, top, width: Math.max(1, right - left), height: Math.max(1, bottom - top) };
+}
+
+function objectKind(item) {
+  if (item?.kind) return item.kind;
+  if (item?.image) return "image";
+  if (item?.text) return "text";
+  return "shape";
+}
+
+function objectOptionLabel(item, counters) {
+  const kind = objectKind(item);
+  if (kind === "image") {
+    counters.image += 1;
+    return item.is_background ? `[图片] 背景主图` : `[图片] 配图 #${counters.image}`;
+  }
+  if (kind === "text") {
+    const snippet = String(item.text || "").replace(/\s+/g, " ").trim().slice(0, 28);
+    return `[文字] ${snippet || "文本框"}`;
+  }
+  counters.shape += 1;
+  return `[图形] 卡片/色块 #${counters.shape}`;
+}
+
+async function renderSceneBase(scene) {
   const scale = 1.6;
-  canvas.width = Math.round(scene.width * scale);
-  canvas.height = Math.round(scene.height * scale);
-  const ctx = canvas.getContext("2d");
+  const offscreen = document.createElement("canvas");
+  offscreen.width = Math.round(scene.width * scale);
+  offscreen.height = Math.round(scene.height * scale);
+  const ctx = offscreen.getContext("2d");
   ctx.scale(scale, scale);
   const images = await Promise.all(scene.objects.map(async (shape) => {
     if (!shape.image) return null;
@@ -234,7 +284,6 @@ async function art(canvas, scene, selected) {
     }
     if (images[index]) {
       const img = images[index];
-      // 按 cover 等比绘制预览，避免拉伸变形
       const ir = img.naturalWidth / Math.max(1, img.naturalHeight);
       const br = width / Math.max(1, height);
       let sx = 0, sy = 0, sw = img.naturalWidth, sh = img.naturalHeight;
@@ -269,17 +318,79 @@ async function art(canvas, scene, selected) {
       lines.forEach((line, lineIndex) => ctx.fillText(line, drawX, startY + lineIndex * lineH));
       ctx.restore();
     }
-    if (shape.id === selected) {
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 4;
-      ctx.strokeRect(left, top, width, height);
-      ctx.strokeStyle = "#18181b";
-      ctx.lineWidth = 2;
-      ctx.setLineDash([7, 4]);
-      ctx.strokeRect(left, top, width, height);
-      ctx.setLineDash([]);
-    }
   }
+  return { offscreen, scale };
+}
+
+function paintOverlay(canvas, base, scene, { selectedIds = [], regionBox = null, isDragging = false } = {}) {
+  if (!base || !scene) return;
+  const { offscreen, scale } = base;
+  if (canvas.width !== offscreen.width || canvas.height !== offscreen.height) {
+    canvas.width = offscreen.width;
+    canvas.height = offscreen.height;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(offscreen, 0, 0);
+  ctx.scale(scale, scale);
+
+  const selectedSet = new Set(selectedIds.filter(Boolean));
+  for (const shape of scene.objects) {
+    if (!selectedSet.has(shape.id)) continue;
+    const { left, top, width, height } = shape;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.lineWidth = regionBox ? 2.5 : 4;
+    ctx.strokeRect(left, top, width, height);
+    ctx.strokeStyle = regionBox ? "rgba(37, 99, 235, 0.72)" : "#2563eb";
+    ctx.lineWidth = regionBox ? 1.5 : 2.2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(left, top, width, height);
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  if (regionBox) {
+    const { left, top, width, height } = regionBox;
+    ctx.save();
+    ctx.fillStyle = isDragging ? "rgba(37, 99, 235, 0.14)" : "rgba(37, 99, 235, 0.10)";
+    ctx.fillRect(left, top, width, height);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 3.5;
+    ctx.strokeRect(left, top, width, height);
+    ctx.strokeStyle = "#2563eb";
+    ctx.lineWidth = 2;
+    ctx.setLineDash(isDragging ? [6, 4] : []);
+    ctx.strokeRect(left, top, width, height);
+    ctx.setLineDash([]);
+    // 四角控制锚点
+    const r = 4;
+    for (const [hx, hy] of [[left, top], [left + width, top], [left, top + height], [left + width, top + height]]) {
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "#2563eb";
+      ctx.lineWidth = 1.6;
+      ctx.fillRect(hx - r, hy - r, r * 2, r * 2);
+      ctx.strokeRect(hx - r, hy - r, r * 2, r * 2);
+    }
+    const wIn = (width / scene.width * SLIDE_W_IN).toFixed(1);
+    const hIn = (height / scene.height * SLIDE_H_IN).toFixed(1);
+    const tag = isDragging ? `圈选区域 ${wIn}" × ${hIn}"` : `已圈选 · ${wIn}" × ${hIn}"`;
+    ctx.font = '600 11px "Microsoft YaHei", sans-serif';
+    const tw = ctx.measureText(tag).width + 12;
+    const th = 20;
+    const tx = Math.max(4, Math.min(scene.width - tw - 4, left));
+    const ty = top >= th + 6 ? top - th - 4 : top + 6;
+    ctx.fillStyle = "#2563eb";
+    ctx.fillRect(tx, ty, tw, th);
+    ctx.fillStyle = "#ffffff";
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+    ctx.fillText(tag, tx + 6, ty + th / 2);
+    ctx.restore();
+  }
+  ctx.restore();
 }
 
 function remember(workspace, fields) {
@@ -292,6 +403,7 @@ export function clearSelection() {
   remember(workspace, { selection: null });
   const chip = document.querySelector("[data-chat-selection]");
   if (chip) chip.innerHTML = "";
+  activeController?.clearBox?.();
 }
 
 function rebuildChoices(select, options) {
@@ -421,6 +533,7 @@ export function mountDeck() {
   const nextBtn = panel.querySelector("[data-deck-next]");
   const counter = panel.querySelector("[data-deck-counter]");
   const shape = panel.querySelector("[data-deck-shape]");
+  const clearBoxBtn = panel.querySelector("[data-deck-clear-box]");
   const canvas = panel.querySelector("canvas");
   const loading = panel.querySelector("[data-deck-loading]");
   const note = panel.querySelector("[data-deck-note]");
@@ -435,8 +548,14 @@ export function mountDeck() {
   let currentWorkspace = workspace;
   let artifacts = studioArtifacts(currentWorkspace.session);
   let scene = null;
+  let baseLayer = null;
   let epoch = 0;
   let totalPages = 0;
+  let activeRegion = null; // { left, top, width, height } in scene coordinates
+  let activeShapeIds = [];
+  let activeLabel = "";
+  let dragStart = null;
+  let dragging = false;
 
   function setStageMode(mode) {
     if (stageBuilding) stageBuilding.hidden = mode !== "building";
@@ -465,34 +584,134 @@ export function mountDeck() {
     }
   }
 
+  function redrawCanvas(isDragging = false) {
+    if (!baseLayer || !scene) return;
+    const selectedIds = activeRegion
+      ? activeShapeIds
+      : (shape.value ? [Number(shape.value)] : []);
+    paintOverlay(canvas, baseLayer, scene, { selectedIds, regionBox: activeRegion, isDragging });
+    if (clearBoxBtn) clearBoxBtn.hidden = !activeRegion && !shape.value;
+  }
+
+  function describeRegionHits(box) {
+    if (!scene || !box) return { ids: [], label: "圈选区域" };
+    const fgHits = [];
+    let bgHit = null;
+    for (const item of scene.objects) {
+      if (!boxesIntersect(item, box)) continue;
+      if (item.is_background) {
+        bgHit = item;
+        continue;
+      }
+      fgHits.push(item);
+    }
+    const ids = fgHits.map((item) => item.id);
+    let images = fgHits.filter((item) => objectKind(item) === "image").length;
+    const texts = fgHits.filter((item) => objectKind(item) === "text").length;
+    const shapes = fgHits.filter((item) => objectKind(item) === "shape").length;
+    if (bgHit && (!fgHits.length || (box.width * box.height) / (scene.width * scene.height) >= 0.22)) {
+      ids.push(bgHit.id);
+      images += 1;
+    }
+    const parts = [];
+    if (images) parts.push(`${images} 张图片`);
+    if (texts) parts.push(`${texts} 处文字`);
+    if (shapes) parts.push(`${shapes} 个图形`);
+    const label = parts.length ? `圈选区域（含 ${parts.join(" · ")}）` : "圈选空白区域（可新增图文）";
+    return { ids, label };
+  }
+
+  function describeSingleObject(item) {
+    if (!item) return "整页自由修改";
+    const kind = objectKind(item);
+    if (kind === "image") return item.is_background ? "背景主图" : "选中图片";
+    if (kind === "text") {
+      const snippet = String(item.text || "").replace(/\s+/g, " ").trim().slice(0, 14);
+      return snippet ? `文字「${snippet}」` : "选中文本框";
+    }
+    return "选中卡片/图形";
+  }
+
+  function scenePointFromEvent(event) {
+    const bounds = canvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(scene.width, (event.clientX - bounds.left) * scene.width / Math.max(1, bounds.width)));
+    const y = Math.max(0, Math.min(scene.height, (event.clientY - bounds.top) * scene.height / Math.max(1, bounds.height)));
+    return { x, y };
+  }
+
+  function pickObjectAtPoint(x, y) {
+    if (!scene) return null;
+    const hits = scene.objects.filter((item) =>
+      x >= item.left && x <= item.left + item.width && y >= item.top && y <= item.top + item.height
+    );
+    if (!hits.length) return null;
+    const foreground = hits.filter((item) => !item.is_background);
+    if (foreground.length) {
+      // 优先命中上层文字/图片，面积更小者优先，方便在卡片内部直接点中图片或文本
+      const score = (item) => {
+        const kind = objectKind(item);
+        const priority = kind === "text" ? 0 : kind === "image" ? 1 : 2;
+        return priority * 1e9 + (item.width * item.height);
+      };
+      foreground.sort((a, b) => score(a) - score(b));
+      return foreground[0];
+    }
+    return hits[hits.length - 1];
+  }
+
   async function loadPptxPage(fileId, number) {
     const ticket = ++epoch;
     scene = null;
+    baseLayer = null;
+    activeRegion = null;
+    activeShapeIds = [];
+    activeLabel = "";
     action.disabled = true;
     syncPager(number);
     if (loading) { loading.textContent = "正在渲染幻灯片…"; loading.hidden = false; }
     const next = await api("/files/" + encodeURIComponent(fileId) + "/slides/" + number);
     if (!panel.isConnected || ticket !== epoch) return;
     scene = next;
-    const objects = scene.objects.filter((item) => item.editable);
-    rebuildChoices(shape, [{ text: "整页的可编辑文字", value: "" }, ...objects.map((item) => ({
-      text: item.text.slice(0, 31), value: String(item.id)
-    }))]);
+    const counters = { image: 0, shape: 0 };
+    const selectableObjects = scene.objects.filter((item) => item.selectable !== false);
+    rebuildChoices(shape, [
+      { text: "整页自由修改（含图片、排版与文字）", value: "" },
+      ...selectableObjects.map((item) => ({
+        text: objectOptionLabel(item, counters),
+        value: String(item.id)
+      }))
+    ]);
     const selected = (readDraft(currentWorkspace.draftKey) || {}).selection;
-    if (selected?.file_id === fileId && selected.slide === number && selected.shape_id) {
-      shape.value = String(selected.shape_id);
+    if (selected?.file_id === fileId && selected.slide === number) {
+      if (selected.region && Number.isFinite(selected.region.w)) {
+        activeRegion = {
+          left: selected.region.x / SLIDE_W_IN * scene.width,
+          top: selected.region.y / SLIDE_H_IN * scene.height,
+          width: selected.region.w / SLIDE_W_IN * scene.width,
+          height: selected.region.h / SLIDE_H_IN * scene.height
+        };
+        activeShapeIds = Array.isArray(selected.shape_ids) ? selected.shape_ids : [];
+        activeLabel = selected.label || "圈选区域";
+      } else if (selected.shape_id) {
+        shape.value = String(selected.shape_id);
+        activeShapeIds = [Number(selected.shape_id)];
+        activeLabel = selected.label || "";
+      }
     }
-    await art(canvas, next, Number(shape.value));
+    baseLayer = await renderSceneBase(next);
     if (!panel.isConnected || ticket !== epoch) return;
+    redrawCanvas(false);
     canvas.hidden = false;
     canvas.classList.remove("fading");
     void canvas.offsetWidth;
     canvas.classList.add("fading");
     if (loading) loading.hidden = true;
-    canvas.setAttribute("aria-label", `第 ${number} 页预览`);
-    shape.disabled = !objects.length;
-    action.disabled = !(objects.length && document.querySelector("[data-form=conversation]"));
-    note.textContent = objects.length ? "点击画布任意文本框，直接选中并在左侧对话修改。" : "当前页没有可编辑的单段文本框。";
+    canvas.setAttribute("aria-label", `第 ${number} 页预览（支持拖拽框选或点击任意元素）`);
+    shape.disabled = false;
+    action.disabled = !document.querySelector("[data-form=conversation]");
+    note.textContent = activeRegion
+      ? `已${activeLabel || "圈选区域"}，可在左侧直接输入修改要求（支持换图、改字、调排版）。`
+      : "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。";
     remember(currentWorkspace, { deck: { fileId, page: number } });
   }
 
@@ -582,7 +801,41 @@ export function mountDeck() {
   function applySelection(focusInput = true) {
     const form = document.querySelector("[data-form=conversation]");
     if (!form || form.dataset.busy || !scene) return;
-    const selection = { file_id: file.value, slide: Number(page.value), shape_id: shape.value ? Number(shape.value) : null };
+    let selection;
+    if (activeRegion) {
+      const region = {
+        x: Number((activeRegion.left / scene.width * SLIDE_W_IN).toFixed(2)),
+        y: Number((activeRegion.top / scene.height * SLIDE_H_IN).toFixed(2)),
+        w: Number(Math.max(0.1, activeRegion.width / scene.width * SLIDE_W_IN).toFixed(2)),
+        h: Number(Math.max(0.1, activeRegion.height / scene.height * SLIDE_H_IN).toFixed(2))
+      };
+      selection = {
+        file_id: file.value,
+        slide: Number(page.value),
+        shape_id: activeShapeIds.length === 1 ? activeShapeIds[0] : null,
+        shape_ids: activeShapeIds.slice(0, 50),
+        region,
+        label: activeLabel || "圈选区域"
+      };
+    } else if (shape.value) {
+      const sid = Number(shape.value);
+      const obj = scene.objects.find((item) => item.id === sid);
+      selection = {
+        file_id: file.value,
+        slide: Number(page.value),
+        shape_id: sid,
+        shape_ids: [sid],
+        label: activeLabel || describeSingleObject(obj)
+      };
+    } else {
+      selection = {
+        file_id: file.value,
+        slide: Number(page.value),
+        shape_id: null,
+        shape_ids: [],
+        label: "整页自由修改"
+      };
+    }
     remember(currentWorkspace, { selection });
     form.querySelector("[data-chat-selection]").innerHTML = selectionChip(selection);
     form.classList.remove("pulsing");
@@ -626,29 +879,109 @@ export function mountDeck() {
     }
   });
   shape.addEventListener("change", () => {
-    clearSelection();
-    if (scene) void art(canvas, scene, Number(shape.value));
+    activeRegion = null;
+    const sid = shape.value ? Number(shape.value) : null;
+    activeShapeIds = sid ? [sid] : [];
+    const obj = sid && scene ? scene.objects.find((item) => item.id === sid) : null;
+    activeLabel = obj ? describeSingleObject(obj) : "";
+    redrawCanvas(false);
+    if (sid) applySelection(false);
+    else clearSelection();
   });
-  canvas.addEventListener("click", (event) => {
-    if (!scene || shape.disabled) return;
-    const bounds = canvas.getBoundingClientRect();
-    const x = (event.clientX - bounds.left) * scene.width / bounds.width;
-    const y = (event.clientY - bounds.top) * scene.height / bounds.height;
-    const hit = [...scene.objects].reverse().find((item) => item.editable && x >= item.left && x <= item.left + item.width && y >= item.top && y <= item.top + item.height);
+  clearBoxBtn?.addEventListener("click", () => {
+    activeRegion = null;
+    activeShapeIds = [];
+    activeLabel = "";
+    shape.value = "";
+    clearSelection();
+    redrawCanvas(false);
+    note.textContent = "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。";
+  });
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (!scene || !baseLayer || event.button !== 0) return;
+    event.preventDefault();
+    dragStart = scenePointFromEvent(event);
+    dragging = false;
+    try { canvas.setPointerCapture(event.pointerId); } catch {}
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (!dragStart || !scene || !baseLayer) return;
+    const current = scenePointFromEvent(event);
+    const dist = Math.hypot(current.x - dragStart.x, current.y - dragStart.y);
+    if (!dragging && dist < 8) return;
+    dragging = true;
+    const box = normalizeBox(dragStart, current, scene.width, scene.height);
+    activeRegion = box;
+    const hitInfo = describeRegionHits(box);
+    activeShapeIds = hitInfo.ids;
+    activeLabel = hitInfo.label;
+    shape.value = "";
+    redrawCanvas(true);
+  });
+
+  function finishPointer(event, cancelled = false) {
+    if (!dragStart || !scene || !baseLayer) return;
+    const start = dragStart;
+    const wasDragging = dragging;
+    dragStart = null;
+    dragging = false;
+    try { canvas.releasePointerCapture(event.pointerId); } catch {}
+    if (cancelled) {
+      redrawCanvas(false);
+      return;
+    }
+    const end = scenePointFromEvent(event);
+    if (wasDragging && Math.abs(end.x - start.x) >= 10 && Math.abs(end.y - start.y) >= 10) {
+      const box = normalizeBox(start, end, scene.width, scene.height);
+      activeRegion = box;
+      const hitInfo = describeRegionHits(box);
+      activeShapeIds = hitInfo.ids;
+      activeLabel = hitInfo.label;
+      shape.value = "";
+      redrawCanvas(false);
+      applySelection(true);
+      note.textContent = `已${activeLabel}，可在左侧直接让 AI 修改（支持换图、重绘、改排版或改文字）。`;
+      toastMessage(`已圈选第 ${page.value} 页区域，可在左侧直接描述修改要求`, "info");
+      return;
+    }
+    // 单击：命中任意元素（图片、文字、卡片/图形）
+    activeRegion = null;
+    const hit = pickObjectAtPoint(end.x, end.y);
     if (hit) {
       shape.value = String(hit.id);
-      void art(canvas, scene, hit.id);
+      activeShapeIds = [hit.id];
+      activeLabel = describeSingleObject(hit);
+      redrawCanvas(false);
       applySelection(true);
-      toastMessage(`已选中第 ${page.value} 页文本框，可在左侧直接输入修改要求`, "info");
+      note.textContent = `已选中「${activeLabel}」，可在左侧直接输入修改要求。`;
+      toastMessage(`已选中第 ${page.value} 页 ${activeLabel}`, "info");
+    } else {
+      shape.value = "";
+      activeShapeIds = [];
+      activeLabel = "";
+      redrawCanvas(false);
     }
-  });
+  }
+
+  canvas.addEventListener("pointerup", (event) => finishPointer(event, false));
+  canvas.addEventListener("pointercancel", (event) => finishPointer(event, true));
+
   action.addEventListener("click", () => {
     applySelection(true);
-    toastMessage("已选中要修改的幻灯片范围", "success");
+    toastMessage("已引用当前画布选区，可在左侧自由描述修改要求", "success");
   });
 
   activeController = {
     isMountedOn: (el) => el === panel && panel.isConnected,
+    clearBox() {
+      activeRegion = null;
+      activeShapeIds = [];
+      activeLabel = "";
+      shape.value = "";
+      redrawCanvas(false);
+    },
     async selectById(fileId, preferredPage = 1) {
       if (!artifacts.some((item) => item.id === fileId)) return;
       file.value = fileId;

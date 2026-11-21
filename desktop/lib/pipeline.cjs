@@ -210,13 +210,20 @@ function parseDeliverable(value) {
     }
     const hasDeck = isObject(parsed.deck) && Array.isArray(parsed.deck.slides);
     const hasPlan = isObject(parsed.plan);
-    const hasArtifact = hasDeck || hasPlan || Array.isArray(parsed.slides);
-    if (hasDeck && !parsed.kind) parsed.kind = "pptx";
-    if (hasPlan && !parsed.kind) parsed.kind = "docx";
-    if (hasArtifact && !parsed.action) parsed.action = "export";
-    if (!hasArtifact && !parsed.action) parsed.action = "reply";
+    const hasSlidePatch = isObject(parsed.slide) && (Array.isArray(parsed.slide.elements) || parsed.slide.bg_image !== undefined);
+    const hasArtifact = hasDeck || hasPlan || hasSlidePatch || Array.isArray(parsed.slides);
+    if (hasSlidePatch) {
+      parsed.action = "patch_slide";
+    } else {
+      if (hasDeck && !parsed.kind) parsed.kind = "pptx";
+      if (hasPlan && !parsed.kind) parsed.kind = "docx";
+      if (hasArtifact && !parsed.action) parsed.action = "export";
+      if (!hasArtifact && !parsed.action) parsed.action = "reply";
+    }
     if (typeof parsed.reply !== "string" || !parsed.reply.trim()) {
-      if (hasArtifact) {
+      if (hasSlidePatch) {
+        parsed.reply = "已按要求修改选中页面。";
+      } else if (hasArtifact) {
         const title = parsed.deck?.title || parsed.plan?.title || parsed.title || "";
         parsed.reply = title ? `已为你生成《${String(title).trim().slice(0, 80)}》。` : "已按要求完成生成。";
       } else {

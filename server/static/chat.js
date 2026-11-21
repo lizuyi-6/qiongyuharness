@@ -1,6 +1,6 @@
 import { active, api, badge, button, cleanErrorMessage, copyText, deadline, e, fileMarkup, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
-import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, setCanvasLiveState, studioArtifacts } from "./slides.js";
+import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, selectionSummaryText, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
 
 const readable = new Set(["docx", "pptx", "pdf", "txt", "md"]);
@@ -1007,7 +1007,7 @@ function artifactCard(file) {
 
 function liveTurnMarkup(live) {
   const selectionHtml = live.selection
-    ? `<small class="request-scope">第 ${live.selection.slide} 页${live.selection.shape_id ? " · 文本框" : " · 整页"}</small><br>`
+    ? `<small class="request-scope">${e(selectionSummaryText(live.selection))}</small><br>`
     : "";
   const steps = Array.isArray(live.steps) ? live.steps : [];
   const stepsHtml = steps.map((step, idx) =>
@@ -1045,7 +1045,7 @@ function turnView(turn, index, canRetry = false) {
     pipeline?.verdict === "skipped" && pipeline?.tier === "light" ? "轻量任务 · 未验收" : "";
   const reviewLabels = { pass: "复核：通过", fail: "复核：未通过", not_needed: "复核：无需复核", unavailable: "复核：不可用" };
   return `<section class="conversation-turn">
-    <div class="request-entry"><p>${turn.selection ? `<small class="request-scope">第 ${turn.selection.slide} 页${turn.selection.shape_id ? " · 文本框" : " · 整页"}</small><br>` : ""}${e(turn.message)}</p></div>
+    <div class="request-entry"><p>${turn.selection ? `<small class="request-scope">${e(selectionSummaryText(turn.selection))}</small><br>` : ""}${e(turn.message)}</p></div>
     ${reply || images.length ? `<div class="response-entry">
       <div class="response-head">
         <p class="response-byline"><span class="response-mark">${icon("mark")}</span><strong>穹驭</strong></p>
@@ -2028,6 +2028,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
         ...(payload.selection ? { selection: payload.selection } : {})
       },
       ...(prepared.wants_pptx ? { ppt_check: true } : {}),
+      ...(prepared.image_index_offset > 0 ? { image_index_offset: prepared.image_index_offset } : {}),
       ...(prepared.web_search ? { web_search: prepared.web_search } : {}),
       ...(enableImageTool ? { image_tool: true } : {})
     };

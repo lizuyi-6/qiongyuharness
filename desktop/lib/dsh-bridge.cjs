@@ -39,8 +39,8 @@ function selectBestOutput(assistantTexts, finalText, lastCheckedDeck) {
     const last = candidate.lastIndexOf("}");
     if (first !== -1 && last > first) {
       const slice = candidate.slice(first, last + 1);
-      if (/"(?:reply|deck|plan|slides|verdict|goal|changes)"/.test(slice)) {
-        if (lastCheckedDeck && !/"slides"\s*:/.test(slice)) {
+      if (/"(?:reply|deck|plan|slides|slide|verdict|goal|changes)"/.test(slice)) {
+        if (lastCheckedDeck && !/"(?:slides|slide)"\s*:/.test(slice)) {
           break;
         }
         return candidate;

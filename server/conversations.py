@@ -16,8 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from . import gateway, prompting, search
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
 from .identity import fail
-from .office import DeckSpec, Plan, add_file, clean_text, coerce_deck_spec, powerpoint, render_freeform_pptx, safe_name, word
-from .presentation import Replacement, Selection, edit_scope, pptx_file, revise_slide
+from .office import DeckSpec, Plan, SLIDE_H, SLIDE_W, add_file, clean_text, coerce_deck_spec, powerpoint, render_freeform_pptx, safe_name, word
+from .presentation import Replacement, Selection, edit_scope, load_presentation, pptx_file, revise_slide, selected_layout
 from .projects import project_for, project_sources
 from .store import audit, database, instant, pack, uid, unpack
 from .tasks import User, task_for
@@ -54,6 +54,13 @@ class Decision(BaseModel):
 class SlideChange(BaseModel):
     reply: str = Field(min_length=1, max_length=2500)
     changes: list[Replacement] = Field(min_length=1,max_length=45)
+
+
+class SlidePatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    reply: str = Field(min_length=1, max_length=6500)
+    slide: dict[str, Any]
+    design: dict[str, Any] | None = None
 
 
 class PipelineStage(BaseModel):
@@ -347,13 +354,74 @@ def demo_decision(message, mode, task, sources, recent, latest):
 
 
 def build_turn_request(body, task, sources, recent, latest, project, scope, assignment):
+    if scope and scope.get("mode") == "freeform":
+        web_search = search.search_status()
+        srv_time = web_search.get("server_time") or search.server_time_snapshot()
+        slide_copy = dict(scope["slide"])
+        indexed_els = []
+        for idx, el in enumerate(slide_copy.get("elements") or []):
+            if isinstance(el, dict):
+                compact = {k: v for k, v in el.items() if v is not None and v is not False}
+                compact["_index"] = idx
+                if idx in scope["matched_indices"]:
+                    compact["_in_selection"] = True
+                indexed_els.append(compact)
+        slide_copy["elements"] = indexed_els
+        sel_info: dict[str, Any] = {
+            "页码": scope["page"],
+            "总页数": len(scope["deck"].get("slides") or []),
+            "选区说明": scope.get("label") or f"第 {scope['page']} 页",
+        }
+        if scope.get("region"):
+            sel_info["圈选区域_英寸"] = scope["region"]
+        if scope["matched_indices"]:
+            sel_info["命中元素索引"] = scope["matched_indices"]
+        if scope.get("hit_bg_image"):
+            sel_info["命中全屏背景图"] = True
+        if scope.get("selected_objects"):
+            sel_info["画布选中的对象摘要"] = scope["selected_objects"]
+        payload = {
+            "当前服务器时间": {
+                "unix_timestamp": srv_time["unix_timestamp"],
+                "date": srv_time["date"],
+                "year": srv_time["year"],
+                "display": srv_time["display"],
+            },
+            "员工修改要求": body.message,
+            "选区范围": sel_info,
+            "整套PPT设计系统": scope["deck"].get("design") or {},
+            "当前页完整画布": slide_copy,
+            "已有图片资产": scope["base_image_meta"],
+            "近期会话": recent[-4:],
+            "参考资料": sources,
+        }
+        plugin_context = {"项目": project, "资料": sources} if project else None
+        if project and gateway.MODE in {"dsh", "desktop"}:
+            payload["项目"] = project
+            payload["参考资料"] = []
+            payload["接入说明"] = "如需查阅项目资料，可先调用 office_context_read。"
+        return {
+            "kind": "slide_freeform",
+            "system": prompting.SLIDE_FREEFORM_SYSTEM,
+            "prompt": pack(payload),
+            "context": plugin_context,
+            "preset_step": None,
+            "wants_pptx": True,
+            "image_index_offset": len(scope["base_image_ids"]),
+            "web_search": {
+                "enabled": bool(web_search["configured"]),
+                "required": False,
+                "server_time": srv_time,
+            },
+        }
     if scope:
         context = {"选中页": scope["page"], "可编辑文本框": scope["boxes"], "项目": project, "参考资料": sources}
         prompt = {"请求": body.message, "选区资料": context}
         if gateway.MODE in {"dsh", "desktop"}:
             prompt = {"请求": body.message, "说明": "先调用 office_context_read 获取选区与资料。"}
         return {"kind": "slide", "system": prompting.SLIDE_SYSTEM, "prompt": pack(prompt), "context": context,
-                "preset_step": None, "wants_pptx": False, "web_search": {"enabled": False, "required": False}}
+                "preset_step": None, "wants_pptx": False, "image_index_offset": 0,
+                "web_search": {"enabled": False, "required": False}}
 
     task_fields = {name: task[name] for name in ("title", "description", "deliverable", "due_at")} if task else None
     plan = latest.get("plan") if latest else None
@@ -493,6 +561,19 @@ def parse_turn_response(text, kind):
             LOG.warning("SlideChange validation failed: %s", exc)
             fail(502, "模型未返回可执行的文字修改，请重试")
     data = _extract_json_object(text)
+    if kind == "slide_freeform":
+        raw_slide = data.get("slide")
+        if isinstance(raw_slide, dict):
+            reply = str(data.get("reply") or "").strip()[:6500] or "已按要求修改选中页面。"
+            design = data.get("design") if isinstance(data.get("design"), dict) else None
+            return SlidePatch(reply=reply, slide=raw_slide, design=design)
+        # 兼容模型在选区修改时输出整套 deck 的情况
+        raw_deck = data.get("deck")
+        if isinstance(raw_deck, dict) and isinstance(raw_deck.get("slides"), list) and raw_deck["slides"]:
+            deck = coerce_deck_spec(raw_deck)
+            reply = str(data.get("reply") or "").strip()[:6500] or f"已按要求更新演示文稿《{deck.title}》。"
+            return Decision(action="export", reply=reply, kind="pptx", deck=deck)
+        fail(502, "模型未返回有效的单页修改方案，请重试")
     raw_kind = str(data.get("kind") or "").strip().lower()
     if raw_kind in {"ppt", "powerpoint"}:
         data["kind"] = "pptx"
@@ -614,14 +695,217 @@ def history_for(db, key):
     return recent, latest
 
 
+def _boxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and ax + aw > bx and ay < by + bh and ay + ah > by
+
+
+def _collect_turn_image_assets(db, key: str, source_run_id: str | None, source_result: dict[str, Any], user_id: str):
+    """提取某份 PPT 依赖的有序图片 artifact IDs 与可读描述，确保多轮圈选换图时 image_index 1..N 精确对齐。"""
+    image_meta_by_id: dict[str, dict[str, Any]] = {}
+    turns = db.all(
+        "SELECT id, result FROM office_turns WHERE conversation_id=? AND status IN ('completed','failed') ORDER BY created_at DESC LIMIT 20",
+        (key,),
+    )
+    for row in turns:
+        res = unpack(row["result"] or "{}")
+        for img in res.get("images") or []:
+            fid = (img.get("file") or {}).get("id") if isinstance(img, dict) else None
+            if fid and fid not in image_meta_by_id:
+                image_meta_by_id[fid] = {
+                    "size": img.get("size") or "",
+                    "prompt": str(img.get("prompt") or "")[:180],
+                }
+
+    ordered_ids: list[str] = []
+    if isinstance(source_result.get("deck_image_ids"), list) and source_result["deck_image_ids"]:
+        ordered_ids = [str(fid) for fid in source_result["deck_image_ids"] if isinstance(fid, str) and fid]
+    elif isinstance(source_result.get("images"), list) and source_result["images"]:
+        for img in source_result["images"]:
+            fid = (img.get("file") or {}).get("id") if isinstance(img, dict) else None
+            if fid:
+                ordered_ids.append(fid)
+    else:
+        for row in turns:
+            res = unpack(row["result"] or "{}")
+            imgs = res.get("images") or []
+            if imgs:
+                for img in imgs:
+                    fid = (img.get("file") or {}).get("id") if isinstance(img, dict) else None
+                    if fid:
+                        ordered_ids.append(fid)
+                break
+
+    valid_ids: list[str] = []
+    meta_list: list[dict[str, Any]] = []
+    for fid in ordered_ids:
+        art = db.one("SELECT id FROM artifacts WHERE id=? AND owner_id=?", (fid, user_id))
+        if not art:
+            continue
+        valid_ids.append(fid)
+        info = image_meta_by_id.get(fid, {})
+        meta_list.append({
+            "image_index": len(valid_ids),
+            "size": info.get("size") or "1536x864",
+            "prompt": info.get("prompt") or "已有配图",
+        })
+    return valid_ids, meta_list
+
+
+def _load_image_blobs_by_ids(db, file_ids: list[str], user_id: str) -> list[bytes]:
+    blobs: list[bytes] = []
+    for fid in file_ids:
+        art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user_id))
+        if art and art["data"]:
+            blobs.append(bytes(art["data"]))
+    return blobs
+
+
+def _is_freeform_deck(plan: Any) -> bool:
+    if not isinstance(plan, dict) or not isinstance(plan.get("slides"), list) or not plan["slides"]:
+        return False
+    return any(
+        isinstance(s, dict) and (isinstance(s.get("elements"), list) and len(s["elements"]) > 0 or s.get("bg_image") is not None)
+        for s in plan["slides"]
+    )
+
+
 def selection_target(db, key, body, user):
     if not body.selection:
         return None
     row = pptx_file(db, body.selection.file_id, user)
-    if not db.one("SELECT id FROM office_turns WHERE id=? AND conversation_id=? AND status='completed'",
-                  (row["run_id"], key)):
+    turn_row = db.one("SELECT id, result FROM office_turns WHERE id=? AND conversation_id=? AND status='completed'",
+                      (row["run_id"], key))
+    if not turn_row:
         fail(403, "只能修改当前会话生成的 PPT")
-    return {"id": row["id"], "name": row["name"], "data": bytes(row["data"])}
+    source_result = unpack(turn_row["result"] or "{}")
+    plan = source_result.get("plan")
+    freeform = _is_freeform_deck(plan) and 1 <= body.selection.slide <= len(plan["slides"])
+    base_image_ids: list[str] = []
+    base_image_meta: list[dict[str, Any]] = []
+    if freeform:
+        base_image_ids, base_image_meta = _collect_turn_image_assets(db, key, turn_row["id"], source_result, user["id"])
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "data": bytes(row["data"]),
+        "freeform": freeform,
+        "deck": plan if freeform else None,
+        "base_image_ids": base_image_ids,
+        "base_image_meta": base_image_meta,
+    }
+
+
+def build_freeform_scope(target: dict[str, Any], selection: Selection) -> dict[str, Any]:
+    deck = target["deck"]
+    slide_index = selection.slide - 1
+    slide_dict = deck["slides"][slide_index]
+    elements = slide_dict.get("elements") if isinstance(slide_dict.get("elements"), list) else []
+
+    region_dict = None
+    query_boxes: list[tuple[float, float, float, float]] = []
+    selected_objects: list[dict[str, Any]] = []
+    hit_bg_image = False
+
+    if selection.region is not None:
+        r = selection.region
+        region_dict = {"x": round(r.x, 2), "y": round(r.y, 2), "w": round(r.w, 2), "h": round(r.h, 2)}
+        query_boxes.append((r.x, r.y, r.w, r.h))
+        if slide_dict.get("bg_image") is not None:
+            hit_bg_image = True
+
+    picked_ids = list(dict.fromkeys(
+        ([selection.shape_id] if selection.shape_id else []) + list(selection.shape_ids or [])
+    ))
+    if picked_ids:
+        try:
+            layout = selected_layout(load_presentation(target["data"]), selection.slide)
+            scale_to_in = SLIDE_W / 1000.0
+            for obj in layout.get("objects") or []:
+                if obj.get("id") not in picked_ids:
+                    continue
+                bx = float(obj.get("left", 0.0)) * scale_to_in
+                by = float(obj.get("top", 0.0)) * scale_to_in
+                bw = max(0.05, float(obj.get("width", 0.0)) * scale_to_in)
+                bh = max(0.05, float(obj.get("height", 0.0)) * scale_to_in)
+                if not query_boxes or selection.region is None:
+                    query_boxes.append((bx, by, bw, bh))
+                if obj.get("kind") == "image" and obj.get("is_background") and slide_dict.get("bg_image") is not None:
+                    hit_bg_image = True
+                selected_objects.append({
+                    "kind": obj.get("kind") or "shape",
+                    "x": round(bx, 2), "y": round(by, 2), "w": round(bw, 2), "h": round(bh, 2),
+                    **({"text": str(obj["text"])[:120]} if obj.get("text") else {}),
+                    **({"is_background": True} if obj.get("is_background") else {}),
+                })
+        except Exception:
+            pass
+
+    matched_indices: list[int] = []
+    if query_boxes:
+        for idx, el in enumerate(elements):
+            if not isinstance(el, dict):
+                continue
+            ex = float(el.get("x") or 0.0)
+            ey = float(el.get("y") or 0.0)
+            ew = max(0.05, float(el.get("w") or 0.2))
+            eh = max(0.05, float(el.get("h") or 0.2))
+            if any(_boxes_intersect((ex, ey, ew, eh), qb) for qb in query_boxes):
+                matched_indices.append(idx)
+
+    return {
+        "mode": "freeform",
+        "page": selection.slide,
+        "slide_index": slide_index,
+        "deck": deck,
+        "slide": slide_dict,
+        "region": region_dict,
+        "matched_indices": matched_indices,
+        "hit_bg_image": hit_bg_image,
+        "selected_objects": selected_objects[:20],
+        "label": selection.label or "",
+        "base_image_ids": target["base_image_ids"],
+        "base_image_meta": target["base_image_meta"],
+    }
+
+
+def apply_freeform_slide_patch(target: dict[str, Any], scope: dict[str, Any], decision: SlidePatch | Decision, image_blobs: list[bytes]):
+    if isinstance(decision, Decision) and decision.deck is not None:
+        updated_deck = decision.deck.clean()
+    elif isinstance(decision, SlidePatch):
+        base_deck_raw = dict(target["deck"])
+        merged_design = dict(base_deck_raw.get("design") or {})
+        if isinstance(decision.design, dict):
+            if isinstance(decision.design.get("palette"), dict):
+                base_pal = dict(merged_design.get("palette") or {})
+                base_pal.update(decision.design["palette"])
+                merged_design["palette"] = base_pal
+            if decision.design.get("concept"):
+                merged_design["concept"] = decision.design["concept"]
+            if decision.design.get("font"):
+                merged_design["font"] = decision.design["font"]
+        # 仅把新单页通过 coerce_deck_spec 归一化（支持自动百分比/像素坐标系纠偏），其他页原样保留
+        coerced_single = coerce_deck_spec({
+            "title": base_deck_raw.get("title") or "演示文稿",
+            "subtitle": base_deck_raw.get("subtitle") or "",
+            "design": merged_design,
+            "slides": [decision.slide],
+        })
+        new_slides = list(base_deck_raw.get("slides") or [])
+        new_slides[scope["slide_index"]] = coerced_single.slides[0].model_dump()
+        updated_deck = coerce_deck_spec({
+            "title": base_deck_raw.get("title") or "演示文稿",
+            "subtitle": base_deck_raw.get("subtitle") or "",
+            "design": coerced_single.design.model_dump(),
+            "slides": new_slides,
+        }).clean()
+    else:
+        fail(502, "模型未返回有效的单页修改方案，请重试")
+
+    name = target["name"] or (safe_name(updated_deck.title[:105]) + ".pptx")
+    data = render_freeform_pptx(updated_deck, image_blobs)
+    return "pptx", updated_deck.model_dump(), name, data
 
 
 def stale_before():
@@ -666,7 +950,14 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
     sources = await read_sources(data)
     if project:
         sources.extend([*notes, *await read_sources(shared_files)])
-    scope = await asyncio.to_thread(edit_scope, target["data"], body.selection) if target else None
+    if target:
+        scope = await asyncio.to_thread(
+            build_freeform_scope if target.get("freeform") else edit_scope,
+            target if target.get("freeform") else target["data"],
+            body.selection,
+        )
+    else:
+        scope = None
     prompt_data = build_turn_request(body, task, sources, recent, latest, project, scope, assignment)
     steps = []
     if task:
@@ -677,7 +968,11 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
     if project:
         steps.append(f"载入项目「{project}」的共享资料")
     if scope:
-        steps.append(f"已锁定第 {scope['page']} 页" + ("选中的文本框" if body.selection.shape_id else "的可编辑文字"))
+        if scope.get("mode") == "freeform":
+            desc = body.selection.label or ("圈选区域" if body.selection.region else ("选中元素" if (body.selection.shape_id or body.selection.shape_ids) else "整页自由画布"))
+            steps.append(f"已锁定第 {scope['page']} 页 · {desc}")
+        else:
+            steps.append(f"已锁定第 {scope['page']} 页" + ("选中的文本框" if body.selection.shape_id else "的可编辑文字"))
     if prompt_data["preset_step"]:
         steps.append(prompt_data["preset_step"])
 
@@ -714,6 +1009,7 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
     return {"run_id": run, "kind": prompt_data["kind"], "system": prompt_data["system"],
             "prompt": prompt_data["prompt"], "context": prompt_data["context"],
             "steps": [*steps, "正在整理回复"], "wants_pptx": bool(prompt_data.get("wants_pptx")),
+            "image_index_offset": int(prompt_data.get("image_index_offset") or 0),
             "web_search": prompt_data.get("web_search") or {"enabled": False, "required": False},
             "body": body, "user": user, "assignment": assignment,
             "task": task, "sources": sources, "recent": recent, "latest": latest,
@@ -723,6 +1019,7 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
 
 async def complete_turn(key, run, payload, user, *, expected_engine):
     image_blobs = []
+    deck_image_ids: list[str] = []
     with database() as db:
         turn = db.one("SELECT * FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
         run_row = db.one("SELECT * FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
@@ -739,41 +1036,56 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         target = selection_target(db, key, body, user)
         recent, latest = history_for(db, key)
         turn_result = unpack(turn["result"] or "{}")
+        current_run_image_ids: list[str] = []
         for img_entry in turn_result.get("images") or []:
             fid = (img_entry.get("file") or {}).get("id") if isinstance(img_entry, dict) else None
             if fid:
-                art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user["id"]))
-                if art and art["data"]:
-                    image_blobs.append(bytes(art["data"]))
-        if not image_blobs:
+                current_run_image_ids.append(fid)
+
+        if target and target.get("freeform"):
+            # 自由画布局部修改：严格拼接 原PPT有序历史图 + 本轮新生成图，保证 1..M 原图不变、M+1.. 新图精确对齐
+            deck_image_ids = [*target.get("base_image_ids", []), *current_run_image_ids]
+            image_blobs = _load_image_blobs_by_ids(db, deck_image_ids, user["id"])
+        elif current_run_image_ids:
+            deck_image_ids = current_run_image_ids
+            image_blobs = _load_image_blobs_by_ids(db, deck_image_ids, user["id"])
+        else:
             prior_turns = db.all(
                 "SELECT result FROM office_turns WHERE conversation_id=? AND id!=? AND status IN ('completed','failed') ORDER BY created_at DESC LIMIT 8",
                 (key, run),
             )
             for p_row in prior_turns:
                 p_res = unpack(p_row["result"] or "{}")
-                p_imgs = p_res.get("images") or []
-                if not p_imgs:
-                    continue
-                for img_entry in p_imgs:
-                    fid = (img_entry.get("file") or {}).get("id") if isinstance(img_entry, dict) else None
-                    if fid:
-                        art = db.one("SELECT data FROM artifacts WHERE id=? AND owner_id=?", (fid, user["id"]))
-                        if art and art["data"]:
-                            image_blobs.append(bytes(art["data"]))
-                if image_blobs:
-                    break
+                if isinstance(p_res.get("deck_image_ids"), list) and p_res["deck_image_ids"]:
+                    deck_image_ids = [str(fid) for fid in p_res["deck_image_ids"] if isinstance(fid, str) and fid]
+                else:
+                    for img_entry in p_res.get("images") or []:
+                        fid = (img_entry.get("file") or {}).get("id") if isinstance(img_entry, dict) else None
+                        if fid:
+                            deck_image_ids.append(fid)
+                if deck_image_ids:
+                    image_blobs = _load_image_blobs_by_ids(db, deck_image_ids, user["id"])
+                    if image_blobs:
+                        break
+                    deck_image_ids = []
 
     if len(payload.text.encode("utf-8")) > 512 * 1024:
         fail_turn(run, user, assignment, "模型响应超过 512 KB")
         fail(413, "模型响应超过 512 KB")
     try:
-        scope = await asyncio.to_thread(edit_scope, target["data"], body.selection) if target else None
-        decision = parse_turn_response(payload.text, "slide" if scope else "conversation")
-        if scope:
+        if target and target.get("freeform"):
+            scope = await asyncio.to_thread(build_freeform_scope, target, body.selection)
+            decision = parse_turn_response(payload.text, "slide_freeform")
+            revised = None
+            rendered = await asyncio.to_thread(apply_freeform_slide_patch, target, scope, decision, image_blobs)
+        elif target:
+            scope = await asyncio.to_thread(edit_scope, target["data"], body.selection)
+            decision = parse_turn_response(payload.text, "slide")
             revised = await asyncio.to_thread(revise_slide, target["data"], scope, decision.changes)
             rendered = None
         else:
+            scope = None
+            decision = parse_turn_response(payload.text, "conversation")
             revised = None
             rendered = await asyncio.to_thread(office_file, decision, body.mode, image_blobs)
     except HTTPException as error:
@@ -814,11 +1126,13 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             steps.append(f"已保存第 {scope['page']} 页的修订版")
         elif rendered:
             kind, plan_data, name, content = rendered
-            parent = latest["file"]["id"] if latest and latest["file"]["name"] == name else None
+            parent = target["id"] if (target and target.get("freeform")) else (latest["file"]["id"] if latest and latest["file"]["name"] == name else None)
             artifact = add_file(db, user["id"], name, content, kind, "generated",
                                 assignment=assignment, parent=parent, run=run)
             result.update(file=public_file(db, artifact), plan=plan_data, kind=kind)
-            steps.append("已导出 " + FORMATS[kind])
+            if kind == "pptx" and deck_image_ids:
+                result["deck_image_ids"] = deck_image_ids
+            steps.append(f"已保存第 {scope['page']} 页的精修版" if (scope and scope.get("mode") == "freeform") else ("已导出 " + FORMATS[kind]))
         changed = db.execute("UPDATE office_turns SET result=?,status='completed' WHERE id=? AND status='running'",
                              (pack(result), run)).rowcount
         if not changed:
@@ -996,7 +1310,7 @@ async def prepare_turn_route(key: str, body: TurnRequest, user: User):
     prepared = await prepare_conversation(key, body, user, engine="desktop")
     if "replay" in prepared:
         fail(409, "本轮请求已经提交，请等待执行完成")
-    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps", "wants_pptx", "web_search")}
+    return {name: prepared[name] for name in ("run_id", "kind", "system", "prompt", "context", "steps", "wants_pptx", "image_index_offset", "web_search")}
 
 
 @router.post("/{key}/turns/{run}/complete")
