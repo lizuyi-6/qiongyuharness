@@ -49,7 +49,15 @@ async function readBody(request) {
   }
 }
 
-async function createImageBroker({ generate, model, maxImages = null, deadlineAt, now = Date.now }) {
+async function createImageBroker({
+  generate,
+  model,
+  maxImages = null,
+  deadlineAt,
+  now = Date.now,
+  initialImages = [],
+  onImageGenerated = () => {}
+}) {
   const hasLimit = Number.isInteger(maxImages) && maxImages >= 1;
   const validLimit = maxImages === null || maxImages === undefined || maxImages === 0 || maxImages === Infinity || hasLimit;
   if (typeof generate !== "function" || typeof model !== "string" || !/^gpt-image-/.test(model) ||
@@ -58,8 +66,12 @@ async function createImageBroker({ generate, model, maxImages = null, deadlineAt
   }
   const key = randomBytes(32).toString("base64url");
   const secret = Buffer.from(key, "utf8");
-  const images = [];
-  let attempts = 0;
+  const images = Array.isArray(initialImages)
+    ? initialImages
+        .filter((img) => img && typeof img === "object" && typeof img.png_base64 === "string" && img.png_base64)
+        .map((img) => ({ ...img }))
+    : [];
+  let attempts = images.length;
   let busy = false;
 
   const server = createServer(async (request, response) => {
@@ -118,7 +130,9 @@ async function createImageBroker({ generate, model, maxImages = null, deadlineAt
         throw new Error("生图返回内容无效");
       }
       const index = images.length + 1;
-      images.push({ ...image });
+      const stored = { ...image };
+      images.push(stored);
+      try { onImageGenerated(stored, index, images.map((item) => ({ ...item }))); } catch {}
       json(response, 200, { ok: true, index, width: image.width, height: image.height,
         size: image.size, quality: image.quality });
     } catch (error) {

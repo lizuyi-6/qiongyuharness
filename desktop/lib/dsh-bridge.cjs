@@ -79,6 +79,7 @@ function runDsh({
   model,
   prompt,
   onEvent = () => {},
+  onCheckedDeck = () => {},
   timeoutMs = 620_000,
   signal,
   spawnImpl = spawn
@@ -123,7 +124,9 @@ function runDsh({
   const fail = (error) => {
     if (settled) return;
     settled = true;
-    rejectResult(error instanceof Error ? error : new Error("DSH 运行失败"));
+    const err = error instanceof Error ? error : new Error("DSH 运行失败");
+    if (lastCheckedDeck && !err.checkedDeck) err.checkedDeck = lastCheckedDeck;
+    rejectResult(err);
   };
   const succeed = () => {
     if (settled) return;
@@ -164,7 +167,10 @@ function runDsh({
     if (event.type === "agent/inbox/spliced") active = true;
     if (event.type === "assistant/message") {
       const checkedDeck = extractCheckedDeck(event);
-      if (checkedDeck) lastCheckedDeck = checkedDeck;
+      if (checkedDeck) {
+        lastCheckedDeck = checkedDeck;
+        try { onCheckedDeck(checkedDeck); } catch {}
+      }
       const text = textFromMessage(event);
       if (text && text.trim()) {
         finalText = text;

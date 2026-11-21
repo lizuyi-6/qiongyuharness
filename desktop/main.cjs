@@ -280,6 +280,16 @@ ipcMain.handle("qo:cancel-agent", (event) => {
   return desktopAgent.cancelAgent();
 });
 
+ipcMain.handle("qo:get-checkpoint", async (event, conversationId, userId) => {
+  if (!trusted(event)) throw new Error("页面无权读取任务断点");
+  return desktopAgent.getCheckpoint(conversationId, userId);
+});
+
+ipcMain.handle("qo:clear-checkpoint", async (event, conversationId) => {
+  if (!trusted(event)) throw new Error("页面无权清除任务断点");
+  return desktopAgent.clearCheckpoint(conversationId);
+});
+
 ipcMain.handle("qo:update-state", (event) => {
   if (!trusted(event)) throw new Error("页面无权读取更新状态");
   return desktopUpdater?.getState() || null;

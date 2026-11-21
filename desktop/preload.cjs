@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld("officeDesktop", {
   runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
   generateImage: (request) => ipcRenderer.invoke("qo:generate-image", request),
   cancelAgent: () => ipcRenderer.invoke("qo:cancel-agent"),
+  getCheckpoint: (conversationId, userId) => ipcRenderer.invoke("qo:get-checkpoint", conversationId, userId),
+  clearCheckpoint: (conversationId) => ipcRenderer.invoke("qo:clear-checkpoint", conversationId),
   openConnect: () => ipcRenderer.invoke("qo:open-connect"),
   getUpdateState: () => ipcRenderer.invoke("qo:update-state"),
   checkUpdate: () => ipcRenderer.invoke("qo:update-check"),

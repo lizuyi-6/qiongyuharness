@@ -10,13 +10,61 @@ const ROLE_LABELS = {
 };
 const MAX_STAGE_CALLS = 8;
 const MAX_EXEC_ROUNDS = 2;
-// 最高推理强度下单阶段可能要几分钟：每阶段最多 620 秒（上游单次 600 秒 + DSH 启动），全程 25 分钟。
-// 服务端 conversations.py 的 stale_before（30 分钟）必须大于 DEADLINE_MS。
+// 最高推理强度下单阶段可能要十余分钟：每阶段最多 900 秒，全程 30 分钟。
+// 服务端 conversations.py 的 stale_before（40 分钟）必须大于 DEADLINE_MS。
 // 服务端下发的 limits.deadline_ms 仍是 270000（旧版桌面端严格校验这个值），本机以这里的常量为准。
-const DEADLINE_MS = 1_500_000;
-const STAGE_TIMEOUT_MS = 620_000;
+const DEADLINE_MS = 1_800_000;
+const STAGE_TIMEOUT_MS = 900_000;
 const MIN_REMAINING_MS = 60_000;
 const TOKEN_FIELDS = ["prompt_tokens", "completion_tokens", "total_tokens"];
+
+function buildResumeContext({ resumeState = null, searchEvidence = "", images = [] } = {}) {
+  if (!resumeState && !searchEvidence && !(Array.isArray(images) && images.length)) return "";
+  const sections = [];
+  const lastError = typeof resumeState?.error === "string" ? resumeState.error.trim() : "";
+  const stageLabel = typeof resumeState?.stageLabel === "string" ? resumeState.stageLabel.trim() : "";
+  if (resumeState) {
+    sections.push(
+      `## 【断点续跑上下文】上次任务${stageLabel ? `在「${stageLabel}」阶段` : ""}中断${lastError ? `（原因：${lastError.slice(0, 180)}）` : ""}。` +
+      "以下为系统自动保留的已完成成果，请直接在此基础上接续并输出最终完整 JSON，严禁推倒重来或重复已完成的高成本操作！"
+    );
+  }
+  const cleanEvidence = typeof searchEvidence === "string" ? searchEvidence.trim() : "";
+  if (cleanEvidence) {
+    sections.push(`### 1. 已检索核实的最新权威资料（请直接采用，无需重复盲搜）\n${cleanEvidence.slice(0, 5500)}`);
+  }
+  if (Array.isArray(images) && images.length > 0) {
+    const imgLines = images.map((img, idx) => {
+      const promptDesc = typeof img?.prompt === "string" ? img.prompt.replace(/\s+/g, " ").trim().slice(0, 160) : "专属配图";
+      const size = typeof img?.size === "string" ? img.size : "1536x864";
+      return `- image_index = ${idx + 1}（尺寸 ${size}）：${promptDesc}`;
+    });
+    sections.push(
+      `### 2. 已生成并保留的专属配图（已计费，严禁重复生成相同画面！）\n` +
+      `本任务已保留 ${images.length} 张配图，请在 deck.slides 的 bg_image 或 image 元素中直接复用以下 image_index；仅当确需新增不同画面时才调用 office_image_generate（新图编号将从 ${images.length + 1} 开始）：\n` +
+      imgLines.join("\n")
+    );
+  }
+  const checkedDeck = resumeState?.checkedDeck;
+  if (checkedDeck && typeof checkedDeck === "object" && Array.isArray(checkedDeck.slides) && checkedDeck.slides.length > 0) {
+    let serialized = "";
+    try { serialized = JSON.stringify(checkedDeck); } catch {}
+    if (serialized) {
+      const clipped = serialized.length > 32000
+        ? `${serialized.slice(0, 32000)}…（后续已截断，共 ${checkedDeck.slides.length} 页）`
+        : serialized;
+      sections.push(
+        `### 3. 上次中断前已通过排版校验的 PPT 自由画布草稿（共 ${checkedDeck.slides.length} 页）\n` +
+        `请直接基于此草稿完成剩余微调并立即输出最终完整 JSON，不要从零重画，也不要重复反复调用 office_ppt_check：\n${clipped}`
+      );
+    }
+  }
+  const thinkingTail = typeof resumeState?.thinkingTail === "string" ? resumeState.thinkingTail.trim() : "";
+  if (thinkingTail) {
+    sections.push(`### 4. 上次中断前的推理与修改笔记摘要（供直接接续）\n${thinkingTail.slice(-2400)}`);
+  }
+  return sections.length ? `\n\n${sections.join("\n\n")}` : "";
+}
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -246,6 +294,15 @@ function sumUsage(stages) {
   return usage;
 }
 
+function compactStages(stages) {
+  if (!Array.isArray(stages)) return [];
+  const valid = stages.filter((s) => s && typeof s.role === "string" && typeof s.model === "string" && typeof s.outcome === "string");
+  if (valid.length <= MAX_STAGE_CALLS) return valid;
+  const nonErr = valid.filter((s) => s.outcome !== "format_error");
+  if (nonErr.length <= MAX_STAGE_CALLS) return nonErr;
+  return nonErr.slice(-MAX_STAGE_CALLS);
+}
+
 function runPipeline({
   job,
   config,
@@ -256,10 +313,13 @@ function runPipeline({
   startedAt = now(),
   signal,
   getGeneratedImageCount = () => 0,
+  getGeneratedImages = () => [],
   requireSearch = false,
   getSearchCount = () => 0,
   serverTime = null,
-  getSearchEvidence = () => ""
+  getSearchEvidence = () => "",
+  resumeState = null,
+  onCheckpoint = () => {}
 }) {
   return (async () => {
     if (!job || typeof job.system !== "string" || typeof job.prompt !== "string" ||
@@ -286,16 +346,40 @@ function runPipeline({
 
     const deadline = startedAt + DEADLINE_MS;
     const hasContext = job.context !== undefined && job.context !== null;
-    const stages = [];
-    const issues = [];
+    const hasResume = isObject(resumeState);
+    const stages = hasResume && Array.isArray(resumeState.stages) ? compactStages(resumeState.stages).map((s) => ({ ...s })) : [];
+    const issues = hasResume && Array.isArray(resumeState.issues) ? resumeState.issues.slice(0, 10) : [];
     let calls = 0;
-    let finalText = "";
-    let tier = "standard";
-    let verdict = "fail";
-    let review = "not_needed";
-    let rounds = 1;
+    let brief = hasResume && isObject(resumeState.brief) ? resumeState.brief : null;
+    let finalText = hasResume && typeof resumeState.finalText === "string" ? resumeState.finalText : "";
+    let tier = hasResume && typeof resumeState.tier === "string" && new Set(["light", "standard", "critical"]).has(resumeState.tier)
+      ? resumeState.tier
+      : (brief?.tier || "standard");
+    let verdict = hasResume && typeof resumeState.verdict === "string" ? resumeState.verdict : "fail";
+    let review = hasResume && typeof resumeState.review === "string" ? resumeState.review : "not_needed";
+    let rounds = hasResume && Number.isInteger(resumeState.rounds) && resumeState.rounds >= 1 ? Math.min(2, resumeState.rounds) : 1;
     let stopReason = "";
-    let twoRoundAcceptanceFailed = false;
+    let twoRoundAcceptanceFailed = Boolean(hasResume && resumeState.twoRoundAcceptanceFailed);
+    let currentStage = hasResume && typeof resumeState.stage === "string" ? resumeState.stage : "understand";
+    let resumeBriefingConsumed = false;
+
+    const savePoint = (stageName) => {
+      currentStage = stageName;
+      try {
+        onCheckpoint({
+          stage: stageName,
+          brief,
+          tier,
+          finalText,
+          verdict,
+          review,
+          rounds,
+          issues: [...issues],
+          stages: compactStages(stages),
+          twoRoundAcceptanceFailed
+        });
+      } catch {}
+    };
 
     function remainingMs() {
       return Math.max(0, deadline - now());
@@ -376,28 +460,47 @@ function runPipeline({
       return `${labels[role]}（${roles[role]}）`;
     }
 
-    emit({ type: "step", label: stageLabel("understand") });
-    const understood = await callValidatedStage({
-      role: "understand",
-      model: roles.understand,
-      system: config.prompts.understand,
-      prompt: job.prompt,
-      withContext: false,
-      parser: parseBrief
-    });
-    if (!understood.parsed) {
-      const timedOut = understood.timeout || understood.stopReason === "全程时间预算不足";
-      throw new Error(timedOut ? "需求理解阶段超时" : "需求理解阶段返回格式无效");
+    function consumeResumeSection() {
+      if (!hasResume || resumeBriefingConsumed) return "";
+      resumeBriefingConsumed = true;
+      return buildResumeContext({
+        resumeState,
+        searchEvidence: String(getSearchEvidence() || "").trim(),
+        images: getGeneratedImages()
+      });
     }
-    const brief = understood.parsed;
-    tier = brief.tier;
+
+    if (brief) {
+      emit({ type: "step", label: "断点续跑：复用已理解的需求方案" });
+      tier = brief.tier || tier;
+    } else {
+      savePoint("understand");
+      emit({ type: "step", label: stageLabel("understand") });
+      const understood = await callValidatedStage({
+        role: "understand",
+        model: roles.understand,
+        system: config.prompts.understand,
+        prompt: job.prompt,
+        withContext: false,
+        parser: parseBrief
+      });
+      if (!understood.parsed) {
+        const timedOut = understood.timeout || understood.stopReason === "全程时间预算不足";
+        throw new Error(timedOut ? "需求理解阶段超时" : "需求理解阶段返回格式无效");
+      }
+      brief = understood.parsed;
+      tier = brief.tier;
+      savePoint(tier === "light" && lightAvailable ? "light" : "execute_round_1");
+    }
 
     if (tier === "light" && lightAvailable) {
+      savePoint("light");
       emit({ type: "step", label: stageLabel("light") });
+      const resumeExtra = consumeResumeSection();
       const light = await callValidatedStage({
         role: "light",
         model: roles.light,
-        system: job.system,
+        system: `${job.system}${resumeExtra}`,
         prompt: job.prompt,
         withContext: hasContext,
         withImages: true,
@@ -409,11 +512,12 @@ function runPipeline({
         const timedOut = light.timeout || light.stopReason === "全程时间预算不足";
         throw new Error(timedOut ? "轻量任务执行超时" : "轻量任务返回格式无效");
       }
+      const compacted = compactStages(stages);
       return {
         text: light.text,
-        usage: sumUsage(stages),
+        usage: sumUsage(compacted),
         model: `智能分工:${roles.execute}`.slice(0, 200),
-        pipeline: { tier, verdict: "skipped", review: "not_needed", issues, stages, rounds: 1, version: config.version }
+        pipeline: { tier, verdict: "skipped", review: "not_needed", issues, stages: compacted, rounds: 1, version: config.version }
       };
     }
     if (tier === "light" && !lightAvailable) addIssue(issues, "轻量模型未开放，已按标准路径执行");
@@ -423,8 +527,10 @@ function runPipeline({
     }
 
     async function executeRound(round, feedback = null) {
+      savePoint(round === 1 ? "execute_round_1" : "execute_round_2");
       emit({ type: "step", label: round === 1 ? stageLabel("execute") : `返工第 ${round} 轮` });
-      const searchEvidence = round > 1 ? String(getSearchEvidence() || "").trim() : "";
+      const resumeExtra = consumeResumeSection();
+      const searchEvidence = round > 1 && !resumeExtra ? String(getSearchEvidence() || "").trim() : "";
       const evidenceSection = searchEvidence
         ? `\n\n## 第一轮已按当前服务器时间戳检索核实的最新权威资料（数据参考，请直接采用最新年份事实）\n${searchEvidence}`
         : "";
@@ -434,7 +540,7 @@ function runPipeline({
       const result = await callValidatedStage({
         role: "execute",
         model: roles.execute,
-        system: executionSystem(revise),
+        system: executionSystem(`${revise}${resumeExtra}`),
         prompt: job.prompt,
         withContext: hasContext,
         withImages: true,
@@ -483,38 +589,76 @@ function runPipeline({
       return outcome;
     }
 
-    let execution = await executeRound(1);
-    if (!execution.parsed) {
-      if (!finalText) {
-        const timedOut = execution.timeout || execution.stopReason === "全程时间预算不足";
-        throw new Error(timedOut ? "任务执行阶段超时" : "任务执行阶段返回格式无效");
+    const skipRound1Execute = hasResume && Boolean(finalText) &&
+      ["accept_round_1", "execute_round_2", "accept_round_2", "review"].includes(currentStage);
+    const skipRound1Accept = hasResume && Boolean(finalText) &&
+      ["execute_round_2", "accept_round_2", "review"].includes(currentStage);
+    const skipRound2Execute = hasResume && Boolean(finalText) &&
+      ["accept_round_2", "review"].includes(currentStage);
+    const skipRound2Accept = hasResume && Boolean(finalText) && currentStage === "review";
+
+    if (skipRound1Execute) {
+      emit({ type: "step", label: "断点续跑：复用第 1 轮已生成初稿" });
+      if (!skipRound1Accept) {
+        savePoint("accept_round_1");
+        if (!canStartStage()) {
+          verdict = "fail";
+          addIssue(issues, stopReason === "全程时间预算不足" ? "验收超时未完成" : "验收未完成：阶段调用预算已用尽");
+          return finish();
+        }
+        await acceptCurrent();
+        savePoint(verdict === "fail" ? "execute_round_2" : (tier === "critical" ? "review" : "complete"));
       }
-      verdict = "fail";
-      addIssue(issues, execution.timeout ? "返工超时未完成" : "返工阶段返回格式无效");
-      rounds = 2;
     } else {
+      let execution = await executeRound(1);
+      if (!execution.parsed) {
+        if (!finalText) {
+          const timedOut = execution.timeout || execution.stopReason === "全程时间预算不足";
+          throw new Error(timedOut ? "任务执行阶段超时" : "任务执行阶段返回格式无效");
+        }
+        verdict = "fail";
+        addIssue(issues, execution.timeout ? "返工超时未完成" : "返工阶段返回格式无效");
+        rounds = 2;
+      } else {
+        savePoint("accept_round_1");
+        if (!canStartStage()) {
+          verdict = "fail";
+          addIssue(issues, stopReason === "全程时间预算不足" ? "验收超时未完成" : "验收未完成：阶段调用预算已用尽");
+          return finish();
+        }
+        await acceptCurrent();
+        savePoint(verdict === "fail" ? "execute_round_2" : (tier === "critical" ? "review" : "complete"));
+      }
+    }
+
+    if (skipRound2Execute && !skipRound2Accept) {
+      rounds = 2;
+      savePoint("accept_round_2");
+      emit({ type: "step", label: "断点续跑：复用返工稿进入复验" });
       if (!canStartStage()) {
         verdict = "fail";
         addIssue(issues, stopReason === "全程时间预算不足" ? "验收超时未完成" : "验收未完成：阶段调用预算已用尽");
-        return finish();
+      } else {
+        const secondAcceptance = await acceptCurrent();
+        twoRoundAcceptanceFailed = Boolean(secondAcceptance.parsed && verdict === "fail");
+        savePoint(twoRoundAcceptanceFailed || (tier === "critical" && verdict === "pass") ? "review" : "complete");
       }
-      await acceptCurrent();
-    }
-
-    if (verdict === "fail" && rounds < MAX_EXEC_ROUNDS && finalText) {
+    } else if (!skipRound2Execute && verdict === "fail" && rounds < MAX_EXEC_ROUNDS && finalText) {
       const previousIssues = [...issues];
       if (!canStartStage()) {
         addIssue(issues, stopReason === "全程时间预算不足" ? "返工超时未开始" : "返工未开始：阶段调用预算已用尽");
       } else {
         rounds = 2;
-        execution = await executeRound(2, { issues: previousIssues, deliverable: finalText });
+        const execution = await executeRound(2, { issues: previousIssues, deliverable: finalText });
         if (execution.parsed) {
+          savePoint("accept_round_2");
           if (!canStartStage()) {
             verdict = "fail";
             addIssue(issues, stopReason === "全程时间预算不足" ? "验收超时未完成" : "验收未完成：阶段调用预算已用尽");
           } else {
             const secondAcceptance = await acceptCurrent();
             twoRoundAcceptanceFailed = Boolean(secondAcceptance.parsed && verdict === "fail");
+            savePoint(twoRoundAcceptanceFailed || (tier === "critical" && verdict === "pass") ? "review" : "complete");
           }
         } else {
           verdict = "fail";
@@ -524,8 +668,9 @@ function runPipeline({
       }
     }
 
-    const needsReview = twoRoundAcceptanceFailed || tier === "critical" && verdict === "pass";
+    const needsReview = skipRound2Accept || twoRoundAcceptanceFailed || tier === "critical" && verdict === "pass";
     if (needsReview) {
+      savePoint("review");
       if (!reviewAvailable) {
         review = "unavailable";
         addIssue(issues, "复核模型未开放，保留验收结果");
@@ -552,11 +697,12 @@ function runPipeline({
 
     function finish() {
       if (!finalText) throw new Error("流水线没有可交付内容");
+      const compacted = compactStages(stages);
       return {
         text: finalText,
-        usage: sumUsage(stages),
+        usage: sumUsage(compacted),
         model: `智能分工:${roles.execute}`.slice(0, 200),
-        pipeline: { tier, verdict, review, issues, stages, rounds, version: config.version }
+        pipeline: { tier, verdict, review, issues, stages: compacted, rounds, version: config.version }
       };
     }
   })();
@@ -568,5 +714,6 @@ module.exports = {
   MIN_REMAINING_MS,
   ROLE_ORDER,
   STAGE_TIMEOUT_MS,
+  buildResumeContext,
   runPipeline
 };

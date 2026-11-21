@@ -118,18 +118,59 @@ async function readBody(request) {
   }
 }
 
-async function createSearchBroker({ search, fetchPage, serverTime, now = Date.now, onSearch = () => {}, onFetch = () => {} }) {
+async function createSearchBroker({
+  search,
+  fetchPage,
+  serverTime,
+  now = Date.now,
+  initialState = null,
+  onSearch = () => {},
+  onFetch = () => {},
+  onStateChange = () => {}
+}) {
   if (typeof search !== "function" || typeof fetchPage !== "function") {
     throw new TypeError("搜索 broker 参数无效");
   }
   const key = randomBytes(32).toString("base64url");
   const secret = Buffer.from(key, "utf8");
-  let activeServerTime = normalizeServerTime(serverTime, now);
-  let searchCount = 0;
-  let fetchCount = 0;
-  const queriesHistory = [];
+  let activeServerTime = normalizeServerTime(serverTime || initialState?.serverTime, now);
+  let searchCount = Number.isInteger(initialState?.searchCount) && initialState.searchCount > 0 ? initialState.searchCount : 0;
+  let fetchCount = Number.isInteger(initialState?.fetchCount) && initialState.fetchCount > 0 ? initialState.fetchCount : 0;
+  const queriesHistory = Array.isArray(initialState?.queriesHistory)
+    ? initialState.queriesHistory.filter((q) => typeof q === "string" && q.trim()).slice(0, 40)
+    : [];
   const evidenceByUrl = new Map();
+  if (Array.isArray(initialState?.evidenceByUrl)) {
+    for (const item of initialState.evidenceByUrl.slice(0, 30)) {
+      if (item && typeof item.url === "string" && item.url) {
+        evidenceByUrl.set(item.url, {
+          url: item.url,
+          title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : item.url,
+          published_at: typeof item.published_at === "string" ? item.published_at.trim() : "",
+          excerpt: typeof item.excerpt === "string" ? item.excerpt.slice(0, 320) : ""
+        });
+      }
+    }
+  }
   const fetchedPages = new Map();
+  if (Array.isArray(initialState?.fetchedPages)) {
+    for (const entry of initialState.fetchedPages.slice(0, 10)) {
+      if (Array.isArray(entry) && typeof entry[0] === "string" && typeof entry[1] === "string" && entry[0]) {
+        fetchedPages.set(entry[0], entry[1].slice(0, 520));
+      }
+    }
+  }
+
+  function exportState() {
+    return {
+      searchCount,
+      fetchCount,
+      queriesHistory: [...queriesHistory].slice(-40),
+      evidenceByUrl: [...evidenceByUrl.values()].slice(0, 30),
+      fetchedPages: [...fetchedPages.entries()].slice(0, 10),
+      serverTime: activeServerTime
+    };
+  }
 
   function recordSearchSources(sources = []) {
     if (!Array.isArray(sources)) return;
@@ -232,6 +273,7 @@ async function createSearchBroker({ search, fetchPage, serverTime, now = Date.no
         searchCount += 1;
         queriesHistory.push(...effectiveQueries);
         recordSearchSources(result?.sources);
+        try { onStateChange(exportState()); } catch {}
         json(response, 200, { ok: true, server_time: activeServerTime, ...result, queries: effectiveQueries });
       } else {
         const targetUrl = typeof body.value.url === "string" ? body.value.url.trim() : "";
@@ -248,6 +290,7 @@ async function createSearchBroker({ search, fetchPage, serverTime, now = Date.no
         if (typeof result?.content === "string" && result.content.trim()) {
           fetchedPages.set(targetUrl, result.content.trim().replace(/\s+/g, " ").slice(0, 520));
         }
+        try { onStateChange(exportState()); } catch {}
         json(response, 200, { ok: true, server_time: activeServerTime, ...result });
       }
     } catch (error) {
@@ -272,6 +315,7 @@ async function createSearchBroker({ search, fetchPage, serverTime, now = Date.no
     get serverTime() { return activeServerTime; },
     queriesHistory,
     getEvidenceDigest,
+    exportState,
     async close() {
       if (!server.listening) return;
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

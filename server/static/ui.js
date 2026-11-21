@@ -61,6 +61,7 @@ const paths = {
   clip: '<path d="m9 11 5-5a3 3 0 1 1 4 4l-8 8a4 4 0 1 1-6-6l8-8"/>',
   copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  play: '<polygon points="7 5 19 12 7 19 7 5"/>',
   sidebar: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
   panelRight: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/>',
   menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
@@ -256,6 +257,12 @@ export function modal(title, html) {
   if (!dialog.open) dialog.showModal();
 }
 
+export function cleanErrorMessage(error, fallback = "操作失败") {
+  const raw = typeof error === "string" ? error : (error?.message || String(error || ""));
+  const cleaned = raw.replace(/^Error invoking remote method '[^']+':\s*(?:Error:\s*)?/i, "").trim();
+  return cleaned || fallback;
+}
+
 export function errorIn(node, error) {
   let target = node.querySelector(".error");
   if (!target) {
@@ -264,7 +271,7 @@ export function errorIn(node, error) {
     target.setAttribute("role", "alert");
     node.append(target);
   }
-  target.textContent = error.message || String(error);
+  target.textContent = cleanErrorMessage(error);
 }
 
 export async function api(path, options = {}) {

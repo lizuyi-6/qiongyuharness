@@ -7,9 +7,9 @@ import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator,
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
 import { abortOrphanTurn, applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeComposerPickers,
-  closeSlashMenu, copyReply, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
+  closeSlashMenu, copyReply, discardCheckpoint, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
   loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
-  removeSource, resetChatState, retryTurn, runDesktopAgent, saveImageAutoPreference,
+  removeSource, resetChatState, resumeFailedTurn, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
   showSources, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
   syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer,
@@ -541,6 +541,8 @@ async function onClick(event) {
     case "chat-history": showConversationHistory(); break;
     case "chat-earlier": await loadEarlier(); break;
     case "chat-cancel": await cancelActiveChat(); break;
+    case "chat-resume": await resumeFailedTurn(target); break;
+    case "chat-discard-checkpoint": await discardCheckpoint(); break;
     case "chat-abort-orphan": await abortOrphanTurn(id, target.dataset.kind || "turn", target); break;
     case "copy-reply": await copyReply(id, target); break;
     case "copy-invite": await copyText(id, "已复制项目邀请码"); break;

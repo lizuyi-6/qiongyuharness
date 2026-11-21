@@ -5,7 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { createLoopbackGateway } = require("./lib/loopback-gateway.cjs");
 const { runDsh } = require("./lib/dsh-bridge.cjs");
-const { DEADLINE_MS, STAGE_TIMEOUT_MS, runPipeline } = require("./lib/pipeline.cjs");
+const { DEADLINE_MS, STAGE_TIMEOUT_MS, buildResumeContext, runPipeline } = require("./lib/pipeline.cjs");
+const { createCheckpointStore, describeStage } = require("./lib/checkpoint.cjs");
 const { listModelsWithRefresh, modelServiceCode, modelServiceError, parseModels } = require("./lib/models.cjs");
 const { buildRuntimeEnv, resolveRuntimePaths } = require("./lib/runtime-env.cjs");
 const { sessionFetch } = require("./lib/session-cookie.cjs");
@@ -262,6 +263,22 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
   const imageGenerateImpl = dependencies.imageGenerate || generateImage;
   const createImageBrokerImpl = dependencies.createImageBroker || createImageBroker;
   const createSearchBrokerImpl = dependencies.createSearchBroker || createSearchBroker;
+  const checkpointStore = dependencies.checkpointStore || createCheckpointStore({
+    baseDir: path.join(app.getPath("userData"), "qo-checkpoints"),
+    now: clockNow
+  });
+
+  async function getCheckpoint(conversationId, userId = "") {
+    const origin = getOrigin();
+    if (!origin || !conversationId) return null;
+    return checkpointStore.summary(origin, String(conversationId), { userId: String(userId || "") });
+  }
+
+  async function clearCheckpoint(conversationId) {
+    const origin = getOrigin();
+    if (!origin || !conversationId) return false;
+    return checkpointStore.clear(origin, String(conversationId));
+  }
 
   async function loadPipelineConfig(origin) {
     const payload = await readSessionJson(origin, `${origin}/api/v1/me/pipeline`);
@@ -328,9 +345,83 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     const startedAt = clockNow();
     const pipelineRequested = job.model === "qo:pipeline";
     const origin = getOrigin();
+    const conversationId = typeof job.conversation_id === "string" ? job.conversation_id : "";
+    const resumeRequested = job.resume === true;
     const hasContext = job.context !== undefined && job.context !== null;
+    const recordedSteps = [];
+    const emitStep = (event) => {
+      if (event?.type === "step" && typeof event.label === "string" && event.label) {
+        if (recordedSteps[recordedSteps.length - 1] !== event.label) {
+          recordedSteps.push(event.label);
+          if (recordedSteps.length > 60) recordedSteps.shift();
+        }
+      }
+      emit(event);
+    };
+
+    let resumedCheckpoint = null;
+    if (resumeRequested && origin && conversationId) {
+      resumedCheckpoint = await checkpointStore.load(origin, conversationId, { userId: job.user_id || "" });
+    }
+    if (resumedCheckpoint?.stage === "complete" &&
+        resumedCheckpoint.completedResult &&
+        typeof resumedCheckpoint.completedResult.text === "string" &&
+        resumedCheckpoint.completedResult.text.trim()) {
+      emitStep({ type: "step", label: "断点续跑：复用已生成的完整结果，正在重新提交保存" });
+      return {
+        ...resumedCheckpoint.completedResult,
+        resumedFromComplete: true
+      };
+    }
+
+    const checkpointMeta = job.checkpoint_meta && typeof job.checkpoint_meta === "object" ? job.checkpoint_meta : {};
+    const checkpointState = {
+      runId: typeof job.run_id === "string" ? job.run_id : (resumedCheckpoint?.runId || ""),
+      userId: typeof job.user_id === "string" ? job.user_id : (resumedCheckpoint?.userId || ""),
+      message: typeof checkpointMeta.message === "string" ? checkpointMeta.message : (resumedCheckpoint?.message || ""),
+      mode: typeof checkpointMeta.mode === "string" ? checkpointMeta.mode : (resumedCheckpoint?.mode || "auto"),
+      materialIds: Array.isArray(checkpointMeta.material_ids) ? checkpointMeta.material_ids : (resumedCheckpoint?.materialIds || []),
+      selection: checkpointMeta.selection !== undefined ? checkpointMeta.selection : (resumedCheckpoint?.selection || null),
+      model: job.model,
+      allowImageTool: job.image_tool === true,
+      stage: resumedCheckpoint?.stage || (pipelineRequested ? "understand" : "single_execute"),
+      brief: resumedCheckpoint?.brief || null,
+      tier: resumedCheckpoint?.tier || "standard",
+      finalText: resumedCheckpoint?.finalText || "",
+      checkedDeck: resumedCheckpoint?.checkedDeck || null,
+      verdict: resumedCheckpoint?.verdict || "fail",
+      review: resumedCheckpoint?.review || "not_needed",
+      rounds: resumedCheckpoint?.rounds || 1,
+      issues: Array.isArray(resumedCheckpoint?.issues) ? [...resumedCheckpoint.issues] : [],
+      stages: Array.isArray(resumedCheckpoint?.stages) ? [...resumedCheckpoint.stages] : [],
+      twoRoundAcceptanceFailed: Boolean(resumedCheckpoint?.twoRoundAcceptanceFailed),
+      searchState: resumedCheckpoint?.searchState || null,
+      images: Array.isArray(resumedCheckpoint?.images) ? resumedCheckpoint.images.map((img) => ({ ...img })) : [],
+      thinkingTail: typeof resumedCheckpoint?.thinkingTail === "string" ? resumedCheckpoint.thinkingTail : "",
+      steps: Array.isArray(resumedCheckpoint?.steps) ? [...resumedCheckpoint.steps] : [],
+      error: "",
+      completedResult: null
+    };
+    const initialUploadedImageCount = checkpointState.images.length;
+    let latestThinkingTail = checkpointState.thinkingTail;
+
+    const persistCheckpoint = (patch = {}) => {
+      if (!origin || !conversationId) return Promise.resolve(null);
+      Object.assign(checkpointState, patch);
+      if (recordedSteps.length) {
+        const merged = [...checkpointState.steps];
+        for (const s of recordedSteps) {
+          if (merged[merged.length - 1] !== s) merged.push(s);
+        }
+        checkpointState.steps = merged.slice(-60);
+      }
+      checkpointState.thinkingTail = latestThinkingTail;
+      return checkpointStore.save(origin, conversationId, checkpointState).catch(() => null);
+    };
+
     try {
-    emit({ type: "step", label: hasContext ? "载入项目资料" : "准备执行环境" });
+    emitStep({ type: "step", label: resumedCheckpoint ? `从「${describeStage(resumedCheckpoint.stage)}」断点续跑` : (hasContext ? "载入项目资料" : "准备执行环境") });
+    if (origin && conversationId) void persistCheckpoint();
     const available = await readFreshModels();
     ensureNotAborted();
     let config;
@@ -404,6 +495,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         if (!thinkingBuffer) return;
         const text = thinkingBuffer;
         thinkingBuffer = "";
+        latestThinkingTail = `${latestThinkingTail}${text}`.slice(-3200);
         emit({ type: "thinking", text, stage: stage.role, model: stage.model });
       };
       try {
@@ -468,7 +560,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
             } else if (streamEvent.type === "tool" && typeof streamEvent.name === "string") {
               flushThinking();
               const label = toolDisplayNames[streamEvent.name] || streamEvent.name;
-              emit({ type: "step", label: `调用工具：${label}` });
+              emitStep({ type: "step", label: `调用工具：${label}` });
             } else if (streamEvent.type === "content" && Number.isFinite(streamEvent.chars)) {
               flushThinking();
               contentChars += streamEvent.chars;
@@ -502,7 +594,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
         });
         const node = getNodeExecutable();
         Object.assign(env, node.extraEnv);
-        emit({ type: "step", label: "正在调用模型" });
+        emitStep({ type: "step", label: "正在调用模型" });
         const text = await runDshStage({
           ...node,
           dshBin: runtimePaths.dshBin,
@@ -516,7 +608,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           timeoutMs: stage.timeoutMs,
           signal,
           onEvent: (event) => {
-            if (event?.type === "step" && typeof event.label === "string") emit(event);
+            if (event?.type === "step" && typeof event.label === "string") emitStep(event);
+          },
+          onCheckedDeck: (deck) => {
+            if (deck && typeof deck === "object" && Array.isArray(deck.slides) && deck.slides.length) {
+              void persistCheckpoint({ checkedDeck: deck });
+            }
           }
         });
         if (pipelineRequested && gateway?.quota_error) {
@@ -563,8 +660,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           generate: (request, options) => imageGenerateImpl(request, options),
           model: imageModel,
           maxImages,
-          deadlineAt: startedAt + (pipelineRequested ? DEADLINE_MS : 600_000),
-          now: clockNow
+          deadlineAt: startedAt + (pipelineRequested ? DEADLINE_MS : STAGE_TIMEOUT_MS),
+          now: clockNow,
+          initialImages: checkpointState.images,
+          onImageGenerated: (_img, _index, allImages) => {
+            void persistCheckpoint({ images: allImages });
+          }
         });
       }
       if (webSearchEnabled) {
@@ -583,15 +684,19 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           }),
           serverTime,
           now: clockNow,
+          initialState: checkpointState.searchState,
           onSearch: (queries, srvTime) => {
             const label = queries.slice(0, 3).join(" / ").slice(0, 100);
             const dateTag = srvTime?.date || serverTime?.date || "";
-            emit({ type: "step", label: `DeepSeek 搜索${dateTag ? `（基准 ${dateTag}）` : ""}：${label}` });
+            emitStep({ type: "step", label: `DeepSeek 搜索${dateTag ? `（基准 ${dateTag}）` : ""}：${label}` });
           },
           onFetch: (targetUrl) => {
             let host = targetUrl;
             try { host = new URL(targetUrl).hostname; } catch {}
-            emit({ type: "step", label: `读取网页：${host}` });
+            emitStep({ type: "step", label: `读取网页：${host}` });
+          },
+          onStateChange: (snapshot) => {
+            void persistCheckpoint({ searchState: snapshot });
           }
         });
       }
@@ -599,64 +704,138 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
       if (imageBroker) extraSystemParts.push(IMAGE_TOOL_INSTRUCTIONS);
       if (searchBroker && webSearchRequired) extraSystemParts.push(buildSearchToolInstructions(searchBroker.serverTime || serverTime));
       const effectiveSystem = extraSystemParts.length ? `${job.system}\n\n${extraSystemParts.join("\n\n")}` : job.system;
+      const collectImages = () => {
+        const list = imageBroker ? imageBroker.images : checkpointState.images;
+        return Array.isArray(list) ? list.map((image) => ({ ...image })) : [];
+      };
       if (pipelineRequested) {
         const pipelineJob = { ...job, system: effectiveSystem };
+        const pipelineResumeState = resumedCheckpoint
+          ? {
+              stage: resumedCheckpoint.stage,
+              stageLabel: describeStage(resumedCheckpoint.stage),
+              error: resumedCheckpoint.error || "",
+              brief: resumedCheckpoint.brief || null,
+              tier: resumedCheckpoint.tier || "standard",
+              finalText: resumedCheckpoint.finalText || "",
+              checkedDeck: resumedCheckpoint.checkedDeck || null,
+              verdict: resumedCheckpoint.verdict || "fail",
+              review: resumedCheckpoint.review || "not_needed",
+              rounds: resumedCheckpoint.rounds || 1,
+              issues: Array.isArray(resumedCheckpoint.issues) ? resumedCheckpoint.issues : [],
+              stages: Array.isArray(resumedCheckpoint.stages) ? resumedCheckpoint.stages : [],
+              twoRoundAcceptanceFailed: Boolean(resumedCheckpoint.twoRoundAcceptanceFailed),
+              thinkingTail: resumedCheckpoint.thinkingTail || ""
+            }
+          : null;
         const pipelineResult = await runPipeline({
           job: pipelineJob,
           config,
           availableModels: available,
           runStage,
-          emit,
+          emit: emitStep,
           now: clockNow,
           startedAt,
           signal,
-          getGeneratedImageCount: () => imageBroker?.images.length || 0,
+          getGeneratedImageCount: () => collectImages().length,
+          getGeneratedImages: collectImages,
           requireSearch: Boolean(searchBroker && webSearchRequired),
           getSearchCount: () => searchBroker?.searchCount || 0,
           serverTime: searchBroker?.serverTime || serverTime,
-          getSearchEvidence: () => searchBroker?.getEvidenceDigest?.() || ""
+          getSearchEvidence: () => searchBroker?.getEvidenceDigest?.() || "",
+          resumeState: pipelineResumeState,
+          onCheckpoint: (snapshot) => {
+            void persistCheckpoint({
+              ...snapshot,
+              images: collectImages(),
+              ...(searchBroker?.exportState ? { searchState: searchBroker.exportState() } : {})
+            });
+          }
         });
-        return {
+        const finalImages = collectImages();
+        const finalPayload = {
           ...pipelineResult,
-          ...(imageBroker?.images.length ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
+          ...(finalImages.length ? { images: finalImages } : {})
         };
+        await persistCheckpoint({
+          stage: "complete",
+          finalText: finalPayload.text,
+          images: finalImages,
+          ...(searchBroker?.exportState ? { searchState: searchBroker.exportState() } : {}),
+          completedResult: finalPayload,
+          error: ""
+        });
+        return finalPayload;
       }
+      const singleResumeExtra = resumedCheckpoint
+        ? buildResumeContext({
+            resumeState: {
+              stage: resumedCheckpoint.stage,
+              stageLabel: describeStage(resumedCheckpoint.stage),
+              error: resumedCheckpoint.error || "",
+              checkedDeck: resumedCheckpoint.checkedDeck || null,
+              thinkingTail: resumedCheckpoint.thinkingTail || ""
+            },
+            searchEvidence: searchBroker?.getEvidenceDigest?.() || "",
+            images: collectImages()
+          })
+        : "";
       let result = await runStage({
         role: "execute",
         model: job.model,
-        system: effectiveSystem,
+        system: `${effectiveSystem}${singleResumeExtra}`,
         prompt: job.prompt,
         withContext: hasContext,
         withSearch: Boolean(searchBroker),
         timeoutMs: STAGE_TIMEOUT_MS
       });
       if (searchBroker && webSearchRequired && searchBroker.searchCount < 1) {
-        emit({ type: "step", label: "程序校验：尚未联网搜索，正在强制调用 DeepSeek 搜索" });
+        emitStep({ type: "step", label: "程序校验：尚未联网搜索，正在强制调用 DeepSeek 搜索" });
         result = await runStage({
           role: "execute",
           model: job.model,
-          system: effectiveSystem,
+          system: `${effectiveSystem}${singleResumeExtra}`,
           prompt: `${job.prompt}\n\n【程序强制拦截】本轮强制要求先调用 web_search（DeepSeek 联网搜索）检索最新资料后再作答。你刚才未调用 web_search，请立即调用 web_search（传入 1–4 个关键词），基于检索结果重新输出完整 JSON 交付物！`,
           withContext: hasContext,
-          withImages: !(imageBroker?.images.length),
+          withImages: !(collectImages().length),
           withSearch: true,
           timeoutMs: STAGE_TIMEOUT_MS
         });
       }
-      emit({ type: "step", label: "处理完成" });
-      return {
+      emitStep({ type: "step", label: "处理完成" });
+      const finalImages = collectImages();
+      const finalPayload = {
         text: result.text,
         usage: result.usage,
         model: job.model,
         max_tokens_clamped: result.usage.max_tokens_clamped,
         finish_reasons: result.usage.finish_reasons,
         truncated: result.usage.truncated,
-        ...(imageBroker ? { images: imageBroker.images.map((image) => ({ ...image })) } : {})
+        ...(imageBroker || finalImages.length ? { images: finalImages } : {})
       };
+      await persistCheckpoint({
+        stage: "complete",
+        finalText: finalPayload.text,
+        images: finalImages,
+        ...(searchBroker?.exportState ? { searchState: searchBroker.exportState() } : {}),
+        completedResult: finalPayload,
+        error: ""
+      });
+      return finalPayload;
     } catch (error) {
-      if (imageBroker?.images.length && origin && job.conversation_id && job.run_id) {
+      const currentImages = imageBroker ? imageBroker.images : checkpointState.images;
+      const newImagesToSave = imageBroker ? imageBroker.images.slice(initialUploadedImageCount) : [];
+      if (error?.checkedDeck && typeof error.checkedDeck === "object") {
+        checkpointState.checkedDeck = error.checkedDeck;
+      }
+      await persistCheckpoint({
+        error: String(error?.message || "桌面执行失败").slice(0, 300),
+        images: Array.isArray(currentImages) ? currentImages.map((image) => ({ ...image })) : [],
+        ...(searchBroker?.exportState ? { searchState: searchBroker.exportState() } : {})
+      });
+      if (newImagesToSave.length && origin && job.conversation_id && job.run_id) {
         const imgEndpoint = `${origin}/api/v1/conversations/${encodeURIComponent(job.conversation_id)}/turns/${encodeURIComponent(job.run_id)}/images`;
-        for (const image of imageBroker.images) {
+        for (const image of newImagesToSave) {
           try {
             await readSessionJson(origin, imgEndpoint, {
               method: "POST",
@@ -666,7 +845,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
           } catch {}
         }
       }
-      emit({ type: "step", label: error.message || "桌面执行失败" });
+      emitStep({ type: "step", label: error.message || "桌面执行失败" });
       throw error;
     } finally {
       await imageBroker?.close().catch(() => {});
@@ -680,7 +859,9 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
   return {
     cancelAgent,
     clearAllCredentials,
+    clearCheckpoint,
     clearCredentialsForOrigin,
+    getCheckpoint,
     models,
     usage,
     generateImage,

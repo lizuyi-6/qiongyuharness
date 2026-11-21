@@ -183,8 +183,8 @@ function checkDeck(args) {
     return `版式与审美自检全部通过：共 ${totalSlides} 页（浅色页 ${lightCount} / 深色页 ${darkCount} / 图表与表格 ${chartOrTableCount} / 配图 ${imageCount}），可直接输出最终 JSON。`;
   }
   const lines = [`版式与审美自检结果（共 ${totalSlides} 页，浅色 ${lightCount} / 深色 ${darkCount} / 图表与表格 ${chartOrTableCount}）：`];
-  if (issues.length) lines.push("必须修复的问题（修完后再输出最终 JSON）：", ...issues.slice(0, 16).map((s) => `- ${s}`));
-  if (warnings.length) lines.push("强烈建议优化项：", ...warnings.slice(0, 10).map((s) => `- ${s}`));
+  if (issues.length) lines.push("必须修复的问题（请直接按以上坐标/字号修正后立即输出最终完整 JSON，无需再次重复调用 office_ppt_check）：", ...issues.slice(0, 16).map((s) => `- ${s}`));
+  if (warnings.length) lines.push("建议优化项（可顺手微调后直接输出最终 JSON，无需再次调用校验）：", ...warnings.slice(0, 10).map((s) => `- ${s}`));
   return lines.join("\n");
 }
 

@@ -108,6 +108,7 @@ class TurnCompletion(BaseModel):
 
 class TurnFailure(BaseModel):
     message: str = Field(min_length=1, max_length=1000)
+    steps: list[str] | None = Field(default=None, max_length=120)
 
 
 IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "1536x864"}
@@ -571,13 +572,22 @@ async def replay(row):
     yield event("complete", turn=public_turn(row))
 
 
-def fail_turn(run, user, assignment, message):
+def fail_turn(run, user, assignment, message, steps=None):
     with database(write=True) as db:
         current = db.one("SELECT result FROM office_turns WHERE id=? AND status='running'", (run,))
         if not current:
             return
         result = unpack(current["result"] or "{}")
         result["error"] = message
+        if isinstance(steps, list) and steps:
+            existing = list(result.get("steps") or [])
+            for step in steps:
+                if not isinstance(step, str):
+                    continue
+                cleaned_step = clean_text(step, 240)
+                if cleaned_step and (not existing or existing[-1] != cleaned_step):
+                    existing.append(cleaned_step)
+            result["steps"] = existing[-80:]
         changed = db.execute("UPDATE office_turns SET status='failed',result=? WHERE id=? AND status='running'",
                              (pack(result), run)).rowcount
         if changed:
@@ -615,9 +625,9 @@ def selection_target(db, key, body, user):
 
 
 def stale_before():
-    # 桌面端智能分工全程上限 25 分钟（desktop/lib/pipeline.cjs DEADLINE_MS），这里必须更长，
+    # 桌面端智能分工全程上限 30 分钟（desktop/lib/pipeline.cjs DEADLINE_MS），这里必须更长，
     # 否则仍在执行的一轮会被下一次请求判成"已中断"。
-    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30))
+    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=40))
 
 
 def check_existing(db, key, body, request, allow_replay, stale):
@@ -1023,7 +1033,7 @@ def fail_turn_route(key: str, run: str, payload: TurnFailure, user: User):
             fail(404, "本轮执行不存在")
         if turn["status"] != "running" or run_row["status"] != "running":
             fail(409, "本轮执行已结束")
-    if not fail_turn(run, user, assignment, clean_text(payload.message, 1000)):
+    if not fail_turn(run, user, assignment, clean_text(payload.message, 1000), steps=payload.steps):
         fail(409, "本轮执行已结束")
     return {"ok": True}
 

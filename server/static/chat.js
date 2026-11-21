@@ -1,4 +1,4 @@
-import { active, api, badge, button, copyText, deadline, e, fileMarkup, icon, modal, outputWarnings, post, readDraft, saveDraft,
+import { active, api, badge, button, cleanErrorMessage, copyText, deadline, e, fileMarkup, icon, modal, outputWarnings, post, readDraft, saveDraft,
   state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
@@ -72,6 +72,28 @@ function findLiveProgress(threadId) {
 
 function emitConversationsUpdated() {
   try { window.dispatchEvent(new CustomEvent("qo:conversations-updated")); } catch {}
+}
+
+async function loadCheckpointFor(threadId, userId = state.me?.id) {
+  if (!threadId || typeof window.officeDesktop?.getCheckpoint !== "function") return null;
+  try {
+    const summary = await window.officeDesktop.getCheckpoint(threadId, userId || "");
+    return summary && summary.conversationId === threadId ? summary : null;
+  } catch {
+    return null;
+  }
+}
+
+function syncCheckpointCardDom(workspace) {
+  if (!workspace || state.chatWorkspace !== workspace) return;
+  const turnsEl = document.querySelector("[data-chat-turns]");
+  if (!turnsEl) return;
+  turnsEl.querySelector("[data-checkpoint-card]")?.remove();
+  const html = checkpointCardMarkup(workspace);
+  if (html) {
+    turnsEl.insertAdjacentHTML("beforeend", html);
+    scrollToLatest();
+  }
 }
 
 function sessionSignature(session) {
@@ -741,6 +763,11 @@ export function syncChatSubmit(form = chatForm(), workspace = state.chatWorkspac
   form.querySelectorAll('button[type="submit"]').forEach((control) => {
     control.disabled = disabled;
   });
+  const resumeBtn = document.querySelector(".checkpoint-resume-btn");
+  if (resumeBtn) {
+    const canResume = !form.dataset.busy && (canSubmitChat(workspace) || Boolean(workspace?.checkpoint?.hasCompletedResult));
+    resumeBtn.disabled = !canResume;
+  }
 }
 
 function draftFor(workspace) {
@@ -817,9 +844,11 @@ export async function loadWorkspace(parts) {
 
   const conversations = Array.isArray(state.conversations) ? state.conversations : [];
   const todayItems = Array.isArray(state.today) ? state.today : [];
+  const checkpoint = session?.id ? await loadCheckpointFor(session.id, userId) : null;
 
   const workspace = {
     session,
+    checkpoint,
     conversations,
     task,
     project,
@@ -846,9 +875,12 @@ export async function loadWorkspace(parts) {
         if (state.me?.id !== userId) return;
         sessionCache.set(scope, freshSession);
         if (state.chatWorkspace !== workspace) return;
+        const freshCheckpoint = await loadCheckpointFor(scope, userId);
+        const cpChanged = JSON.stringify(workspace.checkpoint || null) !== JSON.stringify(freshCheckpoint || null);
+        workspace.checkpoint = freshCheckpoint;
         const changed = sessionSignature(workspace.session) !== sessionSignature(freshSession);
         workspace.session = freshSession;
-        if (changed) {
+        if (changed || cpChanged) {
           const turnsEl = document.querySelector("[data-chat-turns]");
           if (turnsEl) turnsEl.innerHTML = historyView(workspace);
           const titleWrap = document.querySelector("[data-thread-title-wrap]");
@@ -1057,6 +1089,33 @@ function turnView(turn, index, canRetry = false) {
   </section>`;
 }
 
+function checkpointCardMarkup(workspace) {
+  const cp = workspace?.checkpoint;
+  const sessionId = workspace?.session?.id;
+  if (!cp || !sessionId || cp.conversationId !== sessionId) return "";
+  if (activeTurnFor(sessionId)) return "";
+  if (workspace.task && !active(workspace.task.status)) return "";
+  if (!clientExecutionRequired() || typeof window.officeDesktop?.runAgent !== "function") return "";
+  const preserved = Array.isArray(cp.preserved) ? cp.preserved : [];
+  const canResume = selectedModelAvailable(workspace) || Boolean(cp.hasCompletedResult);
+  const errorText = cp.error ? cleanErrorMessage(cp.error, "") : "";
+  const title = cp.hasCompletedResult
+    ? "上次结果已生成，保存时中断"
+    : `上次任务在「${cp.stageLabel || "任务执行"}」阶段中断`;
+  return `<aside class="checkpoint-card" data-checkpoint-card role="region" aria-label="可续跑任务断点">
+    <div class="checkpoint-card-head">
+      <span class="checkpoint-badge">${icon("history")}<span>断点已保存</span></span>
+      <strong class="checkpoint-title">${e(title)}</strong>
+    </div>
+    ${errorText ? `<p class="checkpoint-error">中断原因：${e(errorText)}</p>` : ""}
+    ${preserved.length ? `<div class="checkpoint-chips">${preserved.map((item) => `<span class="checkpoint-chip">${icon("checkPlain")}<span>${e(item)}</span></span>`).join("")}</div>` : ""}
+    <div class="checkpoint-actions">
+      <button type="button" class="button primary sm checkpoint-resume-btn" data-act="chat-resume" ${canResume ? "" : "disabled"}>${icon("play")}${cp.hasCompletedResult ? "直接重新保存" : "从断点续跑"}</button>
+      <button type="button" class="text-button" data-act="chat-discard-checkpoint">放弃断点</button>
+    </div>
+  </aside>`;
+}
+
 function historyView(workspace) {
   const session = workspace.session;
   const canRetry = !(workspace.task && !active(workspace.task.status));
@@ -1070,7 +1129,8 @@ function historyView(workspace) {
     }
     return turnView(turn, i, canRetry);
   }).join("");
-  return `${session?.has_earlier ? `<div class="actions">${button("加载更早的消息", "chat-earlier", { icon: "history", cls: "sm" })}</div>` : ""}${turnsHtml}${activeLive ? liveTurnMarkup(activeLive) : ""}`;
+  const cpHtml = activeLive ? "" : checkpointCardMarkup(workspace);
+  return `${session?.has_earlier ? `<div class="actions">${button("加载更早的消息", "chat-earlier", { icon: "history", cls: "sm" })}</div>` : ""}${turnsHtml}${activeLive ? liveTurnMarkup(activeLive) : cpHtml}`;
 }
 
 function welcomeHero(workspace) {
@@ -1928,7 +1988,7 @@ export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result
   }
 }
 
-async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = true } = {}) {
+async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = true, resume = false } = {}) {
   const desktop = window.officeDesktop;
   if (typeof desktop?.runAgent !== "function") throw new Error("请在桌面客户端中使用 AI 办理");
   const model = workspace.selectedModel;
@@ -1954,12 +2014,19 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
     for (const step of prepared.steps || []) {
       recordLiveStep(live, step);
     }
-    setLiveStatus(live, "正在调用模型…", { canvasLabel: "正在调用模型…" });
+    setLiveStatus(live, resume ? "正在从断点恢复执行…" : "正在调用模型…", { canvasLabel: resume ? "正在从断点恢复执行…" : "正在调用模型…" });
     live.phase = "agent";
     const enableImageTool = Boolean(workspace.image_models?.length) && allowImageTool === true;
     const job = {
-      conversation_id: live.threadId, run_id: prepared.run_id,
+      conversation_id: live.threadId, run_id: prepared.run_id, user_id: live.userId || "",
       system: prepared.system, prompt: prepared.prompt, context: prepared.context, model,
+      resume: resume === true,
+      checkpoint_meta: {
+        message: payload.message,
+        mode: payload.mode,
+        material_ids: Array.isArray(payload.material_ids) ? payload.material_ids : [],
+        ...(payload.selection ? { selection: payload.selection } : {})
+      },
       ...(prepared.wants_pptx ? { ppt_check: true } : {}),
       ...(prepared.web_search ? { web_search: prepared.web_search } : {}),
       ...(enableImageTool ? { image_tool: true } : {})
@@ -1993,6 +2060,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
         model: result.model || model,
         ...(result.pipeline ? { pipeline: result.pipeline } : {})
       });
+      await desktop.clearCheckpoint?.(live.threadId).catch(() => {});
       if (imageSaveFailures) completed.image_save_failures = imageSaveFailures;
       return completed;
     }, (event) => {
@@ -2002,11 +2070,18 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
   } catch (error) {
     if ((cancelled || error?.name === "AbortError") && !String(error?.message || "").startsWith("已停止生成")) {
       error = new Error("已停止生成");
+    } else if (error instanceof Error) {
+      error.message = cleanErrorMessage(error, "桌面执行失败");
+    } else {
+      error = new Error(cleanErrorMessage(error, "桌面执行失败"));
     }
     error.retryAsNew = true;
     if (prepared?.run_id) {
       try {
-        await post(base + "/" + encodeURIComponent(prepared.run_id) + "/fail", { message: error.message || "桌面执行失败" });
+        await post(base + "/" + encodeURIComponent(prepared.run_id) + "/fail", {
+          message: error.message || "桌面执行失败",
+          ...(Array.isArray(live.steps) && live.steps.length ? { steps: live.steps.slice(-80) } : {})
+        });
       } catch (failError) {
         if (live.phase === "complete" && failError.status === 409 && (!error.status || error.status >= 500)) {
           error.message = "无法确认本轮是否已保存，请刷新会话查看最新结果。";
@@ -2033,9 +2108,10 @@ function inferLiveCanvasKind(message, mode, selection, workspace) {
 }
 
 async function refreshConversationInPlace(workspace, threadId, { selectId = "", preferredPage = 1, openCanvas = false } = {}) {
-  const [freshSession, conversations] = await Promise.all([
+  const [freshSession, conversations, freshCheckpoint] = await Promise.all([
     api("/conversations/" + encodeURIComponent(threadId)),
-    api("/conversations").catch(() => null)
+    api("/conversations").catch(() => null),
+    loadCheckpointFor(threadId, state.me?.id)
   ]);
   sessionCache.set(threadId, freshSession);
   if (Array.isArray(conversations)) {
@@ -2045,6 +2121,7 @@ async function refreshConversationInPlace(workspace, threadId, { selectId = "", 
   const currentWorkspace = state.chatWorkspace;
   if (!currentWorkspace || (currentWorkspace !== workspace && currentWorkspace.session?.id !== threadId)) return;
   currentWorkspace.session = freshSession;
+  currentWorkspace.checkpoint = freshCheckpoint;
   currentWorkspace.draftKey = "chat/" + threadId;
   if (Array.isArray(conversations)) currentWorkspace.conversations = conversations;
   const turnsEl = document.querySelector("[data-chat-turns]");
@@ -2213,25 +2290,20 @@ export async function generateImageFromComposer(triggerButton, rerender) {
   }
 }
 
-export async function sendMessage(form, rerender) {
-  const workspace = state.chatWorkspace;
+async function runConversationTurn({
+  workspace,
+  form,
+  message,
+  payload,
+  selected = [],
+  draft = {},
+  allowAiImages = true,
+  resume = false,
+  rethrowToForm = true
+}) {
   const user = state.me.id;
-  if (clientExecutionRequired() && typeof window.officeDesktop?.runAgent !== "function") {
-    throw new Error("请在桌面客户端中使用 AI 办理");
-  }
-  const message = form.elements.message.value.trim();
-  if (!message) throw new Error("请输入工作要求");
-  const draft = draftFor(workspace);
-  const selected = draft.selected || [];
-  const payload = {
-    message, mode: draft.selection ? "auto" : form.elements.mode.value, material_ids: selected.map((file) => file.id),
-    ...(draft.selection ? { selection: draft.selection } : {})
-  };
   const signature = JSON.stringify(payload);
-  if (clientExecutionRequired() && !selectedModelAvailable(workspace)) {
-    throw new Error(workspace.models?.length ? "请先选择可用模型" : "暂无可用模型，请联系管理员开通。");
-  }
-  const requestId = draft.pending?.signature === signature ? draft.pending.id : uuid();
+  const requestId = !resume && draft.pending?.signature === signature ? draft.pending.id : uuid();
   const threadId = workspace.session?.id || draft.newId || uuid();
   if (activeTurnFor(threadId)) {
     throw new Error("当前会话有一轮任务正在执行");
@@ -2245,7 +2317,7 @@ export async function sendMessage(form, rerender) {
   }
 
   writeDraft(workspace, form, { newId: threadId, pending: { id: requestId, signature } });
-  const liveKind = inferLiveCanvasKind(message, payload.mode, draft.selection, workspace);
+  const liveKind = inferLiveCanvasKind(message, payload.mode, payload.selection || draft.selection, workspace);
   const canCancel = !clientExecutionRequired() || typeof window.officeDesktop?.cancelAgent === "function";
   const live = {
     threadId,
@@ -2253,12 +2325,12 @@ export async function sendMessage(form, rerender) {
     userId: user,
     kind: "turn",
     message,
-    selection: draft.selection || null,
+    selection: payload.selection || draft.selection || null,
     steps: [],
-    statusText: "正在思考…",
+    statusText: resume ? "正在从断点恢复执行…" : "正在思考…",
     liveKind,
     liveSteps: [],
-    targetPage: draft.selection?.slide || null,
+    targetPage: (payload.selection || draft.selection)?.slide || null,
     canCancel,
     cancelling: false,
     phase: "prepare",
@@ -2267,9 +2339,13 @@ export async function sendMessage(form, rerender) {
   activeTurns.set(threadId, live);
   emitConversationsUpdated();
 
-  const initialInView = () => form.isConnected && state.me?.id === user;
-  const allowAiImages = form.elements.allow_ai_images ? form.elements.allow_ai_images.checked === true : imageAutoPreference();
-  setComposerLocked(form, true, workspace);
+  const initialInView = () => Boolean(form?.isConnected && state.me?.id === user);
+  if (form) {
+    form.dataset.busy = "1";
+    setComposerLocked(form, true, workspace);
+    form.querySelector(".error")?.remove();
+  }
+  document.querySelector("[data-checkpoint-card]")?.remove();
   try {
     if (!workspace.session) {
       const created = await post("/conversations", {
@@ -2285,17 +2361,19 @@ export async function sendMessage(form, rerender) {
       }
     }
     if (isViewingThread(threadId, user)) {
-      startProgress(form.isConnected ? form : chatForm(), live);
+      startProgress(form?.isConnected ? form : chatForm(), live);
       if (liveKind) {
         switchStudioTab("deck");
         setLiveStatus(live, live.statusText, {
-          canvasLabel: draft.selection?.slide ? `正在准备修改第 ${draft.selection.slide} 页…` : "正在理解工作要求…"
+          canvasLabel: resume
+            ? "正在从断点恢复并继续制作…"
+            : ((payload.selection || draft.selection)?.slide ? `正在准备修改第 ${(payload.selection || draft.selection).slide} 页…` : "正在理解工作要求…")
         });
       }
     }
     let completed;
     if (clientExecutionRequired()) {
-      completed = await executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool: allowAiImages });
+      completed = await executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool: allowAiImages, resume });
     } else {
       const controller = new AbortController();
       live.cancel = async () => { controller.abort(); };
@@ -2318,11 +2396,12 @@ export async function sendMessage(form, rerender) {
     if (state.me?.id !== user) return;
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);
+    workspace.checkpoint = null;
     writeDraft(workspace, null, { message: "", newId: null, pending: null, selection: null });
     const latestFileId = completed.file && ["pptx", "docx"].includes(completed.file.extension)
       ? completed.file.id
       : (completed.images?.[0]?.file?.id || "");
-    const targetPage = completed.file?.extension === "pptx" ? (draft.selection?.slide || 1) : 1;
+    const targetPage = completed.file?.extension === "pptx" ? ((payload.selection || draft.selection)?.slide || 1) : 1;
     const deck = latestFileId ? { fileId: latestFileId, page: targetPage } : draft.deck;
     saveDraft("chat/" + threadId, { selected, mode: payload.mode, deck });
     if (completed.file && workspace.task) {
@@ -2368,11 +2447,15 @@ export async function sendMessage(form, rerender) {
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);
     emitConversationsUpdated();
+    const cleanedMessage = cleanErrorMessage(error, "本轮执行失败");
+    if (error instanceof Error) error.message = cleanedMessage;
+    else error = new Error(cleanedMessage);
     if (state.me?.id === user) {
       const key = workspace.session?.id ? "chat/" + threadId : workspace.draftKey;
       const pending = error.retryAsNew ? null : { id: requestId, signature };
       saveDraft(key, { ...draft, message, mode: payload.mode, newId: threadId, pending });
       workspace.draftKey = key;
+      workspace.checkpoint = await loadCheckpointFor(threadId, user);
     }
     if (isViewingThread(threadId, user)) {
       setCanvasLiveState({ active: false });
@@ -2381,23 +2464,23 @@ export async function sendMessage(form, rerender) {
       node?.querySelector(".running-pulse")?.remove();
       node?.querySelector(".response-mark")?.classList.remove("is-working");
       const current = node?.querySelector(".running-note");
-      if (current) { current.textContent = error.message; current.classList.add("error"); }
+      if (current) { current.textContent = cleanedMessage; current.classList.add("error"); }
+      if (workspace.checkpoint) syncCheckpointCardDom(workspace);
       const currentForm = chatForm();
-      if (currentForm?.elements?.message) {
+      if (!workspace.checkpoint && currentForm?.elements?.message && !resume) {
         currentForm.elements.message.value = message;
         syncComposerGrow(currentForm.elements.message);
       }
-      // 如果原 form 已脱离 DOM（用户中途切页后又切回），不再抛给旧 handleForm 避免重复或丢失反馈
-      if (form.isConnected) throw error;
-      if (!current) toastMessage(error.message || "本轮执行失败", "error");
+      if (rethrowToForm && form?.isConnected && !workspace.checkpoint) throw error;
+      if (!current && !workspace.checkpoint) toastMessage(cleanedMessage, "error");
     } else if (state.me?.id === user) {
-      const stopped = String(error?.message || "").startsWith("已停止生成");
-      toastMessage(stopped ? "后台会话已停止" : `后台会话未完成：${error.message || "执行失败"}`, stopped ? "info" : "error");
+      const stopped = cleanedMessage.startsWith("已停止生成");
+      toastMessage(stopped ? "后台会话已停止" : `后台会话未完成（已保存断点）：${cleanedMessage}`, stopped ? "info" : "error");
     }
   } finally {
     activeTurns.delete(threadId);
     emitConversationsUpdated();
-    if (form.isConnected) {
+    if (form?.isConnected) {
       delete form.dataset.busy;
       setComposerLocked(form, false, state.chatWorkspace);
     }
@@ -2409,4 +2492,122 @@ export async function sendMessage(form, rerender) {
       }
     }
   }
+}
+
+export async function sendMessage(form, rerender) {
+  const workspace = state.chatWorkspace;
+  if (clientExecutionRequired() && typeof window.officeDesktop?.runAgent !== "function") {
+    throw new Error("请在桌面客户端中使用 AI 办理");
+  }
+  const message = form.elements.message.value.trim();
+  if (!message) throw new Error("请输入工作要求");
+  const draft = draftFor(workspace);
+  const selected = draft.selected || [];
+  const payload = {
+    message, mode: draft.selection ? "auto" : form.elements.mode.value, material_ids: selected.map((file) => file.id),
+    ...(draft.selection ? { selection: draft.selection } : {})
+  };
+  if (clientExecutionRequired() && !selectedModelAvailable(workspace)) {
+    throw new Error(workspace.models?.length ? "请先选择可用模型" : "暂无可用模型，请联系管理员开通。");
+  }
+  const allowAiImages = form.elements.allow_ai_images ? form.elements.allow_ai_images.checked === true : imageAutoPreference();
+  await runConversationTurn({
+    workspace,
+    form,
+    message,
+    payload,
+    selected,
+    draft,
+    allowAiImages,
+    resume: false,
+    rethrowToForm: true
+  });
+}
+
+export async function resumeFailedTurn(triggerButton = null) {
+  const workspace = state.chatWorkspace;
+  const threadId = workspace?.session?.id;
+  if (!workspace || !threadId) throw new Error("当前会话不可用");
+  if (!clientExecutionRequired() || typeof window.officeDesktop?.runAgent !== "function") {
+    throw new Error("请在桌面客户端中使用断点续跑");
+  }
+  if (activeTurnFor(threadId)) throw new Error("当前会话有一轮任务正在执行");
+  const form = chatForm();
+  if (form?.dataset.busy) throw new Error("请等待当前请求执行结束");
+
+  const checkpoint = workspace.checkpoint || await loadCheckpointFor(threadId, state.me?.id);
+  if (!checkpoint) {
+    workspace.checkpoint = null;
+    syncCheckpointCardDom(workspace);
+    throw new Error("未找到可续跑的任务断点");
+  }
+  workspace.checkpoint = checkpoint;
+
+  if (!selectedModelAvailable(workspace)) {
+    const fallbackModel = checkpoint.model;
+    const canFallback = fallbackModel === PIPELINE_MODEL
+      ? workspace.pipelineAvailable === true
+      : Boolean(fallbackModel && workspace.models?.includes(fallbackModel));
+    if (canFallback) {
+      workspace.selectedModel = fallbackModel;
+    } else if (!checkpoint.hasCompletedResult) {
+      throw new Error(workspace.models?.length ? "请先选择一个可用模型后再续跑" : "暂无可用模型，请联系管理员开通。");
+    }
+  }
+
+  // 若服务端仍残留未正常结束的 running 孤儿轮次，续跑前自动安全解锁。
+  const turns = workspace.session?.turns || [];
+  const orphanRunning = [...turns].reverse().find((t) => t.status === "running" && !t.reply && !t.error && t.id);
+  if (orphanRunning) {
+    const failPath = orphanRunning.kind === "image"
+      ? `/conversations/${encodeURIComponent(threadId)}/images/${encodeURIComponent(orphanRunning.id)}/fail`
+      : `/conversations/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(orphanRunning.id)}/fail`;
+    try {
+      await post(failPath, { message: "上次执行异常中断，已自动转入断点续跑" });
+    } catch (err) {
+      if (err?.status !== 409 && err?.status !== 404) throw err;
+    }
+  }
+
+  const lastTurn = turns[turns.length - 1];
+  const message = (checkpoint.message || lastTurn?.message || "").trim();
+  if (!message) throw new Error("无法恢复原始工作要求，请手动重新发送");
+
+  const draft = draftFor(workspace);
+  const payload = {
+    message,
+    mode: checkpoint.selection ? "auto" : (checkpoint.mode || "auto"),
+    material_ids: Array.isArray(checkpoint.materialIds) ? checkpoint.materialIds : [],
+    ...(checkpoint.selection ? { selection: checkpoint.selection } : {})
+  };
+  if (triggerButton?.isConnected) {
+    triggerButton.disabled = true;
+    triggerButton.textContent = "正在恢复断点…";
+  }
+  const allowAiImages = form?.elements?.allow_ai_images
+    ? form.elements.allow_ai_images.checked === true
+    : (checkpoint.allowImageTool !== false);
+  await runConversationTurn({
+    workspace,
+    form,
+    message,
+    payload,
+    selected: draft.selected || [],
+    draft,
+    allowAiImages,
+    resume: true,
+    rethrowToForm: false
+  });
+}
+
+export async function discardCheckpoint() {
+  const workspace = state.chatWorkspace;
+  const threadId = workspace?.session?.id;
+  if (!workspace || !threadId) return;
+  try {
+    await window.officeDesktop?.clearCheckpoint?.(threadId);
+  } catch {}
+  workspace.checkpoint = null;
+  document.querySelector("[data-checkpoint-card]")?.remove();
+  toastMessage("已放弃任务断点", "info");
 }
