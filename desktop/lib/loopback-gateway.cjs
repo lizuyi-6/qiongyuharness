@@ -4,7 +4,10 @@ const { StringDecoder } = require("node:string_decoder");
 const { isIsoDateTime } = require("./usage.cjs");
 
 const REQUEST_LIMIT = 2 * 1024 * 1024;
-const RESPONSE_LIMIT = 3 * 1024 * 1024;
+// 长篇自由画布 PPT（30+ 页）叠加高推理思维链时，原始 OpenAI SSE 流体积实测可达 4MB+；
+// 旧值 3MB 会在流式读取中途触发 response.destroy()，在下游制造 terminated: other side closed (UND_ERR_SOCKET)（2026-11-21 线上工单）。
+// SSE 路径已改为边解析边释放，不再整包驻留内存，上限放宽至 32MB 覆盖 64K~131K tokens 输出。
+const RESPONSE_LIMIT = 32 * 1024 * 1024;
 const MAX_CALLS = 32;
 // 不再自设输出上限：表内模型按其官方单次输出上限下发 max_tokens（2026-11-20 查官方/公开文档，
 // 并在线上以该值实测上游返回 200）；表外模型不下发 max_tokens，由上游默认值决定。
@@ -559,9 +562,11 @@ async function pipeResponse(upstream, response, state) {
     "X-Content-Type-Options": "nosniff"
   });
   const reader = upstream.body.getReader();
-  const chunks = [];
-  let total = 0;
   const isSse = contentType.includes("text/event-stream");
+  const chunks = isSse ? null : [];
+  let total = 0;
+  let sseUsage = {};
+  const sseFinishReasons = [];
   const decoder = isSse ? new StringDecoder("utf8") : null;
   const seenTools = new Set();
   const normalizer = isSse ? createSseToolCallNormalizer() : null;
@@ -574,9 +579,22 @@ async function pipeResponse(upstream, response, state) {
     }
   };
 
+  const collectPayloadStats = (payload) => {
+    const nextUsage = usageFromPayload(payload);
+    if (Object.keys(nextUsage).length) sseUsage = nextUsage;
+    for (const choice of Array.isArray(payload?.choices) ? payload.choices : []) {
+      if (typeof choice?.finish_reason === "string") sseFinishReasons.push(choice.finish_reason);
+    }
+  };
+
   const handleSseLine = async (line) => {
     const trimmed = line.trim();
     if (!trimmed) return;
+    if (trimmed.startsWith(":")) {
+      // SSE 心跳注释（如 : keepalive）：直接向下游透传保活，不参与 JSON 解析。
+      await writeDownstream(Buffer.from(`${line}\n\n`, "utf8"));
+      return;
+    }
     if (!trimmed.startsWith("data:")) {
       await writeDownstream(Buffer.from(`${line}\n`, "utf8"));
       return;
@@ -598,6 +616,7 @@ async function pipeResponse(upstream, response, state) {
       await writeDownstream(Buffer.from(`${line}\n\n`, "utf8"));
       return;
     }
+    collectPayloadStats(parsed);
     extractDeltaSignals(parsed, seenTools, state.onStreamEvent);
     for (const p of normalizer.processChunk(parsed)) {
       await writeDownstream(Buffer.from(`data: ${JSON.stringify(p)}\n\n`, "utf8"));
@@ -608,14 +627,14 @@ async function pipeResponse(upstream, response, state) {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      total += value.byteLength;
+      const chunk = Buffer.from(value);
+      const isKeepaliveOnly = isSse && /^(?:\s*:[^\r\n]*\r?\n)+$/.test(chunk.toString("utf8"));
+      if (!isKeepaliveOnly) total += chunk.byteLength;
       if (total > RESPONSE_LIMIT) {
         await reader.cancel();
         response.destroy();
         return;
       }
-      const chunk = Buffer.from(value);
-      chunks.push(chunk);
       if (isSse) {
         sseBuffer += decoder.write(chunk);
         let nl;
@@ -625,6 +644,7 @@ async function pipeResponse(upstream, response, state) {
           await handleSseLine(line);
         }
       } else {
+        chunks.push(chunk);
         await writeDownstream(chunk);
       }
     }
@@ -641,13 +661,18 @@ async function pipeResponse(upstream, response, state) {
       }
     }
     response.end();
-    const fullBody = Buffer.concat(chunks, total);
-    if (!isSse && typeof state.onStreamEvent === "function") {
-      try {
-        extractDeltaSignals(JSON.parse(fullBody.toString("utf8")), seenTools, state.onStreamEvent);
-      } catch {}
+    let details;
+    if (isSse) {
+      details = { usage: sseUsage, finishReasons: sseFinishReasons };
+    } else {
+      const fullBody = Buffer.concat(chunks, total);
+      if (typeof state.onStreamEvent === "function") {
+        try {
+          extractDeltaSignals(JSON.parse(fullBody.toString("utf8")), seenTools, state.onStreamEvent);
+        } catch {}
+      }
+      details = responseDetails(contentType, fullBody);
     }
-    const details = responseDetails(contentType, fullBody);
     addUsage(state.usage, details.usage);
     for (const reason of details.finishReasons) {
       if (state.finish_reasons.length < MAX_CALLS) state.finish_reasons.push(reason);

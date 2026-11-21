@@ -165,6 +165,28 @@ function createCheckpointStore({ baseDir, now = Date.now }) {
     });
   }
 
+  async function invalidateResult(origin, conversationId, { userId = "" } = {}) {
+    // complete 被服务端 4xx 拒绝后调用：作废已生成的结果载荷，让下次续跑重新生成文本，
+    // 但保留已计费的配图、联网搜索与步骤记录（断点重放死循环的根治，2026-11-21 线上工单）。
+    if (!origin || !conversationId) return false;
+    const data = await load(origin, conversationId, { userId });
+    if (!data) return false;
+    for (const key of ["completedResult", "finalText", "checkedDeck", "brief", "thinkingTail"]) {
+      delete data[key];
+    }
+    data.stage = "";
+    data.stages = [];
+    data.issues = [];
+    data.rounds = 1;
+    data.verdict = "fail";
+    data.review = "not_needed";
+    data.twoRoundAcceptanceFailed = false;
+    data.error = "";
+    data.message = "";
+    await save(origin, conversationId, data);
+    return true;
+  }
+
   async function clearForOrigin(origin) {
     if (!origin) return;
     await fs.rm(originDir(origin), { recursive: true, force: true }).catch(() => {});
@@ -179,6 +201,7 @@ function createCheckpointStore({ baseDir, now = Date.now }) {
     load,
     summary,
     clear,
+    invalidateResult,
     clearForOrigin,
     clearAll
   };

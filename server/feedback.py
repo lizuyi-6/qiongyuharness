@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 from urllib.parse import quote
@@ -13,6 +14,14 @@ from pydantic import BaseModel, Field
 
 from .identity import fail, user_for
 from .store import audit, database, instant, uid, unpack
+
+
+def server_version() -> str:
+    override = (os.environ.get("QO_APP_VERSION") or "").strip()
+    if override:
+        return override
+    from . import app as app_module
+    return str(getattr(app_module.app, "version", "") or "unknown")
 
 router = APIRouter(prefix="/api/v1/feedback")
 
@@ -33,7 +42,6 @@ STATUS_LABELS = {
     "closed": "已关闭",
 }
 MAX_LOG_BYTES = 512 * 1024
-APP_VERSION = "0.2.21"
 
 _RE_BEARER = re.compile(r"\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
 _RE_SK_KEY = re.compile(r"\b(sk-[A-Za-z0-9_-]{8,})")
@@ -352,7 +360,7 @@ def submit_feedback(body: FeedbackCreate, user=Depends(user_for)):
             },
             "route": route,
             "client_version": client_version,
-            "server_version": APP_VERSION,
+            "server_version": server_version(),
             "platform": platform,
             "error_message": error_message,
             "desktop_diagnostics": clean_desktop,
@@ -395,7 +403,7 @@ def submit_feedback(body: FeedbackCreate, user=Depends(user_for)):
                 conv_title,
                 route,
                 client_version,
-                APP_VERSION,
+                server_version(),
                 platform,
                 log_summary,
                 log_data,

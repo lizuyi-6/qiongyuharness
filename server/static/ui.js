@@ -132,7 +132,7 @@ export function formatBytes(bytes) {
 export function outputWarnings(telemetry) {
   if (!telemetry || typeof telemetry !== "object") return "";
   const messages = [];
-  if (telemetry.truncated === true) messages.push("回复达到单次输出上限(3500 tokens)被截断");
+  if (telemetry.truncated === true) messages.push("回复达到模型单次输出上限被截断");
   if (Array.isArray(telemetry.max_tokens_clamped)) {
     for (const item of telemetry.max_tokens_clamped) {
       if (Number.isInteger(item?.requested) && item?.applied === 3500) {

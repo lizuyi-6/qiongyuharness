@@ -59,13 +59,13 @@ class Table(BaseModel):
     rows: list[list[str]] = Field(min_length=1, max_length=8)
 
     def clean(self):
-        columns = [clean_text(" ".join(cell.split()), 40) for cell in self.columns]
+        # 同 Section.clean：保存路径只截断不拒绝——表头/格超长或多写格子都不应毁掉已生成已计费的结果。
+        columns = [clean_text(" ".join(cell.split())[:40], 40, False) for cell in self.columns]
         rows = []
+        # 多写的格子直接丢弃；短行补空格子。
         for row in self.rows:
-            if len(row) > len(columns):
-                fail(422, "表格某一行的格数多于表头")
-            # 短行补空格子，避免整份文稿因一行少写一格而失败；多写的格子不截断，直接拒绝。
-            rows.append([clean_text(" ".join(cell.split()), 80, False) for cell in row] + [""] * (len(columns) - len(row)))
+            rows.append([clean_text(" ".join(cell.split())[:80], 80, False) for cell in row[:len(columns)]]
+                        + [""] * max(0, len(columns) - len(row)))
         return Table(columns=columns, rows=rows)
 
 
@@ -77,11 +77,14 @@ class Section(BaseModel):
     table: Table | None = None
 
     def clean(self):
-        if not self.points and not self.table:
+        # 模型偶发把单条要点写出 600 字以上或留空白要点：截断/剔除后照常保存，
+        # 不要用 422 拒绝整轮——那会毁掉已生成已计费的结果（2026-11-21 线上工单）。
+        points = [value for value in (clean_text(str(point)[:600], 600, False) for point in self.points) if value]
+        if not points and not self.table:
             fail(422, "每一节至少需要一条要点或一张表格")
-        return Section(heading=clean_text(self.heading, 80), points=[clean_text(point, 600) for point in self.points],
-                       conclusion=clean_text(" ".join(self.conclusion.split()), 200, False),
-                       notes=clean_text(self.notes, 2000, False),
+        return Section(heading=clean_text(str(self.heading or "")[:80], 80, False) or "本节要点", points=points,
+                       conclusion=clean_text(" ".join(str(self.conclusion or "").split())[:200], 200, False),
+                       notes=clean_text(str(self.notes or "")[:2000], 2000, False),
                        table=self.table.clean() if self.table else None)
 
 
@@ -91,14 +94,16 @@ class Plan(BaseModel):
     sections: list[Section] = Field(min_length=1, max_length=19)
 
     def clean(self):
-        return Plan(title=clean_text(self.title, 110), subtitle=clean_text(self.subtitle, 140, False),
+        return Plan(title=clean_text(str(self.title or "")[:110], 110, False) or "办公文稿",
+                    subtitle=clean_text(str(self.subtitle or "")[:140], 140, False),
                     sections=[part.clean() for part in self.sections])
 
 
 def clean_text(text, limit, required=True):
     value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", "", text).strip()
     if len(value) > limit or required and not value:
-        fail(422, "请检查标题和段落长度")
+        # 带上上限与实际长度，任何残余命中可从报错直接定位是哪一条限制。
+        fail(422, f"请检查标题和段落长度（单条上限 {limit} 字，本次 {len(value)} 字）")
     return value
 
 
@@ -477,8 +482,8 @@ def paginate_deck(plan):
             pages.append(Section(heading=part.heading + suffix if len(part.heading) < 77 else part.heading,
                                  points=chunk, conclusion=part.conclusion if index == len(chunks) - 1 else "",
                                  notes=part.notes if index == 0 else "", table=part.table if index == 0 else None))
-    if len(pages) > 30:
-        fail(422, "演示内容超过 30 页，请精简段落后再生成")
+    if len(pages) > 50:
+        fail(422, "演示内容超过 50 页，请精简段落后再生成")
     return pages
 
 
@@ -1483,7 +1488,8 @@ def _fit_free_text_size(text: str, width: float, height: float, target_size: flo
 
 
 def _add_free_text(slide, el: SlideElement, default_font: str, default_color: str):
-    raw = clean_text(el.text or "", 2000, False)
+    # 渲染时截断超长文本框：保存路径不得因长度拒绝整轮（2026-11-21 线上工单）。
+    raw = clean_text(str(el.text or "")[:2000], 2000, False)
     if not raw:
         return
     shape = slide.shapes.add_textbox(Inches(el.x), Inches(el.y), Inches(el.w), Inches(el.h))
@@ -1520,13 +1526,14 @@ def _add_free_text(slide, el: SlideElement, default_font: str, default_color: st
 
 
 def _add_free_table(slide, el: SlideElement, palette: dict[str, str], default_font: str):
-    cols = [clean_text(" ".join(str(c).split()), 60, False) for c in (el.columns or [])]
+    # 渲染时截断超长表头/格：保存路径不得因长度拒绝整轮（2026-11-21 线上工单）。
+    cols = [clean_text(" ".join(str(c).split())[:60], 60, False) for c in (el.columns or [])]
     if len(cols) < 1:
         return
     rows_raw = el.rows or []
     rows = []
     for row in rows_raw[:14]:
-        cleaned = [clean_text(" ".join(str(cell).split()), 120, False) for cell in row[:len(cols)]]
+        cleaned = [clean_text(" ".join(str(cell).split())[:120], 120, False) for cell in row[:len(cols)]]
         cleaned += [""] * (len(cols) - len(cleaned))
         rows.append(cleaned)
     all_rows = [cols, *rows]
@@ -1718,7 +1725,8 @@ def render_freeform_pptx(deck: DeckSpec, image_blobs: list[bytes] | tuple[bytes,
                 ), default_font, foot_text)
 
         if slide_spec.notes:
-            slide.notes_slide.notes_text_frame.text = clean_text(slide_spec.notes, 2000, False)
+            # 渲染时截断超长演讲备注：保存路径不得因长度拒绝整轮（2026-11-21 线上工单，checkpoint 重放被此点卡死）。
+            slide.notes_slide.notes_text_frame.text = clean_text(str(slide_spec.notes or "")[:2000], 2000, False)
 
     prs.core_properties.title = deck.title
     prs.core_properties.author = "穹驭办公"

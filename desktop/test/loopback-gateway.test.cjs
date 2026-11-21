@@ -216,3 +216,30 @@ test("流水线网关在 429 后阻止后续上游请求并保留 quota_error", 
   assert.equal(calls, 1);
   assert.equal(gateway.quota_error.code, "quota_exhausted");
 });
+
+test("回环网关支持超过 3MB 的长篇 SSE 流式输出并透传 keepalive 心跳且准确统计 usage", async (t) => {
+  const upstream = await startServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+    response.write(": keepalive\n\n");
+    const chunkText = "A".repeat(4000);
+    // 约 4.2 MB SSE 流（覆盖线上 32 页 PPT 3.99MB/4.14MB 实测场景，旧 3MB 上限会触发 UND_ERR_SOCKET）
+    for (let i = 0; i < 1050; i += 1) {
+      response.write(`data: ${JSON.stringify({ id: "cmpl-big", choices: [{ index: 0, delta: { content: chunkText }, finish_reason: null }] })}\n\n`);
+    }
+    response.write(`data: ${JSON.stringify({ id: "cmpl-big", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 12000, completion_tokens: 20000, total_tokens: 32000 } })}\n\n`);
+    response.write("data: [DONE]\n\n");
+    response.end();
+  });
+  const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
+  t.after(async () => { await gateway.close(); await upstream.close(); });
+
+  const response = await post(gateway, validRequest());
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.ok(body.length > 4 * 1024 * 1024, `expected >4MB SSE body, got ${body.length}`);
+  assert.ok(body.includes(": keepalive"));
+  assert.ok(body.includes("data: [DONE]"));
+  assert.deepEqual(gateway.usage, { prompt_tokens: 12000, completion_tokens: 20000, total_tokens: 32000 });
+  assert.deepEqual(gateway.finish_reasons, ["stop"]);
+  assert.equal(gateway.truncated, false);
+});

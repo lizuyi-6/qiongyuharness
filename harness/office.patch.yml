@@ -35,8 +35,11 @@
             baseURL: !!js process.env.QO_RUNTIME_URL
             models:
               - id: !!js process.env.QO_RUNTIME_MODEL
-                contextWindow: 128000
-                # 仅供 DSH 内部预算（compaction 预留）；发给上游的 max_tokens 由桌面回环网关按模型官方上限改写。
+                # 按 glm-5.3 官方 1M 上下文配置：pi-ai 以此值做「silent overflow」判定与 compaction 预算，
+                # 写小会把上游已成功返回的大输入响应误判为 context overflow（2026-11-21 线上工单根因）。
+                # 真实上限仍由上游强制；发给上游的 max_tokens 由桌面回环网关按模型官方上限改写。
+                contextWindow: 1000000
+                # 仅供 DSH 内部预算（compaction 预留）。
                 maxTokens: 3500
                 reasoningEfforts: false
             compat:

@@ -292,3 +292,105 @@ test("buildResumeContext formats images, draft, evidence and thinking cleanly", 
   assert.match(ctx, /已定好配色 #FF3763/);
   assert.ok(summarizeCheckpoint({ stage: "complete", completedResult: { text: "{}" } }).hasCompletedResult);
 });
+
+test("invalidateResult keeps billed images and search while dropping the result payload", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "qo-cp-inv-"));
+  try {
+    const store = createCheckpointStore({ baseDir: dir });
+    const origin = "https://office.aethernettech.dev";
+    const convId = "conv-inv";
+    await store.save(origin, convId, {
+      runId: "run-inv",
+      userId: "user-a",
+      stage: "complete",
+      completedResult: { text: "{\"reply\":\"被判死的结果\"}" },
+      finalText: "{\"reply\":\"被判死的结果\"}",
+      brief: { tier: "standard", goal: "介绍" },
+      checkedDeck: { title: "草稿", slides: [{ title: "封面", elements: [] }] },
+      thinkingTail: "第 9 页挪一下",
+      stages: [{ role: "understand", model: "m", outcome: "ok", usage: {} }],
+      issues: ["旧问题"],
+      steps: ["读取资料"],
+      images: [{ prompt: "封面", png_base64: "BILLED_IMAGE_BLOB" }],
+      searchState: { searchCount: 3, evidenceByUrl: [{ url: "https://e.example", title: "权威", excerpt: "x" }] }
+    });
+    assert.equal(await store.invalidateResult(origin, convId), true);
+    const data = await store.load(origin, convId);
+    assert.equal(data.completedResult, undefined);
+    assert.equal(data.finalText, undefined);
+    assert.equal(data.brief, undefined);
+    assert.equal(data.checkedDeck, undefined);
+    assert.equal(data.thinkingTail, undefined);
+    assert.equal(data.stage, "");
+    assert.deepEqual(data.stages, []);
+    // 已计费的配图与联网搜索记录保留。
+    assert.equal(data.images.length, 1);
+    assert.equal(data.searchState.searchCount, 3);
+    assert.deepEqual(data.steps, ["读取资料"]);
+    const summary = await store.summary(origin, convId, { userId: "user-a" });
+    assert.equal(summary.hasCompletedResult, false);
+    assert.equal(summary.imageCount, 1);
+    assert.equal(summary.searchCount, 3);
+    assert.equal(await store.invalidateResult(origin, "conv-none"), false);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("invalidateCheckpoint forces regeneration instead of replaying the rejected result", async () => {
+  const userData = await fs.mkdtemp(path.join(os.tmpdir(), "qo-agent-inv-"));
+  const origin = "https://office.aethernettech.dev";
+  const convId = "conv-agent-inv";
+  let dshRuns = 0;
+  try {
+    const agent = createDesktopAgent({
+      app: { isPackaged: false, getPath: () => userData },
+      getWindow: () => null,
+      getOrigin: () => origin,
+      dependencies: {
+        freshModels: async () => ["step-5-preview", "gpt-image-2.6-flare"],
+        getCredential: async () => ({ credential: { baseUrl: "https://api.example.com/v1", apiKey: "k-test" } }),
+        fetchSessionJson: async () => ({ configured: false }),
+        createLoopbackGateway: async () => ({
+          url: "http://127.0.0.1:1", key: "gw-key", usage: { total_tokens: 7 },
+          max_tokens_clamped: [], finish_reasons: ["stop"], truncated: false, close: async () => {}
+        }),
+        nodeExecutable: () => ({ executable: process.execPath, extraEnv: {} }),
+        runDsh: async () => {
+          dshRuns += 1;
+          return JSON.stringify({ action: "reply", reply: "全新生成的结果" });
+        }
+      }
+    });
+    const job = (runId, extra = {}) => ({
+      conversation_id: convId, run_id: runId, user_id: "u-1",
+      system: "sys", prompt: "做一份 PPT", model: "step-5-preview",
+      checkpoint_meta: { message: "做一份 PPT", mode: "pptx", material_ids: [] }, ...extra
+    });
+    const first = await agent.runAgent(job("run-inv-1"));
+    assert.equal(dshRuns, 1);
+    const cp = await agent.getCheckpoint(convId, "u-1");
+    assert.equal(cp.stage, "complete");
+    assert.equal(cp.hasCompletedResult, true);
+
+    // 保存被拒前：断点续跑 0 次模型调用，原样重放。
+    const replay = await agent.runAgent(job("run-inv-2", { resume: true }));
+    assert.equal(dshRuns, 1);
+    assert.equal(replay.resumedFromComplete, true);
+
+    // 前端收到 /complete 4xx 后作废结果载荷。
+    assert.equal(await agent.invalidateCheckpoint(convId), true);
+    const invalidated = await agent.getCheckpoint(convId, "u-1");
+    assert.equal(invalidated.hasCompletedResult, false);
+
+    // 再点续跑：重新生成而不是重放同一份被判死的结果。
+    const regenerated = await agent.runAgent(job("run-inv-3", { resume: true }));
+    assert.equal(dshRuns, 2);
+    assert.equal(regenerated.resumedFromComplete, undefined);
+    assert.match(regenerated.text, /全新生成的结果/);
+
+    assert.equal(await agent.invalidateCheckpoint("conv-none"), false);
+  } finally {
+    await fs.rm(userData, { recursive: true, force: true });
+  }
+});

@@ -2784,6 +2784,37 @@ export async function runDesktopAgent(job, onStep = () => {}, afterRun = (result
   }
 }
 
+// 保存被服务端 4xx 拒绝（内容校验不过）时才作废断点结果：401（登录失效）与 409（本轮已结束）不作废。
+export function shouldInvalidateTurnCheckpoint(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500 && status !== 401 && status !== 409;
+}
+
+// /complete 接口返回明确 4xx/502 时，服务端已同步把本轮标记为 failed；前端无需再补发 /fail 触发无意义的 409。
+export function shouldReportTurnFail(phase, status) {
+  if (phase !== "complete") return true;
+  if (!Number.isInteger(status) || status === 0) return true;
+  return status === 408 || status === 503 || status === 504;
+}
+
+// 已计费资产的保存不允许一次网络抖动毁掉：网络层失败（status=0）或瞬时错误自动重试。
+// 慢速上行的大体积 base64 给足超时；重试引擎在这里统一做，api() 单次直发。
+export async function saveBilledAsset(url, payload, { attempts = 3, backoffMs = 1200, timeoutMs = 180_000, retryServerErrors = true } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await api(url, { method: "POST", body: payload, timeoutMs });
+    } catch (error) {
+      lastError = error;
+      const status = Number.isInteger(error?.status) ? error.status : 0;
+      const transientHttp = status === 408 || status === 503 || status === 504;
+      const retryable = (status === 0 || transientHttp || (retryServerErrors && (error?.transient === true || status >= 500))) && attempt < attempts;
+      if (!retryable) throw error;
+      await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+    }
+  }
+  throw lastError;
+}
+
 async function executeDesktopTurn(workspace, live, requestId, payload, { allowImageTool = true, resume = false } = {}) {
   const desktop = window.officeDesktop;
   if (typeof desktop?.runAgent !== "function") throw new Error("请在桌面客户端中使用 AI 办理");
@@ -2836,9 +2867,12 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
       let imageSaveFailures = 0;
       setLiveStatus(live, "正在保存结果…", { removeCancel: true, canvasLabel: "正在保存并同步画布…" });
       // 图片已在 sub2api 计费：即使用户已点停止，也先把它们存进本轮记录，避免已付费的图片丢失。
+      // 每张带幂等 image_id：上行被掐后的重试由服务端按它去重，不会重复入库。
       for (const image of images) {
+        const imageId = uuid();
         try {
-          await post(base + "/" + encodeURIComponent(prepared.run_id) + "/images", image);
+          await saveBilledAsset(base + "/" + encodeURIComponent(prepared.run_id) + "/images",
+            { ...image, image_id: imageId }, { attempts: 3, timeoutMs: 120_000 });
         } catch {
           imageSaveFailures += 1;
         }
@@ -2848,7 +2882,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
         throw new Error(images.length ? `已停止生成（本轮已生成并计费 ${images.length} 张图片，${saved} 张已保存在本轮记录中${imageSaveFailures ? `，${imageSaveFailures} 张保存失败` : ""}）` : "已停止生成");
       }
       live.phase = "complete";
-      const completed = await post(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
+      const completed = await saveBilledAsset(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
         text: result.text,
         usage: {
           ...(result.usage || {}), max_tokens_clamped: result.max_tokens_clamped,
@@ -2856,7 +2890,7 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
         },
         model: result.model || model,
         ...(result.pipeline ? { pipeline: result.pipeline } : {})
-      });
+      }, { attempts: 3, timeoutMs: 120_000, retryServerErrors: false });
       await desktop.clearCheckpoint?.(live.threadId).catch(() => {});
       if (imageSaveFailures) completed.image_save_failures = imageSaveFailures;
       return completed;
@@ -2873,7 +2907,12 @@ async function executeDesktopTurn(workspace, live, requestId, payload, { allowIm
       error = new Error(cleanErrorMessage(error, "桌面执行失败"));
     }
     error.retryAsNew = true;
-    if (prepared?.run_id) {
+    // 结果被服务端 4xx 拒绝时作废断点里的结果载荷，下次续跑重新生成而不是原样重放被判死的内容；
+    // 已计费的配图与联网搜索记录保留（根治断点重放死循环，2026-11-21 线上工单）。
+    if (shouldInvalidateTurnCheckpoint(error.status) && live.threadId) {
+      try { void desktop.invalidateCheckpoint?.(live.threadId).catch(() => {}); } catch {}
+    }
+    if (prepared?.run_id && shouldReportTurnFail(live.phase, error.status)) {
       try {
         await post(base + "/" + encodeURIComponent(prepared.run_id) + "/fail", {
           message: error.message || "桌面执行失败",
@@ -3022,10 +3061,17 @@ export async function generateImageFromComposer(triggerButton, rerender) {
     generated = await window.officeDesktop.generateImage({ prompt, model, size, quality });
     live.phase = "complete";
     setLiveStatus(live, "正在保存图片…", { canvasLabel: "正在保存并同步到画布…" });
-    const completed = await post(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
-      png_base64: generated.png_base64, width: generated.width, height: generated.height,
-      model: generated.model, size: generated.size, quality: generated.quality, usage: generated.usage || {}
-    });
+    // 上行慢速线路保存大图可能被掐：带重试保存；首次已落库但响应丢失时，重试会得到 409，按已保存处理。
+    let completed;
+    try {
+      completed = await saveBilledAsset(base + "/" + encodeURIComponent(prepared.run_id) + "/complete", {
+        png_base64: generated.png_base64, width: generated.width, height: generated.height,
+        model: generated.model, size: generated.size, quality: generated.quality, usage: generated.usage || {}
+      });
+    } catch (error) {
+      if (error?.status !== 409) throw error;
+      completed = { images: [] };
+    }
     saved = true;
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);

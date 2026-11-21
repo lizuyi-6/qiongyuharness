@@ -299,6 +299,12 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
     return checkpointStore.clear(origin, String(conversationId));
   }
 
+  async function invalidateCheckpoint(conversationId) {
+    const origin = getOrigin();
+    if (!origin || !conversationId) return false;
+    return checkpointStore.invalidateResult(origin, String(conversationId));
+  }
+
   function cleanGeneratedTitle(raw) {
     if (typeof raw !== "string") return "";
     let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
@@ -511,13 +517,15 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
       completedResult: null
     };
     const initialUploadedImageCount = checkpointState.images.length;
+    const priorSteps = [...checkpointState.steps];
     let latestThinkingTail = checkpointState.thinkingTail;
 
     const persistCheckpoint = (patch = {}) => {
       if (!origin || !conversationId) return Promise.resolve(null);
       Object.assign(checkpointState, patch);
       if (recordedSteps.length) {
-        const merged = [...checkpointState.steps];
+        // 基于本轮启动前的历史步骤重建，避免每次 persistCheckpoint 把整个 recordedSteps 重复叠加 3~N 遍。
+        const merged = [...priorSteps];
         for (const s of recordedSteps) {
           if (merged[merged.length - 1] !== s) merged.push(s);
         }
@@ -999,6 +1007,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, logger
     clearCheckpoint,
     clearCredentialsForOrigin,
     getCheckpoint,
+    invalidateCheckpoint,
     models,
     usage,
     generateImage,

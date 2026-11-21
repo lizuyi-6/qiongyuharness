@@ -196,6 +196,8 @@ class TurnImage(BaseModel):
     quality: Literal["low", "medium", "high"]
     prompt: str = Field(min_length=1, max_length=4000)
     usage: dict[str, Any] = Field(default_factory=dict)
+    # 客户端为每张已计费配图生成的幂等 ID：保存重试时服务端按它去重，避免重复入库。
+    image_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
     @field_validator("model")
     @classmethod
@@ -404,7 +406,8 @@ def _clean_session_title(raw: Any) -> str:
     text = re.sub(r"^(?:标题|会话标题|题目)\s*[:：]\s*", "", text).strip()
     text = text.strip(" \"'“”‘’《》【】[]「」()（）。，,、:：;；!！?？")
     text = " ".join(text.split())
-    return clean_text(text, 28, False)
+    # 自动命名只截断不拒绝：文稿标题（合法上限 110 字）超过 28 字时绝不能触发 422 回滚整轮已生成结果（2026-11-21 线上工单）。
+    return clean_text(text[:28], 28, False)
 
 
 def _should_auto_replace_title(current_title: str, first_message: str = "") -> bool:
@@ -583,6 +586,77 @@ def demo_decision(message, mode, task, sources, recent, latest):
     return Decision(action="reply", reply="\n\n".join(lines))
 
 
+PLAN_PROMPT_BUDGET = 60_000
+_DIGEST_NOTE = ("原稿过大，以下为结构摘要：保留每页标题、演讲备注与文字要点，省略样式与坐标；"
+                "如需精确修改某一页，请在画布中选中该页后使用局部重绘。")
+
+
+def _digest_plan(plan):
+    """「最近文稿」过大时先分析压缩再注入，避免整套 deck JSON 撑爆模型上下文。"""
+    if not isinstance(plan, dict) or len(pack(plan)) <= PLAN_PROMPT_BUDGET:
+        return plan
+    out: dict[str, Any] = {"压缩说明": _DIGEST_NOTE}
+    for key in ("title", "subtitle", "design"):
+        if key in plan:
+            out[key] = plan[key]
+    parts, kind = [], None
+
+    def budget_left():
+        return PLAN_PROMPT_BUDGET - len(pack(out)) - len(pack(parts))
+
+    slides = plan.get("slides")
+    if isinstance(slides, list):
+        kind = "slides"
+        for index, slide in enumerate(slides, 1):
+            page: dict[str, Any] = {"页": index, "标题": str(slide.get("title") or "")[:80] if isinstance(slide, dict) else ""}
+            if isinstance(slide, dict):
+                if slide.get("bg_image") is not None:
+                    page["bg_image"] = slide["bg_image"]
+                notes = str(slide.get("notes") or "")
+                if notes:
+                    page["备注"] = notes[:300]
+                texts = []
+                for element in slide.get("elements") or []:
+                    if isinstance(element, dict):
+                        if isinstance(element.get("text"), str) and element["text"].strip():
+                            texts.append(element["text"][:120])
+                        elif isinstance(element.get("chart"), dict):
+                            chart = element["chart"]
+                            texts.append(f"[图表 {chart.get('chart_kind', '')} {chart.get('title', '')}]"[:120])
+                        elif element.get("image_index"):
+                            texts.append(f"[配图 {element['image_index']}]")
+                    if len(texts) >= 14:
+                        break
+                if texts:
+                    page["文字要点"] = texts
+            if budget_left() - len(pack(page)) < 0:
+                parts.append({"未纳入摘要": f"其余 {len(slides) - index + 1} 页过大，请在画布中逐页查看"})
+                break
+            parts.append(page)
+    sections = plan.get("sections")
+    if kind is None and isinstance(sections, list):
+        kind = "sections"
+        for index, section in enumerate(sections, 1):
+            part: dict[str, Any] = {"节": str(section.get("heading") or "")[:80] if isinstance(section, dict) else ""}
+            if isinstance(section, dict):
+                points = [str(point)[:160] for point in (section.get("points") or []) if str(point).strip()][:8]
+                if points:
+                    part["要点"] = points
+                if section.get("conclusion"):
+                    part["结论"] = str(section["conclusion"])[:160]
+                if isinstance(section.get("table"), dict):
+                    table = section["table"]
+                    part["表格"] = {"列": table.get("columns"), "行数": len(table.get("rows") or [])}
+            if budget_left() - len(pack(part)) < 0:
+                parts.append({"未纳入摘要": f"其余 {len(sections) - index + 1} 节过大，未注入"})
+                break
+            parts.append(part)
+    if kind is None:
+        return {"压缩说明": _DIGEST_NOTE, "原文截断": pack(plan)[:PLAN_PROMPT_BUDGET]}
+    out[kind] = parts
+    return out
+
+
 def build_turn_request(body, task, sources, recent, latest, project, scope, assignment):
     if scope and scope.get("mode") == "freeform":
         web_search = search.search_status()
@@ -679,7 +753,7 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
         "近期会话": recent,
         "当前任务": task_fields,
         "参考资料": sources,
-        "最近文稿": {key: latest[key] for key in ("plan", "kind")} if latest else None,
+        "最近文稿": {"plan": _digest_plan(plan), "kind": latest_kind} if latest else None,
         "输出偏好": body.mode,
     }
     rules = prompting.checklist(operation, genre)
@@ -822,6 +896,8 @@ def parse_turn_response(text, kind):
         return Decision(action="export", reply=reply, session_title=stitle, kind="pptx", deck=deck)
     if isinstance(data.get("reply"), str) and len(data["reply"]) > 6500:
         data["reply"] = data["reply"][:6500]
+    if "session_title" in data:
+        data["session_title"] = _clean_session_title(data.get("session_title")) or None
     if not data.get("action"):
         if data.get("plan") or data.get("deck"):
             data["action"] = "export"
@@ -904,7 +980,7 @@ def fail_turn(run, user, assignment, message, steps=None):
             for step in steps:
                 if not isinstance(step, str):
                     continue
-                cleaned_step = clean_text(step, 240)
+                cleaned_step = clean_text(step[:240], 240, False)
                 if cleaned_step and (not existing or existing[-1] != cleaned_step):
                     existing.append(cleaned_step)
             result["steps"] = existing[-80:]
@@ -1366,7 +1442,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         steps.append("本机办公客户端返回办公方案" if expected_engine == "desktop" else
                      "运行本地办公演示" if expected_engine == "demo" else
                      "DeepSeek Harness 返回办公方案" if expected_engine == "dsh" else "公司模型网关返回办公方案")
-        result.update(reply=clean_text(decision.reply, 6500), steps=steps)
+        reply_text = clean_text(str(decision.reply or "")[:6500], 6500, False) or "已完成办理"
+        result.update(reply=reply_text, steps=steps)
         if output_telemetry:
             result["output_telemetry"] = output_telemetry
         if payload.pipeline is not None:
@@ -1528,7 +1605,7 @@ def fail_image_route(key: str, run: str, payload: ImageFailure, user: User):
             fail(404, "生图执行不存在")
         if turn["status"] != "running" or run_row["status"] != "running":
             fail(409, "本轮生图已结束")
-    if not fail_turn(run, user, assignment, clean_text(payload.message, 300)):
+    if not fail_turn(run, user, assignment, clean_text(str(payload.message or "")[:300], 300, False) or "生图失败"):
         fail(409, "本轮生图已结束")
     return {"ok": True}
 
@@ -1551,12 +1628,19 @@ def store_turn_image_route(key: str, run: str, payload: TurnImage, user: User):
             fail(409, "本轮执行已结束")
         result = unpack(turn["result"] or "{}")
         images = result.setdefault("images", [])
+        # 幂等保存：同一 image_id 重复提交（网络抖动后的客户端重试）直接返回首次入库的结果，不重复计张。
+        if payload.image_id:
+            for existing in images:
+                if isinstance(existing, dict) and existing.get("image_id") == payload.image_id:
+                    return existing
         index = len(images) + 1
         file_id = add_file(db, user["id"], safe_name(f"AI配图-{index}") + ".png", data, "png", "image",
                            assignment=assignment, run=run)
         image = {"file": public_file(db, file_id), "prompt": payload.prompt, "model": payload.model,
                  "size": payload.size, "quality": payload.quality, "width": payload.width,
                  "height": payload.height, "source": "ai", "usage": usage}
+        if payload.image_id:
+            image["image_id"] = payload.image_id
         images.append(image)
         changed = db.execute("UPDATE office_turns SET result=? WHERE id=? AND status='running'",
                              (pack(result), run)).rowcount
@@ -1612,7 +1696,7 @@ def fail_turn_route(key: str, run: str, payload: TurnFailure, user: User):
             fail(404, "本轮执行不存在")
         if turn["status"] != "running" or run_row["status"] != "running":
             fail(409, "本轮执行已结束")
-    if not fail_turn(run, user, assignment, clean_text(payload.message, 1000), steps=payload.steps):
+    if not fail_turn(run, user, assignment, clean_text(str(payload.message or "")[:1000], 1000, False) or "桌面执行失败", steps=payload.steps):
         fail(409, "本轮执行已结束")
     return {"ok": True}
 

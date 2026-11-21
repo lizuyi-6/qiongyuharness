@@ -310,6 +310,11 @@ ipcMain.handle("qo:clear-checkpoint", async (event, conversationId) => {
   return desktopAgent.clearCheckpoint(conversationId);
 });
 
+ipcMain.handle("qo:invalidate-checkpoint", async (event, conversationId) => {
+  if (!trusted(event)) throw new Error("页面无权作废任务断点");
+  return desktopAgent.invalidateCheckpoint(conversationId);
+});
+
 ipcMain.handle("qo:collect-logs", async (event, options = {}) => {
   if (!trusted(event)) throw new Error("页面无权采集客户端日志");
   const conversationId = typeof options?.conversationId === "string" ? options.conversationId : "";
@@ -437,6 +442,8 @@ app.whenReady().then(() => {
   });
   content.on("console-message", (_event, level, message, line, sourceId) => {
     if (level >= 2) {
+      // Cloudflare 代理自动注入的统计脚本被严格 CSP 拦截属于预期行为，不记作客户端错误噪音。
+      if (typeof message === "string" && message.includes("static.cloudflareinsights.com/beacon.min.js")) return;
       desktopLogger.log(level >= 3 ? "ERROR" : "WARN", "renderer.console", message, { source: sourceId, line });
     }
   });

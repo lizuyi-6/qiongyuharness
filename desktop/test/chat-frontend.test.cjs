@@ -75,6 +75,82 @@ test("AI 自行生图缺省开启，且按账号分开记忆", async () => {
   assert.doesNotThrow(() => chat.saveImageAutoPreference(false));
 });
 
+test("保存被 4xx 拒绝时判定作废断点结果，401/409 与 5xx 不作废", async () => {
+  const { chat } = await modules;
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(422), true, "内容校验 422 必须作废重放源");
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(400), true);
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(413), true);
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(401), false, "登录失效不作废");
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(409), false, "本轮已结束不作废");
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(500), false, "服务端错误保留断点");
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(502), false);
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(undefined), false);
+  assert.equal(chat.shouldInvalidateTurnCheckpoint(0), false);
+  assert.equal(chat.shouldInvalidateTurnCheckpoint("422"), false, "非整数状态码不作废");
+
+  assert.equal(chat.shouldReportTurnFail("agent", 422), true, "非 complete 阶段失败需上报 /fail");
+  assert.equal(chat.shouldReportTurnFail("complete", 422), false, "complete 422 已由服务端落盘 failed，不再多余 /fail 触发 409");
+  assert.equal(chat.shouldReportTurnFail("complete", 502), false, "complete 502 已由服务端落盘 failed，不再多余 /fail 触发 409");
+  assert.equal(chat.shouldReportTurnFail("complete", 0), true, "complete 网络断连需 /fail 兜底");
+  assert.equal(chat.shouldReportTurnFail("complete", 504), true, "complete 504 未到达服务端需 /fail 兜底");
+});
+
+test("saveBilledAsset 在 retryServerErrors=false 时不对 502 重试", async (t) => {
+  const { chat } = await modules;
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  let count = 0;
+  globalThis.fetch = async () => {
+    count += 1;
+    return { ok: false, status: 502, json: async () => ({ detail: "模型输出不可读" }) };
+  };
+  await assert.rejects(
+    chat.saveBilledAsset("/c", {}, { attempts: 3, backoffMs: 1, retryServerErrors: false }),
+    (error) => error.status === 502
+  );
+  assert.equal(count, 1);
+});
+
+test("saveBilledAsset 网络层失败自动重试，4xx 不重试，重试耗尽后如实抛出", async (t) => {
+  const { chat } = await modules;
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  await t.test("首次网络失败后第二次成功", async () => {
+    const calls = [];
+    globalThis.fetch = async () => {
+      calls.push(1);
+      if (calls.length === 1) throw new TypeError("Failed to fetch");
+      return { ok: true, json: async () => ({ images: [] }) };
+    };
+    const result = await chat.saveBilledAsset("/conversations/c/complete", { a: 1 }, { backoffMs: 1 });
+    assert.deepEqual(result, { images: [] });
+    assert.equal(calls.length, 2);
+  });
+
+  await t.test("422 立即抛出不重试", async () => {
+    let count = 0;
+    globalThis.fetch = async () => {
+      count += 1;
+      return { ok: false, status: 422, json: async () => ({ detail: "内容校验未通过" }) };
+    };
+    await assert.rejects(chat.saveBilledAsset("/c", {}, { backoffMs: 1 }), (error) => error.status === 422);
+    assert.equal(count, 1);
+  });
+
+  await t.test("连续网络失败重试耗尽后抛出网络错误", async () => {
+    let count = 0;
+    globalThis.fetch = async () => {
+      count += 1;
+      throw new TypeError("Failed to fetch");
+    };
+    await assert.rejects(chat.saveBilledAsset("/c", {}, { attempts: 3, backoffMs: 1 }),
+      (error) => error.status === 0 && error.transient === true);
+    assert.equal(count, 3);
+  });
+});
+
 test("复制回复：clipboard 被拒时改用 execCommand，并按其返回值提示", async (t) => {
   const { chat, ui } = await modules;
   ui.state.chatWorkspace = { session: { turns: [{ reply: "第一段回复" }] } };

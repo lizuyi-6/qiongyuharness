@@ -1,6 +1,8 @@
+import asyncio
 import json
 import os
 import re
+from contextlib import suppress
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlsplit
 
@@ -34,6 +36,7 @@ PROXY_FORWARD_RESP_HEADERS = (
     "x-ratelimit-reset-tokens",
 )
 PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=2700.0, write=120.0, pool=15.0)
+SSE_KEEPALIVE_SECONDS = 15.0
 
 
 def settings():
@@ -300,12 +303,44 @@ async def _proxy_v1(request: Request, endpoint: str):
         if val is not None:
             resp_headers[name] = val
 
+    is_sse = "text/event-stream" in (upstream_resp.headers.get("content-type") or "").lower()
+
     async def stream_body():
+        if not is_sse:
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+            except httpx.HTTPError:
+                return
+            finally:
+                await upstream_resp.aclose()
+                await client.aclose()
+            return
+
+        # SSE 流式透传：每 SSE_KEEPALIVE_SECONDS 秒无上游字节时下发注释心跳，
+        # 防止模型深度思考静默期超过 Cloudflare 100 秒空闲超时被中途断连。
+        iterator = upstream_resp.aiter_bytes().__aiter__()
+        pending = asyncio.create_task(anext(iterator))
         try:
-            async for chunk in upstream_resp.aiter_bytes():
+            while True:
+                done, _ = await asyncio.wait({pending}, timeout=SSE_KEEPALIVE_SECONDS)
+                if not done:
+                    yield b": keepalive\n\n"
+                    continue
+                try:
+                    chunk = pending.result()
+                except (StopAsyncIteration, httpx.HTTPError):
+                    pending = None
+                    break
                 if chunk:
                     yield chunk
+                pending = asyncio.create_task(anext(iterator))
         finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                with suppress(BaseException):
+                    await pending
             await upstream_resp.aclose()
             await client.aclose()
 

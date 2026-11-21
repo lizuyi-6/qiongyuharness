@@ -680,6 +680,181 @@ class DesktopTurnTest(unittest.TestCase):
             f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/fail", json={"message": "cleanup"})
         self.assertEqual(failed.status_code, 200, failed.text)
 
+    def test_oversized_recent_deck_is_analyzed_before_injection(self):
+        # 线上工单根因：整套自由画布 deck（数百 KB）原样注入「最近文稿」撑爆模型上下文。
+        key = self.conversation()
+        first = self.prepare(key)
+        slides = []
+        for page in range(1, 31):
+            slides.append({"title": f"第{page}页 议题", "notes": "演讲备注" * 40,
+                           "elements": [{"type": "text", "x": 0.7, "y": 0.5 + index * 0.32, "w": 11.9, "h": 0.28,
+                                         "size": 14, "color": "#333333",
+                                         "text": f"第{page}页要点{index} " + "内容" * 50}
+                                        for index in range(20)]})
+        deck = {"title": "巨幅演示", "subtitle": "上下文压力测试",
+                "design": {"palette": {"bg": "#ffffff"}, "font": "Microsoft YaHei"}, "slides": slides}
+        completed = self.complete(key, first, text=json.dumps(
+            {"action": "export", "reply": "已生成巨幅演示", "kind": "pptx", "deck": deck}, ensure_ascii=False))
+        self.assertEqual(completed.status_code, 200, completed.text)
+        second = self.prepare(key, message="修复这一版：加上图表")
+        self.assertLess(len(second["prompt"]), 90_000, "巨幅 deck 注入前必须先压缩为结构摘要")
+        self.assertIn("压缩说明", second["prompt"])
+        self.assertIn("第30页 议题", second["prompt"])
+        self.assertIn("第1页要点0", second["prompt"])
+        self.clients["lin"].post(f"/api/v1/conversations/{key}/turns/{second['run_id']}/fail",
+                                 json={"message": "继续下一轮"})
+        # 小文稿不压缩：完整 plan 原样注入。
+        third_prepared = self.prepare(key, message="换成两页简版")
+        third = self.complete(key, third_prepared, text=json.dumps(
+            {"action": "export", "reply": "已精简", "kind": "pptx",
+             "deck": {"title": "简版", "subtitle": "", "slides": [
+                 {"title": "唯一页", "notes": "", "elements": [
+                     {"type": "text", "x": 0.7, "y": 0.5, "w": 11.9, "h": 0.6, "size": 24,
+                      "color": "#111111", "text": "简版唯一要点"}]}]}}, ensure_ascii=False))
+        self.assertEqual(third.status_code, 200, third.text)
+        fourth = self.prepare(key, message="再改改标题")
+        self.assertNotIn("压缩说明", fourth["prompt"])
+        self.assertIn("简版", fourth["prompt"])
+
+    def test_overlong_docx_point_is_truncated_and_saved(self):
+        # 线上工单：模型单条要点超过 600 字时整轮 422，已生成已计费的结果被毁。
+        key = self.conversation()
+        response = self.clients["lin"].post(f"/api/v1/conversations/{key}/turns/prepare", json={
+            "id": str(uuid4()), "message": "把商业计划书写成 Word 文档", "mode": "docx"})
+        self.assertEqual(response.status_code, 200, response.text)
+        prepared = response.json()
+        long_point = "超长要点：" + "市场规模持续增长的原因描述 " * 50
+        self.assertGreater(len(long_point), 600)
+        text = json.dumps({"action": "export", "reply": "已生成商业计划书", "kind": "docx",
+                           "plan": {"title": "商业计划书", "subtitle": "", "sections": [
+                               {"heading": "市场分析", "points": ["标准要点", long_point, "   "]}]}},
+                          ensure_ascii=False)
+        completed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/complete",
+            json={"text": text, "usage": {"total_tokens": 9}, "model": "desktop-test-model"})
+        self.assertEqual(completed.status_code, 200, completed.text)
+        body = completed.json()
+        self.assertEqual(body["kind"], "docx")
+        from server.store import database, unpack
+        with database() as db:
+            stored = unpack(db.one("SELECT result FROM office_turns WHERE id=?",
+                                    (prepared["run_id"],))["result"])
+        points = stored["plan"]["sections"][0]["points"]
+        self.assertEqual(len(points), 2, "空白要点应被剔除而不是整轮拒绝")
+        self.assertLessEqual(len(points[1]), 600)
+        self.assertTrue(points[1].startswith("超长要点"), "截断应保留要点开头")
+
+    def test_oversized_freeform_elements_render_and_save(self):
+        # 线上工单续：自由画布超长文本框（>2000）与表格格（>60/>120）在渲染时截断，而不是 422 毁掉整轮。
+        key = self.conversation()
+        prepared = self.prepare(key, message="把商业计划书做成 PPT")
+        deck = {"title": "商业计划书 PPT", "subtitle": "", "slides": [
+            {"title": "对比页", "notes": "超长备注：" + "本页讲述的核心论据与数据来源说明 " * 120,
+             "elements": [
+                {"type": "text", "x": 0.7, "y": 0.5, "w": 11.9, "h": 1.2, "size": 14,
+                 "text": "超长文本框：" + "详细市场规模分析叙述 " * 180},
+                {"type": "table", "x": 0.7, "y": 2.0, "w": 11.9, "h": 3.0,
+                 "columns": ["超长表头" + "列名" * 30, "B", "C"],
+                 "rows": [["超长单元格" + "内容描述" * 40, "x", "y"], ["a", "b", "c"]]},
+            ]}]}
+        text = json.dumps({"action": "export", "reply": "已生成对比页", "kind": "pptx", "deck": deck},
+                          ensure_ascii=False)
+        completed = self.complete(key, prepared, text=text)
+        self.assertEqual(completed.status_code, 200, completed.text)
+        body = completed.json()
+        self.assertEqual(body["kind"], "pptx")
+        download = self.clients["lin"].get(f"/api/v1/files/{body['file']['id']}/download")
+        self.assertEqual(download.status_code, 200, download.text)
+        self.assertEqual(len(Presentation(BytesIO(download.content)).slides), 1)
+
+    def test_overlong_docx_table_cells_are_truncated_and_saved(self):
+        # 线上工单续：docx 表格超长表头（>40）/超长格（>80）/多写格子一律截断，不再 422 毁轮。
+        key = self.conversation()
+        response = self.clients["lin"].post(f"/api/v1/conversations/{key}/turns/prepare", json={
+            "id": str(uuid4()), "message": "把商业计划书写成 Word 文档", "mode": "docx"})
+        self.assertEqual(response.status_code, 200, response.text)
+        prepared = response.json()
+        text = json.dumps({"action": "export", "reply": "已生成", "kind": "docx",
+                           "plan": {"title": "商业计划书", "subtitle": "", "sections": [
+                               {"heading": "对比", "points": ["要点"], "table": {
+                                   "columns": ["超长表头" + "列名" * 30, "B"],
+                                   "rows": [["超长单元格" + "内容" * 60, "v", "多余格"], ["a", "b"]]}}]}},
+                          ensure_ascii=False)
+        completed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/complete",
+            json={"text": text, "usage": {"total_tokens": 9}, "model": "desktop-test-model"})
+        self.assertEqual(completed.status_code, 200, completed.text)
+        from server.store import database, unpack
+        with database() as db:
+            stored = unpack(db.one("SELECT result FROM office_turns WHERE id=?",
+                                    (prepared["run_id"],))["result"])
+        table = stored["plan"]["sections"][0]["table"]
+        self.assertLessEqual(len(table["columns"][0]), 40)
+        self.assertTrue(table["columns"][0].startswith("超长表头"))
+        self.assertEqual(len(table["rows"][0]), 2, "多写的格子应被丢弃而不是拒绝整轮")
+        self.assertLessEqual(len(table["rows"][0][0]), 80)
+        self.assertEqual(table["rows"][1], ["a", "b"])
+
+    def test_turn_image_upload_is_idempotent_by_image_id(self):
+        # 线上工单：上行被掐后客户端重试同一张已计费配图，服务端按 image_id 去重，不得重复入库。
+        key = self.conversation()
+        prepared = self.prepare(key)
+        run_path = f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/images"
+        payload = self.image_payload()
+        payload["image_id"] = "retry-img-001"
+        first = self.clients["lin"].post(run_path, json=payload)
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.clients["lin"].post(run_path, json=payload)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["file"]["id"], first.json()["file"]["id"], "重试应返回首次入库结果")
+        self.assertEqual(second.json()["image_id"], "retry-img-001")
+        history = self.clients["lin"].get(f"/api/v1/conversations/{key}").json()["turns"][-1]
+        self.assertEqual(len(history["images"]), 1, "同一 image_id 不得重复计张")
+
+    def test_overlong_deck_title_and_session_title_do_not_422_rollback(self):
+        # 2026-11-21 线上 Turn 79b9518e 复现：PPT 标题 35 字（合法上限 110 字）在保存末尾
+        # 自动命名会话时命中 28 字上限导致 422 事务回滚，修复后应截断到 <=28 字并正常保存。
+        key = self.conversation()
+        prepared = self.prepare(key, message="帮我生成挑战杯路演 PPT")
+        long_title = "AetherGuard 边缘智能零信任工业网络安全网关挑战杯路演演示文稿全案"
+        self.assertGreater(len(long_title), 28)
+        deck = {
+            "title": long_title,
+            "subtitle": "副标题",
+            "slides": [{"title": "封面", "elements": [{"type": "text", "x": 1, "y": 1, "w": 10, "h": 1, "text": "封面内容"}]}],
+        }
+        text = json.dumps({
+            "action": "export",
+            "reply": "已生成",
+            "session_title": long_title,
+            "kind": "pptx",
+            "deck": deck,
+        }, ensure_ascii=False)
+        completed = self.complete(key, prepared, text=text)
+        self.assertEqual(completed.status_code, 200, completed.text)
+        conv = self.clients["lin"].get(f"/api/v1/conversations/{key}").json()
+        self.assertLessEqual(len(conv["title"]), 28)
+        self.assertTrue(conv["title"].startswith("AetherGuard"))
+
+    def test_fail_turn_with_overlong_step_and_feedback_server_version(self):
+        key = self.conversation()
+        prepared = self.prepare(key)
+        long_step = "DeepSeek 搜索：" + "超长检索关键词 " * 60
+        failed = self.clients["lin"].post(
+            f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/fail",
+            json={"message": "失败原因：" + "x" * 100, "steps": [long_step]},
+        )
+        self.assertEqual(failed.status_code, 200, failed.text)
+
+        cfg = self.clients["lin"].get("/api/v1/config").json()
+        report = self.clients["lin"].post("/api/v1/feedback", json={
+            "category": "ai",
+            "title": "版本一致性校验",
+            "description": "检查 server_version 与 /api/v1/config 一致",
+        })
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertEqual(report.json()["server_version"], cfg["version"])
+
 
 if __name__ == "__main__":
     unittest.main()
