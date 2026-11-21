@@ -345,3 +345,285 @@ export function clearDrafts() {
     for (const key of Object.keys(sessionStorage)) if (key.startsWith("qo:")) sessionStorage.removeItem(key);
   } catch {}
 }
+
+/* 全站自定义下拉菜单引擎：自动接管所有原生 <select>，保持 FormData / value / change / disabled 完全兼容 */
+let customSelectInitialized = false;
+let activeSelectMenu = null;
+let activeSelectOwner = null;
+const selectTriggerMap = new WeakMap();
+const selectObserverMap = new WeakMap();
+
+function formatSelectOptionHtml(rawText) {
+  const text = String(rawText ?? "");
+  const tagged = /^\[(图片|文字|图形)\]\s*(.*)$/.exec(text);
+  if (!tagged) return `<span class="qo-select-text">${e(text)}</span>`;
+  const kindMap = { 图片: "image", 文字: "text", 图形: "shape" };
+  return `<span class="qo-opt-tag is-${kindMap[tagged[1]] || "shape"}">${e(tagged[1])}</span><span class="qo-select-text">${e(tagged[2])}</span>`;
+}
+
+export function closeCustomSelectMenu({ restoreFocus = false } = {}) {
+  const prev = activeSelectOwner;
+  if (activeSelectMenu) {
+    activeSelectMenu.remove();
+    activeSelectMenu = null;
+  }
+  if (prev) {
+    const trigger = selectTriggerMap.get(prev);
+    if (trigger) {
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.closest(".qo-select-wrap")?.classList.remove("is-open");
+      if (restoreFocus && trigger.isConnected) trigger.focus({ preventScroll: true });
+    }
+    activeSelectOwner = null;
+  }
+}
+
+function syncSelectTrigger(select) {
+  if (!select) return;
+  const trigger = selectTriggerMap.get(select);
+  if (!trigger) return;
+  const wrap = trigger.closest(".qo-select-wrap");
+  const selectedOpt = select.options?.[select.selectedIndex] || [...(select.options || [])].find((o) => o.value === select.value) || select.options?.[0];
+  const labelText = selectedOpt ? selectedOpt.textContent : "";
+  const labelNode = trigger.querySelector(".qo-select-label");
+  if (labelNode) labelNode.innerHTML = formatSelectOptionHtml(labelText);
+  trigger.disabled = Boolean(select.disabled);
+  trigger.title = labelText || "";
+  if (select.getAttribute("aria-label")) {
+    trigger.setAttribute("aria-label", select.getAttribute("aria-label"));
+  }
+  if (wrap) {
+    wrap.classList.toggle("is-disabled", Boolean(select.disabled));
+    wrap.hidden = Boolean(select.hidden);
+  }
+  if (activeSelectOwner === select && select.disabled) {
+    closeCustomSelectMenu();
+  }
+}
+
+function positionSelectMenu(menu, trigger) {
+  const rect = trigger.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const margin = 10;
+  const minW = Math.max(rect.width, 168);
+  const maxW = Math.min(Math.max(rect.width + 64, 340), vw - margin * 2);
+  menu.style.minWidth = `${Math.round(minW)}px`;
+  menu.style.maxWidth = `${Math.round(maxW)}px`;
+
+  const spaceBelow = vh - rect.bottom - margin;
+  const spaceAbove = rect.top - margin;
+  const openUp = spaceBelow < 220 && spaceAbove > spaceBelow;
+  const maxH = Math.max(120, Math.min(320, (openUp ? spaceAbove : spaceBelow) - 8));
+  menu.style.maxHeight = `${Math.round(maxH)}px`;
+  menu.classList.toggle("open-up", openUp);
+
+  const menuRect = menu.getBoundingClientRect();
+  let left = rect.left;
+  if (left + menuRect.width > vw - margin) {
+    left = Math.max(margin, rect.right - menuRect.width);
+  }
+  if (left < margin) left = margin;
+  menu.style.left = `${Math.round(left)}px`;
+
+  if (openUp) {
+    menu.style.top = "auto";
+    menu.style.bottom = `${Math.round(vh - rect.top + 6)}px`;
+  } else {
+    menu.style.bottom = "auto";
+    menu.style.top = `${Math.round(rect.bottom + 6)}px`;
+  }
+}
+
+function openCustomSelectMenu(select, trigger) {
+  if (!select || select.disabled || !select.options.length) return;
+  if (activeSelectOwner === select && activeSelectMenu) {
+    closeCustomSelectMenu();
+    return;
+  }
+  closeCustomSelectMenu();
+
+  const menu = document.createElement("div");
+  menu.className = "qo-select-menu";
+  menu.setAttribute("role", "listbox");
+  if (select.getAttribute("aria-label")) {
+    menu.setAttribute("aria-label", select.getAttribute("aria-label"));
+  }
+
+  const opts = [...select.options];
+  const currentIdx = select.selectedIndex;
+  for (let i = 0; i < opts.length; i += 1) {
+    const opt = opts[i];
+    const isSelected = i === currentIdx;
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = `qo-select-option${isSelected ? " active" : ""}`;
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", isSelected ? "true" : "false");
+    item.dataset.index = String(i);
+    if (opt.disabled) item.disabled = true;
+    item.innerHTML = `<span class="qo-select-option-main">${formatSelectOptionHtml(opt.textContent)}</span><span class="qo-select-check">${isSelected ? icon("checkPlain") : ""}</span>`;
+    item.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (opt.disabled) return;
+      const changed = select.selectedIndex !== i || select.value !== opt.value;
+      select.selectedIndex = i;
+      syncSelectTrigger(select);
+      closeCustomSelectMenu({ restoreFocus: true });
+      if (changed) {
+        select.dispatchEvent(new Event("input", { bubbles: true }));
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+    menu.append(item);
+  }
+
+  const hostDialog = select.closest("dialog[open]");
+  (hostDialog || document.body).append(menu);
+  activeSelectMenu = menu;
+  activeSelectOwner = select;
+  trigger.setAttribute("aria-expanded", "true");
+  trigger.closest(".qo-select-wrap")?.classList.add("is-open");
+  positionSelectMenu(menu, trigger);
+
+  const activeItem = menu.querySelector(".qo-select-option.active");
+  if (activeItem) activeItem.scrollIntoView({ block: "nearest" });
+}
+
+function enhanceSelect(select) {
+  if (!select || select.tagName !== "SELECT" || select.multiple || Number(select.size) > 1) return;
+  if (select.dataset.qoSelectReady === "1") {
+    syncSelectTrigger(select);
+    return;
+  }
+  const parent = select.parentNode;
+  if (!parent) return;
+
+  select.dataset.qoSelectReady = "1";
+  const wrap = document.createElement("span");
+  wrap.className = "qo-select-wrap";
+  for (const cls of ["deck-select", "deck-page-select", "deck-shape-select", "form-control"]) {
+    if (select.classList.contains(cls)) wrap.classList.add(cls);
+  }
+  if (select.closest(".image-controls")) wrap.classList.add("is-compact");
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "qo-select-trigger";
+  trigger.setAttribute("aria-haspopup", "listbox");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.innerHTML = `<span class="qo-select-label"></span><span class="qo-select-caret">${icon("down")}</span>`;
+
+  parent.insertBefore(wrap, select);
+  wrap.append(trigger, select);
+  select.classList.add("qo-select-native");
+  select.tabIndex = -1;
+  select.setAttribute("aria-hidden", "true");
+  selectTriggerMap.set(select, trigger);
+
+  trigger.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    openCustomSelectMenu(select, trigger);
+  });
+  trigger.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp" || ev.key === "Enter" || ev.key === " ") {
+      if (activeSelectOwner !== select) {
+        ev.preventDefault();
+        openCustomSelectMenu(select, trigger);
+      }
+    }
+  });
+  select.addEventListener("change", () => syncSelectTrigger(select));
+
+  const obs = new MutationObserver(() => {
+    syncSelectTrigger(select);
+    if (activeSelectOwner === select) closeCustomSelectMenu();
+  });
+  obs.observe(select, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["disabled", "hidden", "aria-label"] });
+  selectObserverMap.set(select, obs);
+  syncSelectTrigger(select);
+}
+
+export function enhanceSelectsIn(container = document) {
+  if (!container?.querySelectorAll) return;
+  for (const select of container.querySelectorAll("select:not([data-qo-select-ready='1'])")) {
+    enhanceSelect(select);
+  }
+}
+
+export function initCustomSelects() {
+  if (customSelectInitialized || typeof document === "undefined") return;
+  customSelectInitialized = true;
+
+  // 监听通过 JS 直接赋值 select.value / select.selectedIndex，自动同步自定义触发器文案
+  for (const prop of ["value", "selectedIndex"]) {
+    const desc = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, prop);
+    if (desc?.set && desc?.get) {
+      Object.defineProperty(HTMLSelectElement.prototype, prop, {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get() { return desc.get.call(this); },
+        set(val) {
+          desc.set.call(this, val);
+          if (this.dataset?.qoSelectReady === "1") syncSelectTrigger(this);
+        }
+      });
+    }
+  }
+
+  enhanceSelectsIn(document);
+  const rootObserver = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (node.tagName === "SELECT") enhanceSelect(node);
+        else if (node.querySelectorAll) enhanceSelectsIn(node);
+      }
+    }
+  });
+  rootObserver.observe(document.body, { childList: true, subtree: true });
+
+  document.addEventListener("pointerdown", (ev) => {
+    if (!activeSelectMenu) return;
+    if (ev.target.closest?.(".qo-select-menu") || ev.target.closest?.(".qo-select-trigger")) return;
+    closeCustomSelectMenu();
+  }, true);
+
+  document.addEventListener("keydown", (ev) => {
+    if (!activeSelectMenu || !activeSelectOwner) return;
+    const options = [...activeSelectMenu.querySelectorAll(".qo-select-option:not(:disabled)")];
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeCustomSelectMenu({ restoreFocus: true });
+      return;
+    }
+    if (!options.length) return;
+    const cur = options.findIndex((el) => el.classList.contains("is-focused") || el.classList.contains("active"));
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      const next = (cur + (ev.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+      options.forEach((el, idx) => el.classList.toggle("is-focused", idx === next));
+      options[next].scrollIntoView({ block: "nearest" });
+    } else if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      const target = options[cur >= 0 ? cur : 0];
+      target?.click();
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (activeSelectMenu && activeSelectOwner) {
+      const trigger = selectTriggerMap.get(activeSelectOwner);
+      if (trigger?.isConnected) positionSelectMenu(activeSelectMenu, trigger);
+      else closeCustomSelectMenu();
+    }
+  });
+  window.addEventListener("scroll", (ev) => {
+    if (!activeSelectMenu) return;
+    if (ev.target === activeSelectMenu || activeSelectMenu.contains(ev.target)) return;
+    closeCustomSelectMenu();
+  }, true);
+}

@@ -726,6 +726,284 @@ dialog::backdrop { background: var(--backdrop); }
   50% { opacity: 0.9; }
 }
 
+@keyframes qo-menu-in-down {
+  from { opacity: 0; transform: translateY(-4px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes qo-menu-in-up {
+  from { opacity: 0; transform: translateY(4px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* 全站统一自定义下拉菜单（接管所有原生 <select>） */
+span.qo-select-wrap,
+span.qo-select-wrap.deck-select,
+span.qo-select-wrap.deck-page-select,
+span.qo-select-wrap.deck-shape-select,
+span.qo-select-wrap.form-control {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+span.qo-select-wrap.deck-page-select,
+span.qo-select-wrap.deck-shape-select {
+  flex: 1;
+}
+span.qo-select-wrap.is-compact {
+  width: auto;
+  min-width: 108px;
+  max-width: 168px;
+}
+span.qo-select-wrap[hidden] { display: none; }
+
+select.qo-select-native {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 1px !important;
+  height: 1px !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  overflow: hidden !important;
+}
+
+.qo-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-page);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 450;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background-color var(--t-fast), box-shadow var(--t-fast);
+}
+span.qo-select-wrap.deck-select .qo-select-trigger,
+span.qo-select-wrap.deck-page-select .qo-select-trigger,
+span.qo-select-wrap.deck-shape-select .qo-select-trigger {
+  height: 32px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+span.qo-select-wrap.is-compact .qo-select-trigger {
+  height: 28px;
+  padding: 0 8px 0 9px;
+  border-radius: 8px;
+  background: var(--bg-subtle);
+  font-size: 12px;
+}
+.qo-select-trigger:hover:not(:disabled) {
+  border-color: var(--hairline-muted);
+  background: var(--bg-subtle);
+}
+span.qo-select-wrap.is-open .qo-select-trigger,
+.qo-select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--hairline);
+  background: var(--bg-page);
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+.qo-select-trigger:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.qo-select-label {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+.qo-select-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.qo-select-caret {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: var(--ink-3);
+  transition: transform var(--t-fast), color var(--t-fast);
+}
+.qo-select-caret svg { width: 13px; height: 13px; }
+span.qo-select-wrap.is-open .qo-select-caret {
+  transform: rotate(180deg);
+  color: var(--ink);
+}
+
+.qo-select-menu {
+  position: fixed;
+  z-index: 9999;
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--bg-page);
+  color: var(--ink);
+  box-shadow: var(--shadow-float);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  animation: qo-menu-in-down 140ms var(--ease-line) both;
+}
+.qo-select-menu.open-up {
+  animation-name: qo-menu-in-up;
+}
+.qo-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 450;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--t-fast), color var(--t-fast);
+}
+.qo-select-option:hover:not(:disabled),
+.qo-select-option.is-focused:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--ink);
+}
+.qo-select-option.active {
+  background: var(--bg-selected);
+  color: var(--ink);
+  font-weight: 580;
+}
+.qo-select-option:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.qo-select-option-main {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+}
+.qo-select-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--ink);
+}
+.qo-select-check svg { width: 13px; height: 13px; }
+
+/* 画布元素类型小胶囊（[图片]/[文字]/[图形]） */
+.qo-opt-tag {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--line);
+  background: var(--bg-subtle);
+  color: var(--ink-2);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.qo-opt-tag.is-image {
+  border-color: rgba(37, 99, 235, 0.28);
+  background: rgba(37, 99, 235, 0.08);
+  color: #2563eb;
+}
+[data-theme="dark"] .qo-opt-tag.is-image {
+  border-color: rgba(96, 165, 250, 0.35);
+  background: rgba(96, 165, 250, 0.14);
+  color: #93c5fd;
+}
+.qo-opt-tag.is-shape {
+  border-color: rgba(124, 58, 237, 0.25);
+  background: rgba(124, 58, 237, 0.07);
+  color: #7c3aed;
+}
+[data-theme="dark"] .qo-opt-tag.is-shape {
+  border-color: rgba(167, 139, 250, 0.34);
+  background: rgba(167, 139, 250, 0.14);
+  color: #c4b5fd;
+}
+
+/* 全站统一极简自定义复选框 */
+input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--bg-page);
+  display: inline-grid;
+  place-content: center;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background-color var(--t-fast);
+}
+input[type="checkbox"]::after {
+  content: "";
+  width: 8px;
+  height: 5px;
+  border-left: 1.8px solid var(--bg-page);
+  border-bottom: 1.8px solid var(--bg-page);
+  transform: rotate(-45deg) translate(0.5px, -0.8px) scale(0);
+  transition: transform 110ms var(--ease-line);
+}
+input[type="checkbox"]:hover:not(:disabled) {
+  border-color: var(--hairline);
+}
+input[type="checkbox"]:checked {
+  border-color: var(--ink);
+  background: var(--ink);
+}
+input[type="checkbox"]:checked::after {
+  transform: rotate(-45deg) translate(0.5px, -0.8px) scale(1);
+}
+input[type="checkbox"]:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

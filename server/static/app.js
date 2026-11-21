@@ -1,4 +1,4 @@
-import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, errorIn, fileMarkup, getTheme, go, icon, isManager, isReview, modal,
+import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, errorIn, fileMarkup, getTheme, go, icon, initCustomSelects, isManager, isReview, modal,
   post, readDraft, roles, root, saveDraft, state, toastMessage, toggleTheme, uploadSelected, uuid } from "./ui.js";
 import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, historyView, loginView, pageHead, planSection,
   renderFilesList, settingsView, taskDetail, views } from "./views.js";
@@ -1032,4 +1032,5 @@ setInterval(async () => {
 }, 4000);
 
 applyTheme(getTheme());
+initCustomSelects();
 void startup();
