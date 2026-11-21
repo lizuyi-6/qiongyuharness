@@ -18,7 +18,11 @@ test("运行时裁剪只匹配指定的开发期文件后缀", async () => {
 
 test("electron-builder 配置指向 7z 运行时并保留 NSIS 默认压缩类型", () => {
   const packageJson = JSON.parse(fs.readFileSync(path.join(DESKTOP_ROOT, "package.json"), "utf8"));
-  assert.equal(packageJson.version, "0.2.4");
+  // 版本号必须与 server/app.py 的 FastAPI(version=...) 同步递增（SOP 第 4 节），不钉死具体数字。
+  const serverApp = fs.readFileSync(path.join(DESKTOP_ROOT, "..", "server", "app.py"), "utf8");
+  const serverVersion = serverApp.match(/FastAPI\([^\n]*version="([^"]+)"/);
+  assert.ok(serverVersion, "server/app.py 必须声明 FastAPI version");
+  assert.equal(packageJson.version, serverVersion[1], "desktop/package.json 与 server/app.py 版本号不同步");
   assert.deepEqual(packageJson.build.extraResources, [{ from: "runtime-stage/qo-runtime.7z", to: "qo-runtime.7z" }]);
   assert.deepEqual(packageJson.build.electronLanguages, ["zh-CN", "en-US"]);
   assert.equal(packageJson.build.nsis.oneClick, false);

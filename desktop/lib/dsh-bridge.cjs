@@ -80,7 +80,7 @@ function runDsh({
   prompt,
   onEvent = () => {},
   onCheckedDeck = () => {},
-  timeoutMs = 620_000,
+  timeoutMs = 2_700_000,
   signal,
   spawnImpl = spawn
 }) {

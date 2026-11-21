@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { runPipeline } = require("../lib/pipeline.cjs");
+const { DEADLINE_MS, MIN_REMAINING_MS, STAGE_TIMEOUT_MS, runPipeline } = require("../lib/pipeline.cjs");
 
 const roles = {
   understand: "model-understand",
@@ -70,7 +70,7 @@ test("standard 任务一轮执行并通过验收", async () => {
   assert.equal(output.pipeline.rounds, 1);
   assert.deepEqual(output.pipeline.stages.map((stage) => stage.role), ["understand", "execute", "accept"]);
   assert.equal(output.usage.total_tokens, 9);
-  assert.equal(calls[0].timeoutMs, 95_000);
+  assert.equal(calls[0].timeoutMs, STAGE_TIMEOUT_MS);
 });
 
 test("验收 fail 后返工一轮并通过", async () => {
@@ -163,22 +163,22 @@ test("理解 JSON 连续两次格式错误时中止", async () => {
   assert.deepEqual(calls.map((call) => call.role), ["understand", "understand"]);
 });
 
-test("执行格式错误后修复，并在 trace 中保留两次校验结果", async () => {
+test("执行阶段纯文本按兜底交付，验收格式错误重试一次", async () => {
   const { result } = invoke([
     { text: brief() }, "bad execution", { text: deliverable() }, { text: assessment("pass") }
   ]);
   const output = await result;
   assert.equal(output.pipeline.verdict, "pass");
   assert.deepEqual(output.pipeline.stages.map((stage) => [stage.role, stage.outcome]), [
-    ["understand", "ok"], ["execute", "format_error"], ["execute", "ok"], ["accept", "pass"]
+    ["understand", "ok"], ["execute", "ok"], ["accept", "format_error"], ["accept", "pass"]
   ]);
 });
 
-test("执行后剩余时间少于 15 秒时不启动验收并按 fail 返回交付物", async () => {
+test("执行后剩余时间少于 60 秒时不启动验收并按 fail 返回交付物", async () => {
   const time = { value: 0 };
   const { calls, result } = invoke([
     { text: brief() }, { text: deliverable() }
-  ], { time, onCall: (_stage, count) => { if (count === 2) time.value = 256_000; } });
+  ], { time, onCall: (_stage, count) => { if (count === 2) time.value = DEADLINE_MS - MIN_REMAINING_MS / 2; } });
   const output = await result;
   assert.equal(output.text, deliverable());
   assert.equal(output.pipeline.verdict, "fail");

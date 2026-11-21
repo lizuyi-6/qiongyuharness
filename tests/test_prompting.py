@@ -58,7 +58,7 @@ ROUTES = [
     ("校对一下这份通知有没有错别字", "proofread", "notice"),
     ("把这份会议纪要翻译成英文", "translate", "minutes"),
     ("把这段压缩到200字以内", "condense", None),
-    ("AetherGuard 是什么？", "qa", None),
+    ("AetherGuard 是什么？", "qa", "explainer"),
     ("这个数字能对外说吗？", "qa", None),
     ("帮我想几个活动主题", "outline", None),
     ("给我列个提纲", "outline", None),
@@ -143,15 +143,20 @@ class PromptSizeTest(unittest.TestCase):
 
     def test_system_keeps_output_protocol_and_injects_only_matched_presets(self):
         system = prompting.conversation_system("pptx", None, BY_ID["minutes"])
-        self.assertIn('{"action":"reply","reply":"给员工的答复"}', system)
-        self.assertIn('"kind":"docx 或 pptx"', system)
-        self.assertIn("## PPT 导出规则", system)
+        self.assertIn('{"action":"reply","reply":"给员工的 Markdown 答复"', system)
+        self.assertIn('"kind":"docx"', system)
+        self.assertIn('"kind":"pptx"', system)
+        self.assertIn("## 交付形式判定", system)
+        self.assertIn("本轮目标是制作或修改 PPT", system)
+        self.assertIn("## PPT 咨询/发布会级自由画布设计规范", system)
+        self.assertIn("## 回复排版", system)
         self.assertNotIn("## Word 导出规则", system)
         self.assertIn("## 写作规范：会议纪要", system)
         self.assertEqual(system.count("## 写作规范："), 1)
         bare = prompting.conversation_system("reply")
         self.assertNotIn("## 写作规范：", bare)
-        self.assertNotIn("## PPT 导出规则", bare)
+        self.assertIn("本轮只作文字回复，action 必须是 reply。", bare)
+        self.assertNotIn("自由画布设计规范", bare)
         plan = prompting.plan_system("docx", BY_ID["polish"], BY_ID["notice"])
         self.assertIn('{"title":"标题"', plan)
         self.assertNotIn('"action"', plan)

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import struct
+import zlib
 from uuid import uuid4
 from io import BytesIO
 from unittest.mock import patch
@@ -215,11 +216,20 @@ class DesktopTurnTest(unittest.TestCase):
     def test_invalid_model_json_fails_run_and_second_completion_conflicts(self):
         key = self.conversation()
         prepared = self.prepare(key)
-        rejected = self.complete(key, prepared, text="not a JSON decision")
-        self.assertEqual(rejected.status_code, 502, rejected.text)
+        # 0.2.14 起，不以 { 开头的纯文本按兜底 reply 交付，不再 502。
+        accepted = self.complete(key, prepared, text="not a JSON decision")
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["status"], "completed")
+        self.assertEqual(accepted.json()["reply"], "not a JSON decision")
         again = self.complete(key, prepared)
         self.assertEqual(again.status_code, 409, again.text)
-        turn = self.clients["lin"].get(f"/api/v1/conversations/{key}").json()["turns"][-1]
+        # 以 { 开头但无法解析的残缺 JSON 仍走 502 失败路径，且本轮不能再补交。
+        other = self.conversation()
+        other_prepared = self.prepare(other)
+        rejected = self.complete(other, other_prepared, text='{"action": "broken')
+        self.assertEqual(rejected.status_code, 502, rejected.text)
+        self.assertEqual(self.complete(other, other_prepared).status_code, 409)
+        turn = self.clients["lin"].get(f"/api/v1/conversations/{other}").json()["turns"][-1]
         self.assertEqual(turn["status"], "failed")
         self.assertIn("error", turn)
 
@@ -432,6 +442,16 @@ class DesktopTurnTest(unittest.TestCase):
         header = b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, height)
         return header + trailing
 
+    @staticmethod
+    def real_png(width=1, height=1):
+        # 带 CRC 与 IDAT/IEND 的最小合法灰度 PNG：能通过上传路径的解码校验（PIL 可用时）。
+        def chunk(tag, data):
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+        raw = b"".join(b"\x00" + b"\x00" * width for _ in range(height))
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
     def image_payload(self, *, width=1024, height=1024, model="gpt-image-2.6-flare", size="1024x1024",
                       quality="medium", prompt="蓝色山峦插图", png=None):
         return {"png_base64": base64.b64encode(png if png is not None else self.image_png(width, height)).decode(),
@@ -547,7 +567,7 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertEqual(duplicate.status_code, 409, duplicate.text)
         self.assertEqual(duplicate.json()["detail"], "本轮生图已结束")
 
-    def test_ai_image_upload_limit_status_ownership_and_complete_preservation(self):
+    def test_ai_image_uploads_append_without_cap_and_complete_preserves_them(self):
         key = self.conversation()
         prepared = self.prepare(key)
         run_path = f"/api/v1/conversations/{key}/turns/{prepared['run_id']}/images"
@@ -559,18 +579,20 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertEqual(first_image["prompt"], "蓝色山峦插图")
         self.assertEqual(first_image["usage"], {"input_tokens": 7, "output_tokens": 9,
             "input_tokens_details": {"image_tokens": 3}})
-        second_body = self.image_payload(prompt="另一张插图")
-        second = self.clients["lin"].post(run_path, json=second_body)
-        self.assertEqual(second.status_code, 200, second.text)
-        third = self.clients["lin"].post(run_path, json=image_body)
-        self.assertEqual(third.status_code, 409, third.text)
-        self.assertEqual(third.json()["detail"], "本轮生图次数已达上限（2 张）")
+        # 自由画布工作流按需生图，服务端不再限制每轮张数，序号依次递增。
+        uploads = [first]
+        for prompt in ("另一张插图", "第三张配图"):
+            upload = self.clients["lin"].post(run_path, json=self.image_payload(prompt=prompt))
+            self.assertEqual(upload.status_code, 200, upload.text)
+            uploads.append(upload)
+        self.assertEqual([upload.json()["file"]["name"] for upload in uploads],
+                         ["AI配图-1.png", "AI配图-2.png", "AI配图-3.png"])
         complete = self.complete(key, prepared)
         self.assertEqual(complete.status_code, 200, complete.text)
         final = complete.json()
         self.assertEqual(final["status"], "completed")
-        self.assertEqual(len(final["images"]), 2)
-        self.assertEqual(final["images"][0]["file"]["id"], first_image["file"]["id"])
+        self.assertEqual([image["file"]["id"] for image in final["images"]],
+                         [upload.json()["file"]["id"] for upload in uploads])
         self.assertEqual(final["reply"], "已整理演示稿")
         stale = self.prepare(key)
         self.assertEqual(stale["kind"], "conversation")
@@ -596,7 +618,7 @@ class DesktopTurnTest(unittest.TestCase):
         self.assertEqual(after.status_code, 409, after.text)
         self.assertEqual(after.json()["detail"], "本轮执行已结束")
 
-    def test_image_view_is_owner_only_and_png_upload_remains_rejected(self):
+    def test_image_view_is_owner_only_and_uploads_validate_png_content(self):
         key = self.conversation()
         prepared = self.prepare_image(key).json()
         payload = self.image_payload()
@@ -617,9 +639,20 @@ class DesktopTurnTest(unittest.TestCase):
         other = self.clients["chen"].get(f"/api/v1/files/{image_id}/image")
         self.assertEqual(other.status_code, 404, other.text)
         self.assertEqual(other.json()["detail"], "文件不存在或当前账号无权访问")
-        uploaded = self.clients["lin"].post("/api/v1/files", files={"file": ("upload.png", png_bytes, "image/png")})
-        self.assertEqual(uploaded.status_code, 422, uploaded.text)
-        self.assertEqual(uploaded.json()["detail"], "请选择支持的文档格式，单个文件最多 12 MB")
+        # 0.2.21 起真 PNG 可作为普通文件上传，并经 /files/{id}/image 预览。
+        real_png = self.real_png()
+        uploaded = self.clients["lin"].post("/api/v1/files", files={"file": ("上传图.png", real_png, "image/png")})
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        uploaded_file = uploaded.json()
+        self.assertEqual(uploaded_file["extension"], "png")
+        self.assertEqual(uploaded_file["label"], "uploaded")
+        served = self.clients["lin"].get(f"/api/v1/files/{uploaded_file['id']}/image")
+        self.assertEqual(served.status_code, 200, served.text)
+        self.assertEqual(served.content, real_png)
+        # 无 PNG 文件头的伪造内容仍被拒绝。
+        rejected = self.clients["lin"].post("/api/v1/files", files={"file": ("坏图.png", b"not a png", "image/png")})
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(rejected.json()["detail"], "PNG 图片格式无效")
         doc_turn = self.prepare(key)
         document = self.complete(key, doc_turn)
         self.assertEqual(document.status_code, 200, document.text)

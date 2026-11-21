@@ -10,11 +10,11 @@ const ROLE_LABELS = {
 };
 const MAX_STAGE_CALLS = 8;
 const MAX_EXEC_ROUNDS = 2;
-// 最高推理强度下单阶段可能要十余分钟：每阶段最多 900 秒，全程 30 分钟。
-// 服务端 conversations.py 的 stale_before（40 分钟）必须大于 DEADLINE_MS。
+// 长篇 PPT（30+ 页 + 多张 AI 配图 + 联网搜索）单阶段可能超过半小时：每阶段最多 45 分钟，全程 2 小时。
+// 服务端 conversations.py 的 stale_before（135 分钟）必须大于 DEADLINE_MS。
 // 服务端下发的 limits.deadline_ms 仍是 270000（旧版桌面端严格校验这个值），本机以这里的常量为准。
-const DEADLINE_MS = 1_800_000;
-const STAGE_TIMEOUT_MS = 900_000;
+const DEADLINE_MS = 7_200_000;
+const STAGE_TIMEOUT_MS = 2_700_000;
 const MIN_REMAINING_MS = 60_000;
 const TOKEN_FIELDS = ["prompt_tokens", "completion_tokens", "total_tokens"];
 

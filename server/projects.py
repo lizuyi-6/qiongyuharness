@@ -897,7 +897,22 @@ def project_sources(db, tag, user):
             notes.append({"name": "项目：" + row["title"], "text": excerpt})
             remaining -= len(excerpt)
         if row["extension"] and row["data"] is not None:
-            files.append(("项目：" + row["name"], bytes(row["data"]), row["extension"]))
+            digest = {}
+            if row["digest"]:
+                try:
+                    parsed = unpack(row["digest"])
+                    digest = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    digest = {}
+            files.append({
+                "name": "项目：" + row["name"],
+                "filename": row["name"] or "",
+                "title": row["title"] or "",
+                "data": bytes(row["data"]),
+                "ext": row["extension"],
+                "pinned": bool(row["pinned"]),
+                "digest": digest,
+            })
 
     desc = (project["description"] if "description" in pkeys else "") or ""
     brief = (project["brief"] if "brief" in pkeys else "") or ""
@@ -907,3 +922,120 @@ def project_sources(db, tag, user):
         notes.append({"name": f"项目总览：{project['name']}", "text": overview_text})
 
     return project["name"], notes, files
+
+
+# 项目共享文件注入预算：旧实现按「先到先得」每份 6500 字、总 20000 字，资料一多，排在后面的文件
+# （往往正是用户点名要用的那份）直接拿到 0 字，表现为「N 份没有可提取的正文」。
+# 新实现：用户在消息中点名或置顶的文件优先给足篇幅，其余文件按水位线公平分配，并且每份文件
+# 至少保留预整理摘要（结构 + 要点），保证模型知道每份资料的存在与梗概。
+PROJECT_FILE_BUDGET = 32000
+PROJECT_FOCUS_FILE_LIMIT = 18000
+PROJECT_FILE_FLOOR = 600
+_FOCUS_NORMALIZE_RE = re.compile(r"[\s\-_·•.,，。:：;；'\"“”‘’()（）\[\]【】《》<>/\\|]+")
+
+
+def _focus_norm(text: str) -> str:
+    return _FOCUS_NORMALIZE_RE.sub("", (text or "").lower())
+
+
+def project_file_focus(message: str, filename: str, title: str = "", siblings: list[str] | None = None) -> int:
+    """消息中完整点名某个项目文件返回 2；命中该文件独有的连续 4 字以上片段返回 1；否则 0。
+
+    独有片段需排除同项目其它文件名里也出现的部分（例如所有文件都带项目名前缀），避免误判全部为重点。
+    """
+    msg = _focus_norm(message)
+    if not msg:
+        return 0
+    stem = _focus_norm(os.path.splitext(filename or "")[0])
+    candidates = [c for c in (stem, _focus_norm(title)) if len(c) >= 4]
+    if any(c in msg for c in candidates):
+        return 2
+    others = [_focus_norm(os.path.splitext(s or "")[0]) for s in (siblings or [])]
+    others = [o for o in others if o and o != stem]
+    window = 4
+    if len(stem) > window:
+        for i in range(0, len(stem) - window + 1):
+            piece = stem[i:i + window]
+            if piece in msg and not any(piece in o for o in others):
+                return 1
+    return 0
+
+
+def _safe_extract(data: bytes, ext: str, limit: int) -> str:
+    try:
+        return extract(data, ext, limit) or ""
+    except Exception:
+        return ""
+
+
+def _digest_header(item: dict[str, Any], text: str) -> str:
+    digest = item.get("digest") or {}
+    if not digest.get("stats") and text:
+        digest = preorganize_text(
+            title=item.get("title") or item.get("filename") or "",
+            extracted_text=text,
+            filename=item.get("filename") or "",
+            ext=item.get("ext") or "",
+        )
+    parts = []
+    outline = [str(o) for o in (digest.get("outline") or []) if o][:8]
+    points = [str(p) for p in (digest.get("key_points") or []) if p][:4]
+    if outline:
+        parts.append("结构：" + "、".join(outline)[:260])
+    if points:
+        parts.append("要点：" + "；".join(points)[:360])
+    return "【预整理摘要】" + " ｜ ".join(parts) if parts else ""
+
+
+def _water_fill(lengths: list[int], budget: int) -> list[int]:
+    """按水位线公平分配预算：短文件全量，长文件平分剩余。"""
+    alloc = [0] * len(lengths)
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    remaining = max(0, budget)
+    for pos, idx in enumerate(order):
+        share = remaining // max(1, len(order) - pos)
+        alloc[idx] = min(lengths[idx], share)
+        remaining -= alloc[idx]
+    return alloc
+
+
+async def read_project_sources(files: list[dict[str, Any]], message: str = "",
+                               budget: int = PROJECT_FILE_BUDGET) -> list[dict[str, str]]:
+    if not files:
+        return []
+    texts = await asyncio.gather(*(
+        asyncio.to_thread(_safe_extract, f["data"], f["ext"], 40000) for f in files
+    ))
+    names = [f.get("filename", "") for f in files]
+    scores = [project_file_focus(message, f.get("filename", ""), f.get("title", ""), names) for f in files]
+    focus = [i for i, s in enumerate(scores) if s > 0 or files[i].get("pinned")]
+    focus.sort(key=lambda i: (-scores[i], -int(bool(files[i].get("pinned")))))
+    others = [i for i in range(len(files)) if i not in focus]
+
+    alloc = [0] * len(files)
+    # 每份非重点文件先保底，剩余预算先给重点文件，最后再公平分给其余文件。
+    floor_total = sum(min(len(texts[i]), PROJECT_FILE_FLOOR) for i in others)
+    focus_budget = max(0, min(budget - floor_total, PROJECT_FOCUS_FILE_LIMIT * len(focus)))
+    if focus:
+        capped = [min(len(texts[i]), PROJECT_FOCUS_FILE_LIMIT) for i in focus]
+        for i, value in zip(focus, _water_fill(capped, focus_budget)):
+            alloc[i] = value
+    rest_budget = max(0, budget - sum(alloc))
+    for i, value in zip(others, _water_fill([len(texts[i]) for i in others], rest_budget)):
+        alloc[i] = value
+
+    sources = []
+    for i in [*focus, *others]:
+        item, text, size = files[i], texts[i], alloc[i]
+        if not text:
+            sources.append({"name": item["name"], "text": ""})
+            continue
+        if size >= len(text):
+            body = text
+        else:
+            header = _digest_header(item, text)
+            body = (f"{header}\n" if header else "") + text[:size] + \
+                f"\n……（节选 {size}/{len(text)} 字，篇幅所限未全部载入）"
+        label = item["name"] + ("（用户点名资料）" if scores[i] > 0 else "（置顶资料）" if item.get("pinned") else "")
+        sources.append({"name": label, "text": body})
+    return sources

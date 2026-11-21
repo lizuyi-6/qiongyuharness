@@ -26,7 +26,8 @@ const MODEL_REASONING_EFFORT = Object.freeze({
   "k3.1-pro": "max"
 });
 // 单次上游调用的时限。最高推理强度下执行阶段实测 95 秒（默认强度），留足余量。
-const UPSTREAM_TIMEOUT_MS = 600_000;
+// 单次上游流式调用上限与单阶段上限一致（45 分钟），避免 64K 长输出在流式中途被掐断。
+const UPSTREAM_TIMEOUT_MS = 2_700_000;
 const FORWARDED_FIELDS = [
   "model", "messages", "stream", "stream_options", "temperature", "top_p",
   "reasoning_effort", "thinking"

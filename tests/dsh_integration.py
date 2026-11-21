@@ -7,7 +7,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PLAN = {"title":"DSH 验收", "subtitle":"网关协议测试",
-        "sections":[{"heading":"进度","points":["已走通实际 SDK 调用。"]}]}
+        "sections":[{"heading":"进度","points":["已走通实际 SDK 调用。"],"conclusion":"","notes":"","table":None}]}
 MODEL = "deepseek-v4-flash"
 CAPTURED = []
 

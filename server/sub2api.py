@@ -33,7 +33,7 @@ PROXY_FORWARD_RESP_HEADERS = (
     "x-ratelimit-reset-requests",
     "x-ratelimit-reset-tokens",
 )
-PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+PROXY_TIMEOUT = httpx.Timeout(connect=15.0, read=2700.0, write=120.0, pool=15.0)
 
 
 def settings():

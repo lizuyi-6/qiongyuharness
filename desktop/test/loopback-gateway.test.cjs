@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { MODEL_OUTPUT_LIMITS, createLoopbackGateway } = require("../lib/loopback-gateway.cjs");
+const { MAX_CALLS, MODEL_OUTPUT_LIMITS, createLoopbackGateway } = require("../lib/loopback-gateway.cjs");
 const { quotaExhaustionMessage } = require("../lib/usage.cjs");
 const { readJson, sseResponse, startServer } = require("./helpers.cjs");
 
@@ -108,18 +108,19 @@ test("finish_reason 为 length 时记录 truncated，SSE 与 JSON 响应都解�
   assert.equal(gateway.truncated, true);
 });
 
-test("回环网关拒绝第五次模型调用", async (t) => {
+test("回环网关放行 MAX_CALLS 次以内的调用并拒绝下一次", async (t) => {
   const upstream = await startServer((_request, response) => sseResponse(response));
   const gateway = await createLoopbackGateway({ baseUrl: upstream.url, apiKey: "only-upstream", model: MODEL });
   t.after(async () => { await gateway.close(); await upstream.close(); });
 
   const statuses = [];
-  for (let call = 0; call < 5; call += 1) {
+  for (let call = 0; call <= MAX_CALLS; call += 1) {
     const response = await post(gateway, validRequest());
     statuses.push(response.status);
     await response.text();
   }
-  assert.deepEqual(statuses, [200, 200, 200, 200, 429]);
+  assert.equal(statuses.filter((status) => status === 200).length, MAX_CALLS);
+  assert.equal(statuses.at(-1), 429);
 });
 
 test("回环网关拒绝超过 2 MB 的请求体", async (t) => {

@@ -18,7 +18,7 @@ from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writa
 from .identity import fail
 from .office import DeckSpec, Plan, SLIDE_H, SLIDE_W, add_file, clean_text, coerce_deck_spec, extract_deck_slides, powerpoint, render_freeform_pptx, safe_name, word
 from .presentation import Replacement, Selection, edit_scope, load_presentation, pptx_file, revise_slide, selected_layout
-from .projects import project_for, project_sources
+from .projects import project_for, project_sources, read_project_sources
 from .store import audit, database, instant, pack, uid, unpack
 from .tasks import User, task_for
 
@@ -126,6 +126,8 @@ class TurnFailure(BaseModel):
 IMAGE_SIZES = {"1024x1024", "1536x1024", "1024x1536", "1536x864"}
 IMAGE_QUALITIES = {"low", "medium", "high"}
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# 运行中一轮被判定为「已中断」的时长；必须大于桌面端 DEADLINE_MS（120 分钟）。
+STALE_MINUTES = 135
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_BASE64 = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 IMAGE_SIZE_DIMENSIONS = {"1024x1024": (1024, 1024), "1536x1024": (1536, 1024),
@@ -517,7 +519,7 @@ def patch_thread_route(key: str, body: ConversationPatch, user: User):
 def delete_thread_route(key: str, user: User):
     with database(write=True) as db:
         current = owned_thread(db, key, user)
-        stale_before = instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=40))
+        stale_before = instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=STALE_MINUTES))
         running = db.one(
             "SELECT id FROM office_turns WHERE conversation_id=? AND status='running' AND created_at>?",
             (key, stale_before),
@@ -1146,9 +1148,9 @@ def apply_freeform_slide_patch(target: dict[str, Any], scope: dict[str, Any], de
 
 
 def stale_before():
-    # 桌面端智能分工全程上限 30 分钟（desktop/lib/pipeline.cjs DEADLINE_MS），这里必须更长，
+    # 桌面端智能分工全程上限 120 分钟（desktop/lib/pipeline.cjs DEADLINE_MS），这里必须更长，
     # 否则仍在执行的一轮会被下一次请求判成"已中断"。
-    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=40))
+    return instant(datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=STALE_MINUTES))
 
 
 def check_existing(db, key, body, request, allow_replay, stale):
@@ -1183,11 +1185,20 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
         project_data = project_sources(db, session["project_id"], user)
         target = selection_target(db, key, body, user)
         recent, latest = history_for(db, key)
+        recent_asks = []
+        if project_data[0]:
+            for row in db.all("SELECT input FROM office_turns WHERE conversation_id=? ORDER BY created_at DESC LIMIT 3", (key,)):
+                try:
+                    recent_asks.append(str(unpack(row["input"]).get("message") or "")[:1500])
+                except Exception:
+                    pass
 
     project, notes, shared_files = project_data
     sources = await read_sources(data)
     if project:
-        sources.extend([*notes, *await read_sources(shared_files)])
+        # 「继续」这类短指令也要沿用前几轮（含失败/超时轮次）点名过的资料作为重点。
+        focus_text = "\n".join([body.message, *recent_asks])
+        sources.extend([*notes, *await read_project_sources(shared_files, focus_text)])
     if target:
         scope = await asyncio.to_thread(
             build_freeform_scope if target.get("freeform") else edit_scope,
