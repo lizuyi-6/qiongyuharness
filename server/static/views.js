@@ -268,10 +268,31 @@ export function filterFiles(items, kind = state.filesFilter, query = state.files
       ? true
       : kind === "text"
         ? ["txt", "md"].includes(ext)
-        : ext === kind;
+        : kind === "image"
+          ? ["png", "jpg", "jpeg", "webp", "gif"].includes(ext)
+          : ext === kind;
     const matchQuery = !q || file.name.toLocaleLowerCase().includes(q);
     return matchKind && matchQuery;
   });
+}
+
+export function renderFilesBulkBar(items) {
+  const filtered = filterFiles(items);
+  const filteredIds = new Set(filtered.map((f) => f.id));
+  const selected = (state.filesSelected || []).filter((id) => filteredIds.has(id));
+  const allPicked = filtered.length > 0 && selected.length === filtered.length;
+  if (!filtered.length) return "";
+  return `<div class="files-bulk-bar">
+    <label class="files-select-all">
+      <input type="checkbox" data-files-select-all ${allPicked ? "checked" : ""}>
+      <span>${allPicked ? "取消全选" : `全选当前列表（${filtered.length}）`}</span>
+    </label>
+    ${selected.length ? `<div class="files-bulk-actions">
+      <span class="hint">已选 <strong>${selected.length}</strong> 项</span>
+      <button type="button" class="text-button" data-act="files-clear-select">清空勾选</button>
+      <button type="button" class="button sm danger" data-act="files-batch-delete">${icon("trash")}批量删除（${selected.length}）</button>
+    </div>` : `<span class="hint">共 ${filtered.length} 个文件 · 可勾选批量删除或单行删除</span>`}
+  </div>`;
 }
 
 export function renderFilesList(items) {
@@ -279,7 +300,13 @@ export function renderFilesList(items) {
   if (!filtered.length) {
     return `<p class="empty">${items.length ? "没有匹配的文件" : "当前还没有办公文件"}</p>`;
   }
-  return `<div class="file-list">${filtered.map((f) => fileMarkup(f, { edit: true })).join("")}</div>`;
+  const picked = new Set(state.filesSelected || []);
+  return `<div class="file-list">${filtered.map((f) => fileMarkup(f, {
+    edit: true,
+    deletable: true,
+    check: "file_select",
+    checked: picked.has(f.id)
+  })).join("")}</div>`;
 }
 
 export function filesView(items) {
@@ -287,6 +314,7 @@ export function filesView(items) {
     ["all", "全部"],
     ["docx", "Word"],
     ["pptx", "PowerPoint"],
+    ["image", "图片"],
     ["pdf", "PDF"],
     ["xlsx", "Excel"],
     ["text", "文本"]
@@ -302,6 +330,7 @@ export function filesView(items) {
         <input class="form-control" type="search" data-files-search value="${e(state.filesQuery)}" placeholder="搜索文件名…" aria-label="搜索文件名">
       </div>
     </div>
+    <div data-files-bulk>${renderFilesBulkBar(items)}</div>
     <div data-files-list>${renderFilesList(items)}</div>
   </section>`;
 }

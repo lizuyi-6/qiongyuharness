@@ -104,6 +104,62 @@ async def upload_file(user: User, file: Annotated[UploadFile, File()], assignmen
         return public_file(db, add_file(db, user["id"], name, data, ext, "uploaded", assignment=assignment_id or None))
 
 
+class BatchDeleteFiles(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+def _delete_own_file(db, user, key: str):
+    row = db.one(
+        "SELECT id,owner_id,label,name,extension,parent_id,assignment_id,template_id FROM artifacts WHERE id=?",
+        (key,),
+    )
+    if not row or row["owner_id"] != user["id"] or row["label"] == "material":
+        fail(404, "文件不存在或无权删除")
+    if db.one("SELECT 1 FROM submission_files WHERE artifact_id=?", (key,)):
+        fail(409, "该文件已作为任务成果提交审核，无法删除")
+    db.execute("UPDATE artifacts SET parent_id=? WHERE parent_id=?", (row["parent_id"], key))
+    db.execute("DELETE FROM office_project_context WHERE artifact_id=?", (key,))
+    db.execute("DELETE FROM artifacts WHERE id=? AND owner_id=?", (key, user["id"]))
+    audit(db, "file.deleted", user["id"], row["assignment_id"], row["template_id"], artifact_id=key, name=row["name"])
+    return row["name"]
+
+
+@router.post("/files/batch-delete")
+def batch_delete_files(body: BatchDeleteFiles, user: User):
+    deleted: list[str] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    with database(write=True) as db:
+        for raw_id in body.ids:
+            key = str(raw_id or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            row = db.one(
+                "SELECT id,owner_id,label,name,parent_id,assignment_id,template_id FROM artifacts WHERE id=?",
+                (key,),
+            )
+            if not row or row["owner_id"] != user["id"] or row["label"] == "material":
+                skipped.append({"id": key, "reason": "文件不存在或无权删除"})
+                continue
+            if db.one("SELECT 1 FROM submission_files WHERE artifact_id=?", (key,)):
+                skipped.append({"id": key, "reason": f"「{row['name']}」已提交任务审核，无法删除"})
+                continue
+            db.execute("UPDATE artifacts SET parent_id=? WHERE parent_id=?", (row["parent_id"], key))
+            db.execute("DELETE FROM office_project_context WHERE artifact_id=?", (key,))
+            db.execute("DELETE FROM artifacts WHERE id=? AND owner_id=?", (key, user["id"]))
+            audit(db, "file.deleted", user["id"], row["assignment_id"], row["template_id"], artifact_id=key, name=row["name"])
+            deleted.append(key)
+    return {"deleted": deleted, "skipped": skipped}
+
+
+@router.delete("/files/{key}")
+def delete_file(key: str, user: User):
+    with database(write=True) as db:
+        name = _delete_own_file(db, user, key)
+    return {"ok": True, "id": key, "name": name}
+
+
 @router.get("/files/{key}/download")
 def download(key: str, user: User):
     with database(write=True) as db:

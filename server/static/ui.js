@@ -21,6 +21,7 @@ export const state = {
   filesCache: [],
   filesFilter: "all",
   filesQuery: "",
+  filesSelected: [],
   update: null,
   updateBannerDismissed: false,
   admin: { offset: 0, department: "", status: "", date: "" },
@@ -158,7 +159,7 @@ export const statuses = {
   overdue:"已逾期",draft:"草稿",active:"运行中",finished:"已结束",
   open:"待处理",resolved:"已解决"
 };
-export const labels = {docx:"Word",pptx:"PowerPoint",pdf:"PDF",xlsx:"Excel",txt:"文本",md:"Markdown",other:"综合"};
+export const labels = {docx:"Word",pptx:"PowerPoint",pdf:"PDF",xlsx:"Excel",txt:"文本",md:"Markdown",png:"图片",jpg:"图片",jpeg:"图片",webp:"图片",other:"综合"};
 export const priorities = {normal:"普通",high:"高优先级",urgent:"紧急"};
 export const roles = {admin:"超级管理员",manager:"部门主管",employee:"员工",reviewer:"审阅人"};
 export const eventLabels = {
@@ -172,7 +173,7 @@ export const eventLabels = {
   "schedule.updated":"更新重复计划", "auth.login":"企业身份登录", "image.started":"启动图片生成",
   "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片",
   "feedback.submitted":"提交问题反馈", "feedback.updated":"更新反馈状态",
-  "conversation.deleted":"删除办公会话"
+  "conversation.deleted":"删除办公会话", "file.deleted":"删除文件"
 };
 
 export function badge(value) {
@@ -214,7 +215,9 @@ export function fromLocal(value) {
 }
 
 export function fileIcon(kind) {
-  return `<span class="task-icon ${e(kind || "other")}">${icon(kind)}</span>`;
+  const k = String(kind || "other").toLowerCase();
+  const glyph = ["png", "jpg", "jpeg", "webp", "gif"].includes(k) ? "image" : k;
+  return `<span class="task-icon ${e(k)}">${icon(glyph)}</span>`;
 }
 
 export function button(label, action, opts = {}) {
@@ -334,13 +337,15 @@ export function go(path) {
 
 export function fileMarkup(file, opts = {}) {
   const size = file.size === undefined ? "" : file.size > 1048576 ? `${(file.size/1048576).toFixed(1)} MB` : `${Math.ceil(file.size/1024)} KB`;
+  const isImage = ["png", "jpg", "jpeg", "webp", "gif"].includes(String(file.extension || "").toLowerCase());
   return `<div class="file">${opts.check ? `<input type="checkbox" name="${e(opts.check)}" value="${e(file.id)}" aria-label="${e(file.name)}" ${opts.checked ? "checked" : ""}>` : ""}${fileIcon(file.extension)}
     <span class="file-meta"><strong>${e(file.name)}</strong><small>${e(labels[file.extension] || file.extension)}${size ? " · " + size : ""}${file.parent_id ? " · 历史版本保留" : ""}</small></span>
     <span class="file-actions">
-      <button class="text-button" type="button" data-act="preview" data-id="${e(file.id)}">预览</button>
+      <button class="text-button" type="button" data-act="${isImage ? "preview-image" : "preview"}" data-id="${e(file.id)}" data-name="${e(file.name)}">预览</button>
       <a class="text-button" href="/api/v1/files/${encodeURIComponent(file.id)}/download" download>下载</a>
       ${opts.edit && ["docx","pptx"].includes(file.extension) ? `<button class="text-button" type="button" data-act="edit-file" data-id="${e(file.id)}">修改</button>` : ""}
       ${opts.copy ? `<button class="text-button" type="button" data-act="copy-file" data-id="${e(file.id)}">关联</button>` : ""}
+      ${opts.deletable ? `<button class="text-button is-danger" type="button" data-act="delete-file" data-id="${e(file.id)}" data-name="${e(file.name)}">删除</button>` : ""}
     </span>
   </div>`;
 }

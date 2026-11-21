@@ -1,7 +1,7 @@
 import { active, api, applyTheme, button, clearDrafts, copyText, dialog, e, errorIn, fileMarkup, getTheme, go, icon, initCustomSelects, isManager, isReview, modal,
   post, readDraft, roles, root, saveDraft, state, toastMessage, toggleTheme, uploadSelected, uuid } from "./ui.js";
-import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, historyView, loginView, pageHead, planSection,
-  renderFilesList, settingsView, taskDetail, views } from "./views.js";
+import { agentSetup, dashboard, demoUsers, detectDesktopVersion, filesView, filterFiles, historyView, loginView, pageHead, planSection,
+  renderFilesBulkBar, renderFilesList, settingsView, taskDetail, views } from "./views.js";
 import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator, syncFeedbackBadge, syncShell,
   syncSidebarConversations, syncThemeToggle, syncTodayBadge, syncUpdateUi, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
@@ -187,6 +187,7 @@ async function login(user) {
   state.filesCache = [];
   state.filesFilter = "all";
   state.filesQuery = "";
+  state.filesSelected = [];
   state.filter = "all";
   state.today = [];
   adminReset();
@@ -349,6 +350,8 @@ async function render(keepScroll = false) {
       case "agent": content = await fetchAgent(state.route, true); break;
       case "files": {
         state.filesCache = await api("/files");
+        const validIds = new Set(state.filesCache.map((f) => f.id));
+        state.filesSelected = (state.filesSelected || []).filter((fid) => validIds.has(fid));
         content = filesView(state.filesCache);
         break;
       }
@@ -393,6 +396,8 @@ function localRefresh() {
   if (state.route[0] === "agent") workplace.innerHTML = agentSetup(state.agent, agentTask, agentFiles, agentDesktopModels);
   else if (state.route[0] === "today") workplace.innerHTML = dashboard();
   else if (state.route[0] === "files") {
+    const bulkWrap = workplace.querySelector("[data-files-bulk]");
+    if (bulkWrap) bulkWrap.innerHTML = renderFilesBulkBar(state.filesCache);
     const listWrap = workplace.querySelector("[data-files-list]");
     if (listWrap) listWrap.innerHTML = renderFilesList(state.filesCache);
     for (const pill of workplace.querySelectorAll("[data-act=files-filter]")) {
@@ -584,6 +589,62 @@ async function onClick(event) {
       state.filesFilter = id;
       localRefresh();
       break;
+    case "files-clear-select":
+      state.filesSelected = [];
+      localRefresh();
+      break;
+    case "delete-file": {
+      const name = target.dataset.name || "该文件";
+      await api("/files/" + encodeURIComponent(id), { method: "DELETE" });
+      state.filesCache = (state.filesCache || []).filter((f) => f.id !== id);
+      state.filesSelected = (state.filesSelected || []).filter((fid) => fid !== id);
+      if (state.route[0] === "files") localRefresh();
+      else await render(true);
+      toastMessage(`已删除「${name}」`, "success");
+      break;
+    }
+    case "files-batch-delete": {
+      const filtered = filterFiles(state.filesCache);
+      const filteredIds = new Set(filtered.map((f) => f.id));
+      const ids = (state.filesSelected || []).filter((fid) => filteredIds.has(fid));
+      if (!ids.length) break;
+      const result = await post("/files/batch-delete", { ids });
+      const deletedSet = new Set(result.deleted || []);
+      state.filesCache = (state.filesCache || []).filter((f) => !deletedSet.has(f.id));
+      state.filesSelected = (state.filesSelected || []).filter((fid) => !deletedSet.has(fid));
+      localRefresh();
+      const skippedCount = (result.skipped || []).length;
+      if (deletedSet.size && skippedCount) {
+        toastMessage(`已删除 ${deletedSet.size} 个文件，另有 ${skippedCount} 个受保护文件未删除`, "info");
+      } else if (deletedSet.size) {
+        toastMessage(`已删除 ${deletedSet.size} 个文件`, "success");
+      } else if (skippedCount) {
+        toastMessage(result.skipped[0]?.reason || "所选文件不可删除", "error");
+      }
+      break;
+    }
+    case "preview-image": {
+      const name = target.dataset.name || "图片预览";
+      modal(name, `<div class="stack">
+        <div class="file-image-preview"><img src="/api/v1/files/${encodeURIComponent(id)}/image" alt="${e(name)}"></div>
+        <div class="actions">
+          <a class="button primary" href="/api/v1/files/${encodeURIComponent(id)}/download" download>${icon("download")}下载图片</a>
+          <button type="button" class="button danger" data-act="delete-file-modal" data-id="${e(id)}" data-name="${e(name)}">${icon("trash")}删除图片</button>
+        </div>
+      </div>`);
+      break;
+    }
+    case "delete-file-modal": {
+      const name = target.dataset.name || "该文件";
+      await api("/files/" + encodeURIComponent(id), { method: "DELETE" });
+      dialog.close();
+      state.filesCache = (state.filesCache || []).filter((f) => f.id !== id);
+      state.filesSelected = (state.filesSelected || []).filter((fid) => fid !== id);
+      if (state.route[0] === "files") localRefresh();
+      else await render(true);
+      toastMessage(`已删除「${name}」`, "success");
+      break;
+    }
     case "profile":
       modal("账户与身份", `<div class="stack">
         <div class="profile-banner">
@@ -1036,6 +1097,26 @@ document.addEventListener("input", (event) => {
   }
 });
 document.addEventListener("change", (event) => {
+  if (event.target.matches("[name=file_select]")) {
+    const fid = event.target.value;
+    const set = new Set(state.filesSelected || []);
+    if (event.target.checked) set.add(fid);
+    else set.delete(fid);
+    state.filesSelected = [...set];
+    const bulkWrap = root.querySelector("[data-files-bulk]");
+    if (bulkWrap) bulkWrap.innerHTML = renderFilesBulkBar(state.filesCache);
+    return;
+  }
+  if (event.target.matches("[data-files-select-all]")) {
+    const filtered = filterFiles(state.filesCache);
+    const filteredIds = filtered.map((f) => f.id);
+    const set = new Set(state.filesSelected || []);
+    if (event.target.checked) filteredIds.forEach((fid) => set.add(fid));
+    else filteredIds.forEach((fid) => set.delete(fid));
+    state.filesSelected = [...set];
+    localRefresh();
+    return;
+  }
   if (event.target.matches("[name=allow_ai_images]")) {
     saveImageAutoPreference(event.target.checked);
     syncImageAutoIndicator();

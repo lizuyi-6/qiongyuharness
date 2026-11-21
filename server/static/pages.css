@@ -324,6 +324,51 @@
 .work-list tbody tr:nth-child(6), .project-card:nth-child(6), .file-list .file:nth-child(6) { animation-delay: 110ms; }
 .work-list tbody tr:nth-child(n+7), .project-card:nth-child(n+7), .file-list .file:nth-child(n+7) { animation-delay: 130ms; }
 
+.text-button.is-danger { color: var(--danger); }
+.text-button.is-danger:hover:not(:disabled) { color: var(--danger); }
+.file-actions { flex-shrink: 0; white-space: nowrap; }
+
+.files-bulk-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+}
+.files-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 560;
+  color: var(--ink);
+  cursor: pointer;
+}
+.files-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.file-image-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+}
+.file-image-preview img {
+  max-width: 100%;
+  max-height: 62vh;
+  border-radius: 6px;
+  object-fit: contain;
+}
+
 /* 问题反馈与一键上传日志 */
 .feedback-inline-bar {
   display: flex;
