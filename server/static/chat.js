@@ -446,7 +446,7 @@ function renderSidebarQuota(slot, result, { loading = false } = {}) {
           <span>${e(row.label)}</span>
           <strong class="mono">${e(row.remaining <= 0 ? "已用尽" : formatCompactAmount(row.remaining, unit))}</strong>
         </div>
-        <div class="quota-track"><span class="quota-fill" style="width:${r.toFixed(1)}%"></span></div>
+        <progress class="quota-progress" max="100" value="${Math.round(r)}" aria-label="${e(row.label)}使用比例"></progress>
       </div>`;
     }).join("")}
   </div>` : "";
@@ -469,9 +469,7 @@ function renderSidebarQuota(slot, result, { loading = false } = {}) {
         <strong class="quota-dock-rem">${e(remCompact)}</strong>
         <span class="quota-dock-used">${e(usedSummary)}</span>
       </div>
-      <div class="quota-track" role="progressbar" aria-valuenow="${Math.round(ratio)}" aria-valuemin="0" aria-valuemax="100" aria-label="${e(primary.label)}使用比例">
-        <span class="quota-fill" style="width:${ratio.toFixed(1)}%"></span>
-      </div>
+      <progress class="quota-progress" max="100" value="${Math.round(ratio)}" aria-label="${e(primary.label)}使用比例"></progress>
       <p class="quota-dock-meta" title="${e(resetFull)}">${e(resetCompact)}</p>
       ${extrasHtml}
     </div>

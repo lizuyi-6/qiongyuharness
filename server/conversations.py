@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from . import gateway, prompting, search
 from .files import PLAN_SLOTS, collect_sources, public_file, read_sources, writable_task
 from .identity import fail
-from .office import DeckSpec, Plan, SLIDE_H, SLIDE_W, add_file, clean_text, coerce_deck_spec, powerpoint, render_freeform_pptx, safe_name, word
+from .office import DeckSpec, Plan, SLIDE_H, SLIDE_W, add_file, clean_text, coerce_deck_spec, extract_deck_slides, powerpoint, render_freeform_pptx, safe_name, word
 from .presentation import Replacement, Selection, edit_scope, load_presentation, pptx_file, revise_slide, selected_layout
 from .projects import project_for, project_sources
 from .store import audit, database, instant, pack, uid, unpack
@@ -729,13 +729,15 @@ def parse_turn_response(text, kind):
     data = _extract_json_object(text)
     if kind == "slide_freeform":
         raw_slide = data.get("slide")
+        if not isinstance(raw_slide, dict) and isinstance(data.get("design"), dict) and isinstance(data["design"].get("slide"), dict):
+            raw_slide = data["design"]["slide"]
         if isinstance(raw_slide, dict):
             reply = str(data.get("reply") or "").strip()[:6500] or "已按要求修改选中页面。"
             design = data.get("design") if isinstance(data.get("design"), dict) else None
             return SlidePatch(reply=reply, slide=raw_slide, design=design)
         # 兼容模型在选区修改时输出整套 deck 的情况
         raw_deck = data.get("deck")
-        if isinstance(raw_deck, dict) and isinstance(raw_deck.get("slides"), list) and raw_deck["slides"]:
+        if isinstance(raw_deck, dict) and extract_deck_slides(raw_deck):
             deck = coerce_deck_spec(raw_deck)
             reply = str(data.get("reply") or "").strip()[:6500] or f"已按要求更新演示文稿《{deck.title}》。"
             return Decision(action="export", reply=reply, kind="pptx", deck=deck)
@@ -746,15 +748,23 @@ def parse_turn_response(text, kind):
     elif raw_kind in {"doc", "word"}:
         data["kind"] = "docx"
     raw_deck = data.get("deck")
-    if not isinstance(raw_deck, dict) and isinstance(data.get("plan"), dict) and isinstance(data["plan"].get("slides"), list):
-        raw_deck = data["plan"]
-    if not isinstance(raw_deck, dict) and isinstance(data.get("slides"), list):
-        raw_deck = data
-    if (data.get("action") == "export" or data.get("kind") == "pptx") and isinstance(raw_deck, dict) and isinstance(raw_deck.get("slides"), list):
+    if not (isinstance(raw_deck, dict) and extract_deck_slides(raw_deck)):
+        if isinstance(data.get("plan"), dict) and extract_deck_slides(data["plan"]):
+            raw_deck = data["plan"]
+        elif extract_deck_slides(data):
+            raw_deck = data
+    if (data.get("action") == "export" or data.get("kind") == "pptx") and isinstance(raw_deck, dict) and extract_deck_slides(raw_deck):
         deck = coerce_deck_spec(raw_deck)
         reply = str(data.get("reply") or "").strip()[:6500] or f"已生成演示文稿《{deck.title}》。"
         stitle = _clean_session_title(data.get("session_title")) or None
         return Decision(action="export", reply=reply, session_title=stitle, kind="pptx", deck=deck)
+    if isinstance(data.get("reply"), str) and len(data["reply"]) > 6500:
+        data["reply"] = data["reply"][:6500]
+    if not data.get("action"):
+        if data.get("plan") or data.get("deck"):
+            data["action"] = "export"
+        elif data.get("reply"):
+            data["action"] = "reply"
     try:
         return Decision.model_validate(data)
     except ValidationError as exc:

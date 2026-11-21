@@ -782,11 +782,34 @@ def _detect_coord_scale(raw_slides: list[Any]) -> tuple[float, float]:
     return scale_x, scale_y
 
 
+def extract_deck_slides(raw: Any) -> list[Any] | None:
+    """从 AI 输出的 deck 对象中提取 slides，兼容模型漏闭大括号把 slides 误嵌到 design/palette 里的情况。"""
+    if not isinstance(raw, dict):
+        return None
+    for key in ("slides", "pages"):
+        val = raw.get(key)
+        if isinstance(val, list) and val:
+            return val
+    design = raw.get("design")
+    if isinstance(design, dict):
+        for key in ("slides", "pages"):
+            val = design.get(key)
+            if isinstance(val, list) and val:
+                return val
+        palette = design.get("palette")
+        if isinstance(palette, dict):
+            for key in ("slides", "pages"):
+                val = palette.get(key)
+                if isinstance(val, list) and val:
+                    return val
+    return None
+
+
 def coerce_deck_spec(raw: Any, fallback_title: str = "演示文稿") -> DeckSpec:
     """对 AI 输出的自由画布 JSON 做强容错归一化，自动换算误用的百分比/像素坐标系，避免因别名或越界导致空白页。"""
     if not isinstance(raw, dict):
         fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
-    raw_slides = raw.get("slides")
+    raw_slides = extract_deck_slides(raw)
     if not isinstance(raw_slides, list) or not raw_slides:
         fail(502, "办公助理返回了无法读取的结果，请重试当前请求")
 

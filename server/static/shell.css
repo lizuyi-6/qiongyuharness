@@ -335,6 +335,31 @@
   border-radius: var(--radius-pill);
 }
 
+.quota-progress {
+  display: block;
+  width: 100%;
+  height: 3px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--line);
+  overflow: hidden;
+  appearance: none;
+  -webkit-appearance: none;
+}
+.quota-progress::-webkit-progress-bar {
+  background: var(--line);
+  border-radius: var(--radius-pill);
+}
+.quota-progress::-webkit-progress-value {
+  background: var(--hairline);
+  border-radius: var(--radius-pill);
+  transition: width 360ms var(--ease-line), background var(--t-fast);
+}
+.quota-dock.is-warn .quota-progress::-webkit-progress-value,
+.quota-mini-row.is-warn .quota-progress::-webkit-progress-value { background: var(--warn); }
+.quota-dock.is-danger .quota-progress::-webkit-progress-value,
+.quota-mini-row.is-danger .quota-progress::-webkit-progress-value { background: var(--danger); }
+
 .quota-track {
   position: relative;
   width: 100%;
