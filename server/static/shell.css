@@ -113,6 +113,31 @@
 .nav-group.subtle .nav:hover,
 .nav-group.subtle .nav.active { color: var(--ink); }
 
+.nav-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  margin: 0 8px 4px;
+}
+.nav-label-row .nav-label { margin: 0; }
+.nav-label-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: background-color var(--t-fast), color var(--t-fast);
+}
+.nav-label-action:hover:not(:disabled) { background: var(--bg-hover); color: var(--ink); }
+.nav-label-action svg { width: 13px; height: 13px; }
+.nav-label-action.is-spinning svg { animation: spin 0.9s linear infinite; }
 .nav-label {
   margin: 0 8px 4px;
   color: var(--ink-3);
@@ -485,6 +510,7 @@
 .app-shell.sidebar-collapsed .sidebar-top { flex-direction: column; gap: 6px; justify-content: center; padding-inline: 0; }
 .app-shell.sidebar-collapsed .brand-name,
 .app-shell.sidebar-collapsed .nav-label,
+.app-shell.sidebar-collapsed .nav-label-row,
 .app-shell.sidebar-collapsed .nav .nav-text,
 .app-shell.sidebar-collapsed .nav-count,
 .app-shell.sidebar-collapsed .id-copy,
@@ -987,6 +1013,7 @@ main.content.view-entering {
   .app-shell.canvas-side-by-side .sidebar-top { flex-direction: column; gap: 6px; justify-content: center; padding-inline: 0; }
   .app-shell.canvas-side-by-side .brand-name,
   .app-shell.canvas-side-by-side .nav-label,
+  .app-shell.canvas-side-by-side .nav-label-row,
   .app-shell.canvas-side-by-side .nav .nav-text,
   .app-shell.canvas-side-by-side .nav-count,
   .app-shell.canvas-side-by-side .id-copy,

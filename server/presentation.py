@@ -8,12 +8,13 @@ from pptx import Presentation
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL_TYPE
 from pptx.enum.shapes import MSO_SHAPE, MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Inches
 from pydantic import BaseModel, Field
 
-from .files import file_for
+from .files import file_for, public_file
 from .identity import fail
-from .office import DRAW, clean_text, parse_xml
-from .store import database
+from .office import DRAW, add_file, clean_text, parse_xml
+from .store import database, instant, pack, unpack
 from .tasks import User
 
 router = APIRouter(prefix="/api/v1/files")
@@ -40,6 +41,18 @@ class Selection(BaseModel):
 class Replacement(BaseModel):
     shape_id: int = Field(ge=1)
     text: str = Field(min_length=1,max_length=500)
+
+
+class LayoutChange(BaseModel):
+    shape_id: int = Field(ge=1)
+    x: float = Field(ge=-2.0, le=15.0)
+    y: float = Field(ge=-2.0, le=9.5)
+    w: float = Field(gt=0.05, le=16.0)
+    h: float = Field(gt=0.05, le=10.0)
+
+
+class SlideLayoutUpdate(BaseModel):
+    changes: list[LayoutChange] = Field(min_length=1, max_length=80)
 
 
 def pptx_file(db, key, user):
@@ -237,6 +250,94 @@ def slide_preview(key: str,page:int,user:User):
     with database() as db:
         data=bytes(pptx_file(db,key,user)["data"])
     return selected_layout(load_presentation(data),page)
+
+
+def _sync_plan_element_coords(plan, page: int, moved_boxes: list[tuple[float, float, float, float, float, float, float, float]]):
+    """把手动拖动/缩放的新坐标同步回自由画布 DeckSpec，保证后续 AI 圈选修改看到最新排版。"""
+    if not isinstance(plan, dict):
+        return False
+    slides_list = plan.get("slides")
+    if not isinstance(slides_list, list) or not (1 <= page <= len(slides_list)):
+        return False
+    slide_dict = slides_list[page - 1]
+    elements = slide_dict.get("elements") if isinstance(slide_dict, dict) else None
+    if not isinstance(elements, list) or not elements:
+        return False
+    used_indices: set[int] = set()
+    changed = False
+    for old_x, old_y, old_w, old_h, new_x, new_y, new_w, new_h in moved_boxes:
+        best_idx = -1
+        best_dist = 0.65
+        for idx, el in enumerate(elements):
+            if idx in used_indices or not isinstance(el, dict):
+                continue
+            ex = float(el.get("x") or 0.0)
+            ey = float(el.get("y") or 0.0)
+            ew = float(el.get("w") or 0.0)
+            eh = float(el.get("h") or 0.0)
+            dist = abs(ex - old_x) + abs(ey - old_y) + abs(ew - old_w) * 0.5 + abs(eh - old_h) * 0.5
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        if best_idx >= 0:
+            used_indices.add(best_idx)
+            elements[best_idx]["x"] = round(new_x, 3)
+            elements[best_idx]["y"] = round(new_y, 3)
+            elements[best_idx]["w"] = round(new_w, 3)
+            elements[best_idx]["h"] = round(new_h, 3)
+            changed = True
+    return changed
+
+
+@router.post("/{key}/slides/{page}/layout")
+def update_slide_layout(key: str, page: int, payload: SlideLayoutUpdate, user: User):
+    with database() as db:
+        row = pptx_file(db, key, user)
+        data = bytes(row["data"])
+    prs = load_presentation(data)
+    slide = get_page(prs, page)
+    change_map = {item.shape_id: item for item in payload.changes}
+    moved_boxes: list[tuple[float, float, float, float, float, float, float, float]] = []
+    emu_per_inch = 914400.0
+    updated = 0
+    for shape in slide.shapes:
+        if shape.shape_id not in change_map:
+            continue
+        item = change_map[shape.shape_id]
+        old_x = int(shape.left or 0) / emu_per_inch
+        old_y = int(shape.top or 0) / emu_per_inch
+        old_w = int(shape.width or 0) / emu_per_inch
+        old_h = int(shape.height or 0) / emu_per_inch
+        shape.left = Inches(item.x)
+        shape.top = Inches(item.y)
+        shape.width = Inches(max(0.05, item.w))
+        shape.height = Inches(max(0.05, item.h))
+        moved_boxes.append((old_x, old_y, old_w, old_h, item.x, item.y, item.w, item.h))
+        updated += 1
+    if not updated:
+        fail(422, "未找到可移动的幻灯片组件")
+    out = BytesIO()
+    prs.save(out)
+    new_bytes = out.getvalue()
+
+    with database(write=True) as db:
+        row = pptx_file(db, key, user)
+        new_id = add_file(
+            db, user["id"], row["name"], new_bytes, "pptx", "edited",
+            assignment=row["assignment_id"], parent=row["id"], run=row["run_id"],
+        )
+        new_file = public_file(db, new_id)
+        if row["run_id"]:
+            turn_row = db.one("SELECT id, conversation_id, result FROM office_turns WHERE id=?", (row["run_id"],))
+            if turn_row:
+                res = unpack(turn_row["result"] or "{}")
+                if isinstance(res.get("file"), dict) and res["file"].get("id") == row["id"]:
+                    res["file"] = new_file
+                if res.get("plan"):
+                    _sync_plan_element_coords(res["plan"], page, moved_boxes)
+                db.execute("UPDATE office_turns SET result=? WHERE id=?", (pack(res), turn_row["id"]))
+                db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), turn_row["conversation_id"]))
+    return {"file": new_file, "page": page, "updated": updated}
 
 
 def edit_scope(data, selection):

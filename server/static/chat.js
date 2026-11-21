@@ -17,6 +17,101 @@ const modelInFlight = new Map();
 const sessionCache = new Map();
 const taskCache = new Map();
 const projectCache = new Map();
+const titleInFlight = new Set();
+const titleAttempted = new Set();
+const RAW_TITLE_RE = /^(?:新会话|请?帮我|请?给我|请你|请把|做一[个份套]|写一[个份篇]|生成一[个份套]|设计一[个份套]|介绍一?下)/;
+
+function looksLikeRawTitle(title) {
+  const t = String(title || "").trim();
+  if (!t || t === "新会话") return true;
+  if (RAW_TITLE_RE.test(t)) return true;
+  return false;
+}
+
+function applyConversationTitleLocally(threadId, nextTitle) {
+  if (!threadId || !nextTitle) return;
+  if (Array.isArray(state.conversations)) {
+    state.conversations = state.conversations.map((item) =>
+      item.id === threadId ? { ...item, title: nextTitle } : item
+    );
+  }
+  const cached = sessionCache.get(threadId);
+  if (cached) cached.title = nextTitle;
+  if (state.chatWorkspace?.session?.id === threadId) {
+    state.chatWorkspace.session.title = nextTitle;
+    if (Array.isArray(state.conversations)) state.chatWorkspace.conversations = state.conversations;
+    const titleWrap = document.querySelector("[data-thread-title-wrap]");
+    if (titleWrap) {
+      titleWrap.classList.remove("muted");
+      titleWrap.innerHTML = `${icon("message")}<span class="thread-title-text" title="${e(nextTitle)}">${e(nextTitle)}</span>`;
+    }
+  }
+  emitConversationsUpdated();
+}
+
+export async function generateConversationTitle(threadId, { force = false } = {}) {
+  const userId = state.me?.id;
+  if (!threadId || !userId || typeof window.officeDesktop?.generateTitle !== "function") return null;
+  if (titleInFlight.has(threadId)) return null;
+  if (!force && titleAttempted.has(threadId)) return null;
+  titleInFlight.add(threadId);
+  titleAttempted.add(threadId);
+  try {
+    const prep = await post(`/conversations/${encodeURIComponent(threadId)}/title/prepare`, {});
+    if (state.me?.id !== userId) return null;
+    const res = await window.officeDesktop.generateTitle({ system: prep.system, prompt: prep.prompt });
+    const title = String(res?.title || "").trim();
+    if (!title || title.length < 2 || state.me?.id !== userId) return null;
+    const updated = await api(`/conversations/${encodeURIComponent(threadId)}/title`, {
+      method: "PATCH",
+      body: { title }
+    });
+    if (state.me?.id !== userId) return null;
+    const finalTitle = updated?.title || title;
+    applyConversationTitleLocally(threadId, finalTitle);
+    return finalTitle;
+  } catch {
+    return null;
+  } finally {
+    titleInFlight.delete(threadId);
+  }
+}
+
+export async function autoTitleRecentConversations({ force = false, limit = 12, triggerButton = null } = {}) {
+  if (typeof window.officeDesktop?.generateTitle !== "function") {
+    if (force) toastMessage("请在桌面客户端中使用 AI 智能命名", "info");
+    return 0;
+  }
+  const list = Array.isArray(state.conversations) ? state.conversations : [];
+  const targets = list
+    .filter((s) => !s.assignment_id && !s.project_id && (force || (looksLikeRawTitle(s.title) && !titleAttempted.has(s.id))))
+    .slice(0, limit);
+  if (!targets.length) {
+    if (force) toastMessage("近期会话标题均已清晰规范", "info");
+    return 0;
+  }
+  if (triggerButton?.isConnected) {
+    triggerButton.disabled = true;
+    triggerButton.classList.add("is-spinning");
+  }
+  let renamed = 0;
+  try {
+    for (const session of targets) {
+      if (!state.me?.id) break;
+      const result = await generateConversationTitle(session.id, { force });
+      if (result) renamed += 1;
+    }
+    if (force) {
+      toastMessage(renamed ? `已为 ${renamed} 个会话生成 AI 标题` : "暂未能生成新标题，请稍后重试", renamed ? "success" : "info");
+    }
+  } finally {
+    if (triggerButton?.isConnected) {
+      triggerButton.disabled = false;
+      triggerButton.classList.remove("is-spinning");
+    }
+  }
+  return renamed;
+}
 
 export function runningConversationIds() {
   const userId = state.me?.id;
@@ -38,6 +133,8 @@ export function resetChatState() {
   sessionCache.clear();
   taskCache.clear();
   projectCache.clear();
+  titleInFlight.clear();
+  titleAttempted.clear();
 }
 
 function activeTurnFor(threadId) {
@@ -947,7 +1044,12 @@ export function conversationNav(workspace) {
     <button type="button" class="button new-session" data-act="route" data-id="chat" title="新建会话">
       ${icon("plus")}<span class="new-session-label">新建会话</span>
     </button>
-    ${workspace.conversations.length ? `<p class="nav-label">最近会话</p>
+    ${workspace.conversations.length ? `<div class="nav-label-row">
+      <p class="nav-label">最近会话</p>
+      ${typeof window.officeDesktop?.generateTitle === "function"
+        ? `<button type="button" class="nav-label-action" data-act="chat-auto-titles" title="让 AI 根据内容为最近会话生成精炼标题" aria-label="AI 智能命名最近会话">${icon("sparkles")}</button>`
+        : ""}
+    </div>
       <button type="button" class="button ghost history-trigger" data-act="chat-history" title="最近会话" aria-label="最近会话">${icon("history")}</button>
       <div class="recent-sessions">${workspace.conversations.map((session) => {
         const selected = state.route[0] === "chat" && state.route[1] === session.id;
@@ -2444,6 +2546,10 @@ async function runConversationTurn({
       toastMessage(title ? `会话「${title}」已完成` : "后台会话已完成，可切回查看结果", "success");
     }
     void refreshDesktopUsage().catch(() => {});
+    const curTitle = state.conversations?.find((c) => c.id === threadId)?.title || workspace.session?.title || "";
+    if (!workspace.task && !workspace.project && looksLikeRawTitle(curTitle)) {
+      void generateConversationTitle(threadId, { force: true }).catch(() => {});
+    }
   } catch (error) {
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);

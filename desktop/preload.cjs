@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld("officeDesktop", {
   usage: () => ipcRenderer.invoke("qo:usage"),
   runAgent: (job) => ipcRenderer.invoke("qo:run-agent", job),
   generateImage: (request) => ipcRenderer.invoke("qo:generate-image", request),
+  generateTitle: (request) => ipcRenderer.invoke("qo:generate-title", request),
   cancelAgent: () => ipcRenderer.invoke("qo:cancel-agent"),
   getCheckpoint: (conversationId, userId) => ipcRenderer.invoke("qo:get-checkpoint", conversationId, userId),
   clearCheckpoint: (conversationId) => ipcRenderer.invoke("qo:clear-checkpoint", conversationId),

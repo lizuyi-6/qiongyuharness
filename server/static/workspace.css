@@ -1784,6 +1784,54 @@
 .deck-shape-select { flex: 1; }
 .deck-note { min-height: 1.4em; }
 
+/* 画布交互模式切换（框选给 AI / 拖动排版） */
+.deck-mode-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.deck-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--bg-subtle);
+}
+.deck-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--t-fast), color var(--t-fast), box-shadow var(--t-fast);
+}
+.deck-mode-btn svg { width: 13px; height: 13px; flex: none; }
+.deck-mode-btn:hover:not(.active) { color: var(--ink); }
+.deck-mode-btn.active {
+  background: var(--bg-page);
+  color: var(--ink);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+.deck-layout-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.deck-layout-actions[hidden] { display: none; }
+.deck-canvas-frame canvas.is-move-mode { cursor: default; }
+
 /* 上下文 Tab 内容 */
 .studio-context-body {
   padding: 16px 18px 24px;

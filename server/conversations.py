@@ -46,9 +46,14 @@ class Decision(BaseModel):
     model_config = ConfigDict(extra="ignore")
     action: Literal["reply", "export"]
     reply: str = Field(min_length=1, max_length=6500)
+    session_title: str | None = Field(default=None, max_length=60)
     kind: Literal["docx", "pptx"] | None = None
     plan: Plan | None = None
     deck: DeckSpec | None = None
+
+
+class TitleUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=60)
 
 
 class SlideChange(BaseModel):
@@ -292,6 +297,32 @@ def new_thread(body: NewConversation, user: User):
         return conversation_summary(owned_thread(db, key, user))
 
 
+_RAW_PROMPT_TITLE_RE = re.compile(r"^(?:新会话|请?帮我|请?给我|请你|请把|做一[个份套]|写一[个份篇]|生成一[个份套]|设计一[个份套]|介绍一?下)")
+
+
+def _clean_session_title(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    text = re.sub(r"<think>[\s\S]*?</think>", "", raw, flags=re.I)
+    text = text.strip().splitlines()[0] if text.strip() else ""
+    text = re.sub(r"^(?:标题|会话标题|题目)\s*[:：]\s*", "", text).strip()
+    text = text.strip(" \"'“”‘’《》【】[]「」()（）。，,、:：;；!！?？")
+    text = " ".join(text.split())
+    return clean_text(text, 28, False)
+
+
+def _should_auto_replace_title(current_title: str, first_message: str = "") -> bool:
+    cur = (current_title or "").strip()
+    if not cur or cur == "新会话":
+        return True
+    if _RAW_PROMPT_TITLE_RE.match(cur):
+        return True
+    first_norm = " ".join((first_message or "").split())[:42]
+    if first_norm and cur == first_norm:
+        return True
+    return False
+
+
 @router.get("/{key}")
 def thread(key: str, user: User, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
     with database() as db:
@@ -300,6 +331,56 @@ def thread(key: str, user: User, limit: int = Query(50, ge=1, le=100), offset: i
                        (key, limit, offset))
     return {**conversation_summary(session), "turns": [public_turn(row) for row in reversed(turns)],
             "has_earlier": len(turns) == limit}
+
+
+@router.post("/{key}/title/prepare")
+def prepare_title_route(key: str, user: User):
+    with database() as db:
+        session = owned_thread(db, key, user)
+        turns = db.all(
+            "SELECT input, result, status FROM office_turns WHERE conversation_id=? ORDER BY created_at ASC LIMIT 6",
+            (key,),
+        )
+    snippets = []
+    for row in turns:
+        inp = unpack(row["input"] or "{}")
+        res = unpack(row["result"] or "{}")
+        msg = str(inp.get("message") or "").strip()[:240]
+        reply = str(res.get("reply") or "").strip()[:260]
+        file_name = (res.get("file") or {}).get("name") if isinstance(res.get("file"), dict) else ""
+        plan = res.get("plan")
+        doc_title = plan.get("title") if isinstance(plan, dict) else ""
+        parts = []
+        if msg:
+            parts.append(f"员工：{msg}")
+        if doc_title:
+            parts.append(f"文稿标题：{doc_title}")
+        elif file_name:
+            parts.append(f"生成文件：{file_name}")
+        if reply:
+            parts.append(f"助理回复：{reply}")
+        if parts:
+            snippets.append("\n".join(parts))
+    if not snippets:
+        fail(422, "会话暂无可用于命名的数据")
+    prompt = "请根据以下办公会话内容，输出一个 6–14 字的精炼中文标题：\n\n" + "\n---\n".join(snippets[:4])
+    return {
+        "system": prompting.TITLE_SYSTEM,
+        "prompt": prompt[:2400],
+        "current_title": session["title"],
+    }
+
+
+@router.patch("/{key}/title")
+def update_title_route(key: str, body: TitleUpdate, user: User):
+    cleaned = _clean_session_title(body.title)
+    if len(cleaned) < 2:
+        fail(422, "标题内容无效")
+    with database(write=True) as db:
+        owned_thread(db, key, user)
+        db.execute("UPDATE office_conversations SET title=? WHERE id=?", (cleaned, key))
+        updated = owned_thread(db, key, user)
+    return conversation_summary(updated)
 
 
 def demo_decision(message, mode, task, sources, recent, latest):
@@ -587,7 +668,8 @@ def parse_turn_response(text, kind):
     if (data.get("action") == "export" or data.get("kind") == "pptx") and isinstance(raw_deck, dict) and isinstance(raw_deck.get("slides"), list):
         deck = coerce_deck_spec(raw_deck)
         reply = str(data.get("reply") or "").strip()[:6500] or f"已生成演示文稿《{deck.title}》。"
-        return Decision(action="export", reply=reply, kind="pptx", deck=deck)
+        stitle = _clean_session_title(data.get("session_title")) or None
+        return Decision(action="export", reply=reply, session_title=stitle, kind="pptx", deck=deck)
     try:
         return Decision.model_validate(data)
     except ValidationError as exc:
@@ -1101,7 +1183,7 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
     output_telemetry = {key: stored_usage[key] for key in
                         ("max_tokens_clamped", "finish_reasons", "truncated") if key in stored_usage}
     with database(write=True) as db:
-        owned_thread(db, key, user)
+        conv_row = owned_thread(db, key, user)
         writable_task(db, assignment, user)
         current = db.one("SELECT status,result FROM office_turns WHERE id=? AND conversation_id=?", (run, key))
         current_run = db.one("SELECT status,engine FROM runs WHERE id=? AND user_id=?", (run, user["id"]))
@@ -1119,6 +1201,7 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             result["output_telemetry"] = output_telemetry
         if payload.pipeline is not None:
             result["pipeline"] = payload.pipeline.model_dump()
+        auto_doc_title = ""
         if revised:
             artifact = add_file(db, user["id"], target["name"], revised, "pptx", "generated",
                                 assignment=assignment, parent=target["id"], run=run)
@@ -1132,6 +1215,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             result.update(file=public_file(db, artifact), plan=plan_data, kind=kind)
             if kind == "pptx" and deck_image_ids:
                 result["deck_image_ids"] = deck_image_ids
+            if isinstance(plan_data, dict) and isinstance(plan_data.get("title"), str):
+                auto_doc_title = plan_data["title"]
             steps.append(f"已保存第 {scope['page']} 页的精修版" if (scope and scope.get("mode") == "freeform") else ("已导出 " + FORMATS[kind]))
         changed = db.execute("UPDATE office_turns SET result=?,status='completed' WHERE id=? AND status='running'",
                              (pack(result), run)).rowcount
@@ -1139,7 +1224,16 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
             fail(409, "本轮执行已结束")
         db.execute("UPDATE runs SET status='completed',usage=? WHERE id=? AND status='running'",
                    (pack(stored_usage), run))
-        db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), key))
+        # 若当前会话标题仍是占位符/口语截断，优先用 AI 产出的 session_title 或文稿标题自动优化
+        ai_title = _clean_session_title(getattr(decision, "session_title", None))
+        doc_title = _clean_session_title(auto_doc_title)
+        candidate_title = ai_title or doc_title
+        if (candidate_title and len(candidate_title) >= 2 and
+                not conv_row["assignment_id"] and not conv_row["project_id"] and
+                _should_auto_replace_title(conv_row["title"], body.message)):
+            db.execute("UPDATE office_conversations SET title=?,updated_at=? WHERE id=?", (candidate_title, instant(), key))
+        else:
+            db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), key))
         audit(db, "agent.completed", user["id"], assignment, run_id=run, engine=expected_engine, usage=stored_usage)
         return public_turn(db.one("SELECT * FROM office_turns WHERE id=?", (run,)))
 

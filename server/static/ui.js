@@ -73,7 +73,9 @@ const paths = {
   arrowUp: '<path d="M12 19V5m-6 6 6-6 6 6"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="m21 15-4.5-4.5L9 18"/>',
   slash: '<path d="M15 4 9 20"/>',
-  maximize: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>'
+  maximize: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
+  move: '<path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20"/>',
+  crop: '<rect x="5" y="5" width="14" height="14" rx="1.5" stroke-dasharray="3 2.5"/>'
 };
 
 const THEME_KEY = "qo-theme";

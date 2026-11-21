@@ -275,6 +275,11 @@ ipcMain.handle("qo:generate-image", async (event, request) => {
   return desktopAgent.generateImage(request);
 });
 
+ipcMain.handle("qo:generate-title", async (event, request) => {
+  if (!trusted(event)) throw new Error("页面无权生成会话标题");
+  return desktopAgent.generateTitle(request);
+});
+
 ipcMain.handle("qo:cancel-agent", (event) => {
   if (!trusted(event)) throw new Error("页面无权停止桌面执行");
   return desktopAgent.cancelAgent();

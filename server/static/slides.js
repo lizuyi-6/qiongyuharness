@@ -1,4 +1,4 @@
-import { api, button, e, icon, readDraft, saveDraft, state, toastMessage } from "./ui.js";
+import { api, button, e, icon, post, readDraft, saveDraft, state, toastMessage } from "./ui.js";
 
 export function deckFiles(session) {
   return [...new Map((session?.turns || []).filter((turn) => turn.file?.extension === "pptx")
@@ -134,6 +134,16 @@ export function deckPanel(workspace) {
     </div>
 
     <div class="deck-pptx-footer" data-pptx-controls hidden>
+      <div class="deck-mode-bar" data-deck-mode-bar>
+        <div class="deck-mode-switch" role="tablist" aria-label="画布交互模式">
+          <button type="button" class="deck-mode-btn active" data-deck-mode="select" role="tab" aria-selected="true">${icon("crop")}框选给 AI</button>
+          <button type="button" class="deck-mode-btn" data-deck-mode="move" role="tab" aria-selected="false">${icon("move")}拖动排版</button>
+        </div>
+        <div class="deck-layout-actions" data-deck-layout-actions hidden>
+          <button type="button" class="button sm ghost" data-deck-reset-layout>还原</button>
+          <button type="button" class="button sm primary" data-deck-save-layout>${icon("checkPlain")}保存布局</button>
+        </div>
+      </div>
       <div class="deck-strip" data-deck-strip aria-label="幻灯片页码快切"></div>
       <div class="deck-pager">
         <button type="button" class="icon-button bordered" data-deck-prev aria-label="上一页" title="上一页" disabled>${icon("left")}</button>
@@ -231,23 +241,113 @@ function objectOptionLabel(item, counters) {
   return `[图形] 卡片/色块 #${counters.shape}`;
 }
 
-async function renderSceneBase(scene) {
-  const scale = 1.6;
-  const offscreen = document.createElement("canvas");
-  offscreen.width = Math.round(scene.width * scale);
-  offscreen.height = Math.round(scene.height * scale);
-  const ctx = offscreen.getContext("2d");
-  ctx.scale(scale, scale);
-  const images = await Promise.all(scene.objects.map(async (shape) => {
+const RENDER_SCALE = 1.6;
+const HANDLE_RADIUS = 5.5;
+
+async function decodeSceneImages(scene) {
+  return Promise.all(scene.objects.map(async (shape) => {
     if (!shape.image) return null;
     const image = new Image();
     image.src = shape.image;
     try { await image.decode(); return image; } catch { return null; }
   }));
+}
+
+function effectiveRect(shape, overrides) {
+  const ov = overrides?.get(shape.id);
+  return ov || { left: shape.left, top: shape.top, width: shape.width, height: shape.height };
+}
+
+function resizeHandlesFor(box) {
+  return [
+    { key: "nw", x: box.left, y: box.top, cursor: "nwse-resize" },
+    { key: "ne", x: box.left + box.width, y: box.top, cursor: "nesw-resize" },
+    { key: "sw", x: box.left, y: box.top + box.height, cursor: "nesw-resize" },
+    { key: "se", x: box.left + box.width, y: box.top + box.height, cursor: "nwse-resize" }
+  ];
+}
+
+function hitHandle(box, x, y, hitPad = 10) {
+  if (!box) return null;
+  for (const h of resizeHandlesFor(box)) {
+    if (Math.abs(x - h.x) <= hitPad && Math.abs(y - h.y) <= hitPad) return h;
+  }
+  return null;
+}
+
+function snapBoxToGuides(movingId, rawBox, scene, overrides, threshold = 6) {
+  const guides = { x: [], y: [] };
+  const xTargets = [0, scene.width / 2, scene.width, 51, scene.width - 51];
+  const yTargets = [0, scene.height / 2, scene.height, 36, scene.height - 36];
+  for (const item of scene.objects) {
+    if (item.id === movingId || item.is_background) continue;
+    const r = effectiveRect(item, overrides);
+    xTargets.push(r.left, r.left + r.width / 2, r.left + r.width);
+    yTargets.push(r.top, r.top + r.height / 2, r.top + r.height);
+  }
+  let left = rawBox.left;
+  let top = rawBox.top;
+  const w = rawBox.width;
+  const h = rawBox.height;
+
+  let bestDx = threshold + 1;
+  let snappedX = null;
+  for (const [edgeVal, offset] of [[left, 0], [left + w / 2, w / 2], [left + w, w]]) {
+    for (const target of xTargets) {
+      const d = Math.abs(edgeVal - target);
+      if (d < bestDx) {
+        bestDx = d;
+        left = target - offset;
+        snappedX = target;
+      }
+    }
+  }
+  if (snappedX !== null && bestDx <= threshold) guides.x.push(snappedX);
+
+  let bestDy = threshold + 1;
+  let snappedY = null;
+  for (const [edgeVal, offset] of [[top, 0], [top + h / 2, h / 2], [top + h, h]]) {
+    for (const target of yTargets) {
+      const d = Math.abs(edgeVal - target);
+      if (d < bestDy) {
+        bestDy = d;
+        top = target - offset;
+        snappedY = target;
+      }
+    }
+  }
+  if (snappedY !== null && bestDy <= threshold) guides.y.push(snappedY);
+
+  return { box: { left, top, width: w, height: h }, guides };
+}
+
+function paintInteractiveScene(canvas, scene, images, overrides, {
+  selectedIds = [],
+  hoveredId = null,
+  regionBox = null,
+  isDragging = false,
+  mode = "select",
+  guides = null,
+  activeMoveId = null
+} = {}) {
+  if (!scene) return;
+  const wPx = Math.round(scene.width * RENDER_SCALE);
+  const hPx = Math.round(scene.height * RENDER_SCALE);
+  if (canvas.width !== wPx || canvas.height !== hPx) {
+    canvas.width = wPx;
+    canvas.height = hPx;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.scale(RENDER_SCALE, RENDER_SCALE);
+
   ctx.fillStyle = scene.background;
   ctx.fillRect(0, 0, scene.width, scene.height);
+
   for (const [index, shape] of scene.objects.entries()) {
-    const { left, top, width, height } = shape;
+    const { left, top, width, height } = effectiveRect(shape, overrides);
     if (shape.fill || shape.gradient || shape.border) {
       ctx.save();
       if (typeof shape.opacity === "number" && shape.opacity < 1) ctx.globalAlpha = Math.max(0, Math.min(1, shape.opacity));
@@ -282,7 +382,7 @@ async function renderSceneBase(scene) {
       }
       ctx.restore();
     }
-    if (images[index]) {
+    if (images?.[index]) {
       const img = images[index];
       const ir = img.naturalWidth / Math.max(1, img.naturalHeight);
       const br = width / Math.max(1, height);
@@ -319,40 +419,92 @@ async function renderSceneBase(scene) {
       ctx.restore();
     }
   }
-  return { offscreen, scale };
-}
 
-function paintOverlay(canvas, base, scene, { selectedIds = [], regionBox = null, isDragging = false } = {}) {
-  if (!base || !scene) return;
-  const { offscreen, scale } = base;
-  if (canvas.width !== offscreen.width || canvas.height !== offscreen.height) {
-    canvas.width = offscreen.width;
-    canvas.height = offscreen.height;
+  // 智能对齐参考线
+  if (mode === "move" && guides) {
+    ctx.save();
+    ctx.strokeStyle = "#ec4899";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    for (const gx of guides.x || []) {
+      ctx.beginPath();
+      ctx.moveTo(gx, 0);
+      ctx.lineTo(gx, scene.height);
+      ctx.stroke();
+    }
+    for (const gy of guides.y || []) {
+      ctx.beginPath();
+      ctx.moveTo(0, gy);
+      ctx.lineTo(scene.width, gy);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
-  const ctx = canvas.getContext("2d");
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(offscreen, 0, 0);
-  ctx.scale(scale, scale);
+
+  // 拖动模式悬停提示框
+  if (mode === "move" && hoveredId && hoveredId !== activeMoveId) {
+    const hovered = scene.objects.find((o) => o.id === hoveredId);
+    if (hovered) {
+      const { left, top, width, height } = effectiveRect(hovered, overrides);
+      ctx.save();
+      ctx.strokeStyle = "rgba(37, 99, 235, 0.45)";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(left, top, width, height);
+      ctx.restore();
+    }
+  }
 
   const selectedSet = new Set(selectedIds.filter(Boolean));
   for (const shape of scene.objects) {
     if (!selectedSet.has(shape.id)) continue;
-    const { left, top, width, height } = shape;
+    const box = effectiveRect(shape, overrides);
+    const { left, top, width, height } = box;
     ctx.save();
-    ctx.strokeStyle = "rgba(255,255,255,0.9)";
-    ctx.lineWidth = regionBox ? 2.5 : 4;
-    ctx.strokeRect(left, top, width, height);
-    ctx.strokeStyle = regionBox ? "rgba(37, 99, 235, 0.72)" : "#2563eb";
-    ctx.lineWidth = regionBox ? 1.5 : 2.2;
-    ctx.setLineDash([6, 4]);
-    ctx.strokeRect(left, top, width, height);
-    ctx.setLineDash([]);
+    if (mode === "move" && shape.id === activeMoveId) {
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 3.5;
+      ctx.strokeRect(left, top, width, height);
+      ctx.strokeStyle = "#2563eb";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(left, top, width, height);
+      for (const h of resizeHandlesFor(box)) {
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = "#2563eb";
+        ctx.lineWidth = 1.8;
+        ctx.fillRect(h.x - HANDLE_RADIUS, h.y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2);
+        ctx.strokeRect(h.x - HANDLE_RADIUS, h.y - HANDLE_RADIUS, HANDLE_RADIUS * 2, HANDLE_RADIUS * 2);
+      }
+      const xIn = (left / scene.width * SLIDE_W_IN).toFixed(2);
+      const yIn = (top / scene.height * SLIDE_H_IN).toFixed(2);
+      const wIn = (width / scene.width * SLIDE_W_IN).toFixed(2);
+      const hIn = (height / scene.height * SLIDE_H_IN).toFixed(2);
+      const tag = `X ${xIn}" · Y ${yIn}" · ${wIn}"×${hIn}"`;
+      ctx.font = '600 10.5px "Microsoft YaHei", sans-serif';
+      const tw = ctx.measureText(tag).width + 12;
+      const th = 19;
+      const tx = Math.max(4, Math.min(scene.width - tw - 4, left));
+      const ty = top >= th + 8 ? top - th - 6 : top + 6;
+      ctx.fillStyle = "#18181b";
+      ctx.fillRect(tx, ty, tw, th);
+      ctx.fillStyle = "#ffffff";
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+      ctx.fillText(tag, tx + 6, ty + th / 2);
+    } else {
+      ctx.strokeStyle = "rgba(255,255,255,0.9)";
+      ctx.lineWidth = regionBox ? 2.5 : 4;
+      ctx.strokeRect(left, top, width, height);
+      ctx.strokeStyle = regionBox ? "rgba(37, 99, 235, 0.72)" : "#2563eb";
+      ctx.lineWidth = regionBox ? 1.5 : 2.2;
+      ctx.setLineDash([6, 4]);
+      ctx.strokeRect(left, top, width, height);
+      ctx.setLineDash([]);
+    }
     ctx.restore();
   }
 
-  if (regionBox) {
+  if (mode === "select" && regionBox) {
     const { left, top, width, height } = regionBox;
     ctx.save();
     ctx.fillStyle = isDragging ? "rgba(37, 99, 235, 0.14)" : "rgba(37, 99, 235, 0.10)";
@@ -365,7 +517,6 @@ function paintOverlay(canvas, base, scene, { selectedIds = [], regionBox = null,
     ctx.setLineDash(isDragging ? [6, 4] : []);
     ctx.strokeRect(left, top, width, height);
     ctx.setLineDash([]);
-    // 四角控制锚点
     const r = 4;
     for (const [hx, hy] of [[left, top], [left + width, top], [left, top + height], [left + width, top + height]]) {
       ctx.fillStyle = "#ffffff";
@@ -534,6 +685,10 @@ export function mountDeck() {
   const counter = panel.querySelector("[data-deck-counter]");
   const shape = panel.querySelector("[data-deck-shape]");
   const clearBoxBtn = panel.querySelector("[data-deck-clear-box]");
+  const modeBar = panel.querySelector("[data-deck-mode-bar]");
+  const layoutActions = panel.querySelector("[data-deck-layout-actions]");
+  const saveLayoutBtn = panel.querySelector("[data-deck-save-layout]");
+  const resetLayoutBtn = panel.querySelector("[data-deck-reset-layout]");
   const canvas = panel.querySelector("canvas");
   const loading = panel.querySelector("[data-deck-loading]");
   const note = panel.querySelector("[data-deck-note]");
@@ -548,14 +703,19 @@ export function mountDeck() {
   let currentWorkspace = workspace;
   let artifacts = studioArtifacts(currentWorkspace.session);
   let scene = null;
-  let baseLayer = null;
+  let decodedImages = [];
   let epoch = 0;
   let totalPages = 0;
+  let interactionMode = "select"; // "select" | "move"
   let activeRegion = null; // { left, top, width, height } in scene coordinates
   let activeShapeIds = [];
   let activeLabel = "";
-  let dragStart = null;
-  let dragging = false;
+  let activeMoveId = null;
+  let hoveredId = null;
+  let layoutOverrides = new Map(); // shape_id -> { left, top, width, height }
+  let activeGuides = null;
+  let dragState = null; // { kind: "region"|"move"|"resize", ... }
+  let savingLayout = false;
 
   function setStageMode(mode) {
     if (stageBuilding) stageBuilding.hidden = mode !== "building";
@@ -567,6 +727,41 @@ export function mountDeck() {
 
   function currentArtifact() {
     return artifacts.find((item) => item.id === file.value) || null;
+  }
+
+  function syncModeUi() {
+    if (modeBar) {
+      for (const btn of modeBar.querySelectorAll("[data-deck-mode]")) {
+        const on = btn.dataset.deckMode === interactionMode;
+        btn.classList.toggle("active", on);
+        btn.setAttribute("aria-selected", on ? "true" : "false");
+      }
+    }
+    if (layoutActions) {
+      layoutActions.hidden = layoutOverrides.size === 0;
+    }
+    if (canvas) {
+      canvas.classList.toggle("is-move-mode", interactionMode === "move");
+      if (interactionMode === "select") canvas.style.cursor = "crosshair";
+      else if (!dragState) canvas.style.cursor = "default";
+    }
+  }
+
+  function setInteractionMode(nextMode) {
+    interactionMode = nextMode === "move" ? "move" : "select";
+    activeGuides = null;
+    if (interactionMode === "move") {
+      activeRegion = null;
+      if (!activeMoveId && shape.value) activeMoveId = Number(shape.value);
+      note.textContent = "拖动排版模式：直接拖动任意图片、卡片或文本框调整位置，拖动四角可缩放，支持方向键微调。";
+    } else {
+      hoveredId = null;
+      note.textContent = activeRegion
+        ? `已${activeLabel || "圈选区域"}，可在左侧直接输入修改要求（支持换图、改字、调排版）。`
+        : "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。";
+    }
+    syncModeUi();
+    redrawCanvas(false);
   }
 
   function syncPager(current) {
@@ -585,12 +780,21 @@ export function mountDeck() {
   }
 
   function redrawCanvas(isDragging = false) {
-    if (!baseLayer || !scene) return;
-    const selectedIds = activeRegion
-      ? activeShapeIds
-      : (shape.value ? [Number(shape.value)] : []);
-    paintOverlay(canvas, baseLayer, scene, { selectedIds, regionBox: activeRegion, isDragging });
-    if (clearBoxBtn) clearBoxBtn.hidden = !activeRegion && !shape.value;
+    if (!scene) return;
+    const selectedIds = interactionMode === "move"
+      ? (activeMoveId ? [activeMoveId] : [])
+      : (activeRegion ? activeShapeIds : (shape.value ? [Number(shape.value)] : []));
+    paintInteractiveScene(canvas, scene, decodedImages, layoutOverrides, {
+      selectedIds,
+      hoveredId: interactionMode === "move" ? hoveredId : null,
+      regionBox: interactionMode === "select" ? activeRegion : null,
+      isDragging,
+      mode: interactionMode,
+      guides: activeGuides,
+      activeMoveId
+    });
+    if (clearBoxBtn) clearBoxBtn.hidden = interactionMode !== "select" || (!activeRegion && !shape.value);
+    if (layoutActions) layoutActions.hidden = layoutOverrides.size === 0;
   }
 
   function describeRegionHits(box) {
@@ -598,7 +802,8 @@ export function mountDeck() {
     const fgHits = [];
     let bgHit = null;
     for (const item of scene.objects) {
-      if (!boxesIntersect(item, box)) continue;
+      const r = effectiveRect(item, layoutOverrides);
+      if (!boxesIntersect(r, box)) continue;
       if (item.is_background) {
         bgHit = item;
         continue;
@@ -641,17 +846,18 @@ export function mountDeck() {
 
   function pickObjectAtPoint(x, y) {
     if (!scene) return null;
-    const hits = scene.objects.filter((item) =>
-      x >= item.left && x <= item.left + item.width && y >= item.top && y <= item.top + item.height
-    );
+    const hits = scene.objects.filter((item) => {
+      const r = effectiveRect(item, layoutOverrides);
+      return x >= r.left && x <= r.left + r.width && y >= r.top && y <= r.top + r.height;
+    });
     if (!hits.length) return null;
     const foreground = hits.filter((item) => !item.is_background);
     if (foreground.length) {
-      // 优先命中上层文字/图片，面积更小者优先，方便在卡片内部直接点中图片或文本
       const score = (item) => {
+        const r = effectiveRect(item, layoutOverrides);
         const kind = objectKind(item);
         const priority = kind === "text" ? 0 : kind === "image" ? 1 : 2;
-        return priority * 1e9 + (item.width * item.height);
+        return priority * 1e9 + (r.width * r.height);
       };
       foreground.sort((a, b) => score(a) - score(b));
       return foreground[0];
@@ -662,11 +868,16 @@ export function mountDeck() {
   async function loadPptxPage(fileId, number) {
     const ticket = ++epoch;
     scene = null;
-    baseLayer = null;
+    decodedImages = [];
     activeRegion = null;
     activeShapeIds = [];
     activeLabel = "";
+    activeMoveId = null;
+    hoveredId = null;
+    activeGuides = null;
+    layoutOverrides.clear();
     action.disabled = true;
+    syncModeUi();
     syncPager(number);
     if (loading) { loading.textContent = "正在渲染幻灯片…"; loading.hidden = false; }
     const next = await api("/files/" + encodeURIComponent(fileId) + "/slides/" + number);
@@ -695,10 +906,11 @@ export function mountDeck() {
       } else if (selected.shape_id) {
         shape.value = String(selected.shape_id);
         activeShapeIds = [Number(selected.shape_id)];
+        activeMoveId = Number(selected.shape_id);
         activeLabel = selected.label || "";
       }
     }
-    baseLayer = await renderSceneBase(next);
+    decodedImages = await decodeSceneImages(next);
     if (!panel.isConnected || ticket !== epoch) return;
     redrawCanvas(false);
     canvas.hidden = false;
@@ -706,12 +918,15 @@ export function mountDeck() {
     void canvas.offsetWidth;
     canvas.classList.add("fading");
     if (loading) loading.hidden = true;
-    canvas.setAttribute("aria-label", `第 ${number} 页预览（支持拖拽框选或点击任意元素）`);
+    canvas.setAttribute("aria-label", `第 ${number} 页预览（支持框选修改或拖动排版）`);
     shape.disabled = false;
     action.disabled = !document.querySelector("[data-form=conversation]");
-    note.textContent = activeRegion
-      ? `已${activeLabel || "圈选区域"}，可在左侧直接输入修改要求（支持换图、改字、调排版）。`
-      : "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。";
+    syncModeUi();
+    note.textContent = interactionMode === "move"
+      ? "拖动排版模式：直接拖动任意图片、卡片或文本框调整位置，拖动四角可缩放，支持方向键微调。"
+      : (activeRegion
+        ? `已${activeLabel || "圈选区域"}，可在左侧直接输入修改要求（支持换图、改字、调排版）。`
+        : "在画布上拖拽鼠标可自由圈选任意区域（含图片、卡片、文字），或单击任意元素直接让 AI 修改。");
     remember(currentWorkspace, { deck: { fileId, page: number } });
   }
 
@@ -882,11 +1097,70 @@ export function mountDeck() {
     activeRegion = null;
     const sid = shape.value ? Number(shape.value) : null;
     activeShapeIds = sid ? [sid] : [];
+    activeMoveId = sid;
     const obj = sid && scene ? scene.objects.find((item) => item.id === sid) : null;
     activeLabel = obj ? describeSingleObject(obj) : "";
     redrawCanvas(false);
-    if (sid) applySelection(false);
-    else clearSelection();
+    if (interactionMode === "select") {
+      if (sid) applySelection(false);
+      else clearSelection();
+    }
+  });
+  modeBar?.addEventListener("click", (event) => {
+    const btn = event.target.closest("[data-deck-mode]");
+    if (!btn) return;
+    setInteractionMode(btn.dataset.deckMode);
+  });
+  resetLayoutBtn?.addEventListener("click", () => {
+    layoutOverrides.clear();
+    activeGuides = null;
+    redrawCanvas(false);
+    toastMessage("已还原当前页手动拖动改动", "info");
+  });
+  saveLayoutBtn?.addEventListener("click", async () => {
+    if (savingLayout || !scene || !layoutOverrides.size) return;
+    const currentFileId = file.value;
+    const currentPageNum = Number(page.value) || 1;
+    if (!currentFileId) return;
+    savingLayout = true;
+    saveLayoutBtn.disabled = true;
+    saveLayoutBtn.textContent = "正在保存…";
+    try {
+      const changes = [];
+      for (const [shapeId, box] of layoutOverrides.entries()) {
+        changes.push({
+          shape_id: Number(shapeId),
+          x: Number((box.left / scene.width * SLIDE_W_IN).toFixed(3)),
+          y: Number((box.top / scene.height * SLIDE_H_IN).toFixed(3)),
+          w: Number(Math.max(0.08, box.width / scene.width * SLIDE_W_IN).toFixed(3)),
+          h: Number(Math.max(0.08, box.height / scene.height * SLIDE_H_IN).toFixed(3))
+        });
+      }
+      const res = await post(`/files/${encodeURIComponent(currentFileId)}/slides/${currentPageNum}/layout`, { changes });
+      const newFile = res?.file;
+      if (newFile?.id) {
+        // 同步替换当前会话内存中的对应 turn.file，让画布下拉与下载按钮立刻指向新版 PPT
+        const turns = currentWorkspace?.session?.turns || [];
+        for (let i = turns.length - 1; i >= 0; i -= 1) {
+          if (turns[i].file?.id === currentFileId) {
+            turns[i].file = newFile;
+            break;
+          }
+        }
+        layoutOverrides.clear();
+        activeGuides = null;
+        await activeController?.syncArtifacts(currentWorkspace, { selectId: newFile.id, preferredPage: currentPageNum, flash: true });
+        toastMessage(`已保存第 ${currentPageNum} 页布局（已调整 ${res.updated || changes.length} 个组件）`, "success");
+      }
+    } catch (error) {
+      toastMessage(error?.message || "布局保存失败", "error");
+    } finally {
+      savingLayout = false;
+      if (saveLayoutBtn.isConnected) {
+        saveLayoutBtn.disabled = false;
+        saveLayoutBtn.innerHTML = `${icon("checkPlain")}保存布局`;
+      }
+    }
   });
   clearBoxBtn?.addEventListener("click", () => {
     activeRegion = null;
@@ -899,42 +1173,150 @@ export function mountDeck() {
   });
 
   canvas.addEventListener("pointerdown", (event) => {
-    if (!scene || !baseLayer || event.button !== 0) return;
+    if (!scene || event.button !== 0) return;
     event.preventDefault();
-    dragStart = scenePointFromEvent(event);
-    dragging = false;
+    const pt = scenePointFromEvent(event);
     try { canvas.setPointerCapture(event.pointerId); } catch {}
+
+    if (interactionMode === "move") {
+      // 1. 先检查是否点中当前选中组件的四角缩放手柄
+      if (activeMoveId) {
+        const curObj = scene.objects.find((o) => o.id === activeMoveId);
+        if (curObj) {
+          const curBox = effectiveRect(curObj, layoutOverrides);
+          const handle = hitHandle(curBox, pt.x, pt.y);
+          if (handle) {
+            dragState = { kind: "resize", id: curObj.id, handle: handle.key, startPt: pt, startBox: { ...curBox } };
+            canvas.style.cursor = handle.cursor;
+            return;
+          }
+        }
+      }
+      // 2. 命中组件即可直接拖动移动
+      const hit = pickObjectAtPoint(pt.x, pt.y);
+      if (hit) {
+        activeMoveId = hit.id;
+        shape.value = String(hit.id);
+        const startBox = { ...effectiveRect(hit, layoutOverrides) };
+        dragState = { kind: "move", id: hit.id, startPt: pt, startBox, moved: false };
+        canvas.style.cursor = "grabbing";
+        note.textContent = `已选中「${describeSingleObject(hit)}」，拖动移动位置，拖四角缩放大小。`;
+        redrawCanvas(false);
+      } else {
+        activeMoveId = null;
+        shape.value = "";
+        dragState = null;
+        redrawCanvas(false);
+      }
+      return;
+    }
+
+    // 框选给 AI 模式
+    dragState = { kind: "region", startPt: pt, dragging: false };
   });
 
   canvas.addEventListener("pointermove", (event) => {
-    if (!dragStart || !scene || !baseLayer) return;
-    const current = scenePointFromEvent(event);
-    const dist = Math.hypot(current.x - dragStart.x, current.y - dragStart.y);
-    if (!dragging && dist < 8) return;
-    dragging = true;
-    const box = normalizeBox(dragStart, current, scene.width, scene.height);
-    activeRegion = box;
-    const hitInfo = describeRegionHits(box);
-    activeShapeIds = hitInfo.ids;
-    activeLabel = hitInfo.label;
-    shape.value = "";
-    redrawCanvas(true);
+    if (!scene) return;
+    const pt = scenePointFromEvent(event);
+
+    if (!dragState) {
+      if (interactionMode === "move") {
+        if (activeMoveId) {
+          const curObj = scene.objects.find((o) => o.id === activeMoveId);
+          if (curObj) {
+            const handle = hitHandle(effectiveRect(curObj, layoutOverrides), pt.x, pt.y);
+            if (handle) {
+              canvas.style.cursor = handle.cursor;
+              return;
+            }
+          }
+        }
+        const hit = pickObjectAtPoint(pt.x, pt.y);
+        const nextHover = hit ? hit.id : null;
+        canvas.style.cursor = hit ? "move" : "default";
+        if (nextHover !== hoveredId) {
+          hoveredId = nextHover;
+          redrawCanvas(false);
+        }
+      }
+      return;
+    }
+
+    if (dragState.kind === "move") {
+      const dx = pt.x - dragState.startPt.x;
+      const dy = pt.y - dragState.startPt.y;
+      if (!dragState.moved && Math.hypot(dx, dy) < 2) return;
+      dragState.moved = true;
+      const rawBox = {
+        left: Math.max(-40, Math.min(scene.width - 10, dragState.startBox.left + dx)),
+        top: Math.max(-40, Math.min(scene.height - 10, dragState.startBox.top + dy)),
+        width: dragState.startBox.width,
+        height: dragState.startBox.height
+      };
+      const snapped = snapBoxToGuides(dragState.id, rawBox, scene, layoutOverrides);
+      layoutOverrides.set(dragState.id, snapped.box);
+      activeGuides = snapped.guides;
+      redrawCanvas(true);
+      return;
+    }
+
+    if (dragState.kind === "resize") {
+      const dx = pt.x - dragState.startPt.x;
+      const dy = pt.y - dragState.startPt.y;
+      const sb = dragState.startBox;
+      const minW = 20;
+      const minH = 14;
+      let left = sb.left;
+      let top = sb.top;
+      let right = sb.left + sb.width;
+      let bottom = sb.top + sb.height;
+      if (dragState.handle.includes("w")) left = Math.min(right - minW, Math.max(0, sb.left + dx));
+      if (dragState.handle.includes("e")) right = Math.max(left + minW, Math.min(scene.width, sb.left + sb.width + dx));
+      if (dragState.handle.includes("n")) top = Math.min(bottom - minH, Math.max(0, sb.top + dy));
+      if (dragState.handle.includes("s")) bottom = Math.max(top + minH, Math.min(scene.height, sb.top + sb.height + dy));
+      layoutOverrides.set(dragState.id, { left, top, width: right - left, height: bottom - top });
+      activeGuides = null;
+      redrawCanvas(true);
+      return;
+    }
+
+    if (dragState.kind === "region") {
+      const dist = Math.hypot(pt.x - dragState.startPt.x, pt.y - dragState.startPt.y);
+      if (!dragState.dragging && dist < 8) return;
+      dragState.dragging = true;
+      const box = normalizeBox(dragState.startPt, pt, scene.width, scene.height);
+      activeRegion = box;
+      const hitInfo = describeRegionHits(box);
+      activeShapeIds = hitInfo.ids;
+      activeLabel = hitInfo.label;
+      shape.value = "";
+      redrawCanvas(true);
+    }
   });
 
   function finishPointer(event, cancelled = false) {
-    if (!dragStart || !scene || !baseLayer) return;
-    const start = dragStart;
-    const wasDragging = dragging;
-    dragStart = null;
-    dragging = false;
+    if (!dragState || !scene) return;
+    const stateSnap = dragState;
+    dragState = null;
+    activeGuides = null;
     try { canvas.releasePointerCapture(event.pointerId); } catch {}
+
+    if (stateSnap.kind === "move" || stateSnap.kind === "resize") {
+      canvas.style.cursor = "move";
+      redrawCanvas(false);
+      if (layoutOverrides.size > 0) {
+        note.textContent = `已调整 ${layoutOverrides.size} 个组件位置/尺寸，点击上方「保存布局」写入 PPTX。`;
+      }
+      return;
+    }
+
     if (cancelled) {
       redrawCanvas(false);
       return;
     }
     const end = scenePointFromEvent(event);
-    if (wasDragging && Math.abs(end.x - start.x) >= 10 && Math.abs(end.y - start.y) >= 10) {
-      const box = normalizeBox(start, end, scene.width, scene.height);
+    if (stateSnap.dragging && Math.abs(end.x - stateSnap.startPt.x) >= 10 && Math.abs(end.y - stateSnap.startPt.y) >= 10) {
+      const box = normalizeBox(stateSnap.startPt, end, scene.width, scene.height);
       activeRegion = box;
       const hitInfo = describeRegionHits(box);
       activeShapeIds = hitInfo.ids;
@@ -946,12 +1328,12 @@ export function mountDeck() {
       toastMessage(`已圈选第 ${page.value} 页区域，可在左侧直接描述修改要求`, "info");
       return;
     }
-    // 单击：命中任意元素（图片、文字、卡片/图形）
     activeRegion = null;
     const hit = pickObjectAtPoint(end.x, end.y);
     if (hit) {
       shape.value = String(hit.id);
       activeShapeIds = [hit.id];
+      activeMoveId = hit.id;
       activeLabel = describeSingleObject(hit);
       redrawCanvas(false);
       applySelection(true);
@@ -967,6 +1349,42 @@ export function mountDeck() {
 
   canvas.addEventListener("pointerup", (event) => finishPointer(event, false));
   canvas.addEventListener("pointercancel", (event) => finishPointer(event, true));
+  canvas.addEventListener("pointerleave", () => {
+    if (!dragState && hoveredId !== null) {
+      hoveredId = null;
+      redrawCanvas(false);
+    }
+  });
+
+  // 拖动排版模式下支持方向键精准微调组件位置
+  const onKeydown = (event) => {
+    if (!panel.isConnected) {
+      document.removeEventListener("keydown", onKeydown);
+      return;
+    }
+    if (interactionMode !== "move" || !activeMoveId || !scene) return;
+    if (event.target?.matches?.("input, textarea, select, [contenteditable]")) return;
+    const step = event.shiftKey ? 12 : 2;
+    let dx = 0;
+    let dy = 0;
+    if (event.key === "ArrowLeft") dx = -step;
+    else if (event.key === "ArrowRight") dx = step;
+    else if (event.key === "ArrowUp") dy = -step;
+    else if (event.key === "ArrowDown") dy = step;
+    else return;
+    event.preventDefault();
+    const curObj = scene.objects.find((o) => o.id === activeMoveId);
+    if (!curObj) return;
+    const box = effectiveRect(curObj, layoutOverrides);
+    layoutOverrides.set(activeMoveId, {
+      left: Math.max(-40, Math.min(scene.width - 10, box.left + dx)),
+      top: Math.max(-40, Math.min(scene.height - 10, box.top + dy)),
+      width: box.width,
+      height: box.height
+    });
+    redrawCanvas(false);
+  };
+  document.addEventListener("keydown", onKeydown);
 
   action.addEventListener("click", () => {
     applySelection(true);

@@ -30,10 +30,10 @@ PRINCIPLES = """
 CONVERSATION_PROTOCOL = """
 # 输出协议（必须严格遵守）
 只输出一个 JSON 对象。不要输出代码围栏、解释或 JSON 之外的任何文字。字符串里的换行写成 \\n，双引号写成 \\"。
-- 纯回复（默认优先）：{"action":"reply","reply":"给员工的 Markdown 答复"}
-- 导出 Word：{"action":"export","reply":"一两句话说明生成了什么、有哪些待补充项","kind":"docx","plan":{"title":"标题","subtitle":"副标题，可为空字符串","sections":[{"heading":"节标题","points":["要点或段落"],"conclusion":"本节结论，可为空字符串","notes":""}]}}
+- 纯回复（默认优先）：{"action":"reply","reply":"给员工的 Markdown 答复","session_title":"6–14字精炼会话标题（可选，严禁以帮我/给我/请开头）"}
+- 导出 Word：{"action":"export","reply":"一两句话说明生成了什么、有哪些待补充项","session_title":"6–14字精炼会话标题（可选）","kind":"docx","plan":{"title":"标题","subtitle":"副标题，可为空字符串","sections":[{"heading":"节标题","points":["要点或段落"],"conclusion":"本节结论，可为空字符串","notes":""}]}}
   需要对比时，section 里可加 "table":{"columns":["对比项","A","B"],"rows":[["指标","…","…"]]}。
-- 导出 PPT（自由画布，无固定模板）：{"action":"export","reply":"一两句话说明设计风格、页数与待补充项","kind":"pptx","deck":{"title":"标题","subtitle":"副标题","design":{"concept":"本套视觉概念","palette":{"bg":"#...","surface":"#...","primary":"#...","accent":"#...","text":"#...","muted":"#...","border":"#..."},"font":"Microsoft YaHei"},"slides":[{"title":"本页标题","bg":"#...","bg_image":1,"bg_overlay":{"color":"#...","opacity":0.55},"notes":"演讲备注","elements":[...]}]}}
+- 导出 PPT（自由画布，无固定模板）：{"action":"export","reply":"一两句话说明设计风格、页数与待补充项","session_title":"6–14字精炼会话标题（可选）","kind":"pptx","deck":{"title":"标题","subtitle":"副标题","design":{"concept":"本套视觉概念","palette":{"bg":"#...","surface":"#...","primary":"#...","accent":"#...","text":"#...","muted":"#...","border":"#..."},"font":"Microsoft YaHei"},"slides":[{"title":"本页标题","bg":"#...","bg_image":1,"bg_overlay":{"color":"#...","opacity":0.55},"notes":"演讲备注","elements":[...]}]}}
 
 ## 交付形式判定（极其重要，严禁越权生成文件）
 1. 默认直接文字回复（action="reply"）：问答、介绍项目/公司/技术、总结资料、分析问题、看大纲、润色几段话等没有明确要文件的请求，一律用结构化 Markdown 直接回复，不要导出文件。
@@ -169,6 +169,14 @@ SLIDE_FREEFORM_SYSTEM = """
    - 仅输出一个 JSON 对象，不要代码围栏或多余文字：
      {"action":"patch_slide","reply":"一两句话清楚说明对本页/选区做了哪些修改（含是否重新生图）","slide":{"title":"本页标题","bg":"#...","bg_image":null,"bg_overlay":null,"notes":"演讲备注","elements":[...]}}
    - 仅当员工明确要求调整整套主色/字体时，可额外附带可选字段 `"design": {"concept":"...","palette":{...},"font":"Microsoft YaHei"}`。
+""".strip()
+
+TITLE_SYSTEM = """
+你是办公会话标题提炼助手。请根据给定的对话内容和已生成的文稿，提炼一个 6–14 字的精炼中文标题。
+严格规则：
+1. 只输出标题纯文本本身，不要输出引号、书名号、句号、前缀（如“标题：”）、解释或换行。
+2. 严禁以“帮我”“给我”“请”“做一个”“设计一个”“介绍一下”等口语请求词开头。
+3. 精准概括核心主题与产出类型（例如：MiniMax 公司介绍 PPT、DeepSeek 模型深度解析、Q3 销售复盘报告、Networksafe 项目架构问答）。
 """.strip()
 
 _COMPILED = {preset.id: tuple(re.compile(pattern, re.IGNORECASE) for pattern in preset.keywords)

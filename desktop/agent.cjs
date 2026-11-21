@@ -280,6 +280,67 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     return checkpointStore.clear(origin, String(conversationId));
   }
 
+  function cleanGeneratedTitle(raw) {
+    if (typeof raw !== "string") return "";
+    let text = raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    text = lines[lines.length - 1] || "";
+    text = text.replace(/^(?:标题|会话标题|题目)\s*[:：]\s*/, "");
+    text = text.replace(/^["'“”‘’《》【】\[\]「」()（）]+|["'“”‘’《》【】\[\]「」()（）。，,、:：;；!！?？]+$/g, "");
+    text = text.replace(/\s+/g, " ").trim();
+    return text.slice(0, 26);
+  }
+
+  async function generateTitle(request = {}) {
+    const system = typeof request.system === "string" ? request.system.trim() : "";
+    const prompt = typeof request.prompt === "string" ? request.prompt.trim() : "";
+    if (!system || !prompt) throw new Error("标题生成参数无效");
+    const origin = getOrigin();
+    const available = (await readFreshModels()).filter((m) => !m.startsWith("gpt-image-"));
+    if (!available.length) throw new Error("暂无可用模型");
+    let chosenModel = typeof request.model === "string" && available.includes(request.model) ? request.model : "";
+    if (!chosenModel) {
+      try {
+        const cfg = await loadPipelineConfig(origin);
+        for (const candidate of [cfg?.roles?.light, cfg?.roles?.understand, cfg?.roles?.accept, cfg?.roles?.execute]) {
+          if (candidate && available.includes(candidate)) {
+            chosenModel = candidate;
+            break;
+          }
+        }
+      } catch {}
+    }
+    if (!chosenModel) chosenModel = available[0];
+    const { credential } = await getCredentialImpl(origin);
+    const url = `${credential.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+    const response = await net.fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credential.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({
+        model: chosenModel,
+        stream: false,
+        temperature: 0.2,
+        max_tokens: 96,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: prompt }
+        ]
+      }),
+      redirect: "error",
+      signal: AbortSignal.timeout(25_000)
+    });
+    if (!response.ok) throw new Error(`标题生成请求失败(HTTP ${response.status})`);
+    const payload = await response.json().catch(() => ({}));
+    const msg = payload?.choices?.[0]?.message || {};
+    const title = cleanGeneratedTitle(typeof msg.content === "string" ? msg.content : "");
+    if (!title || title.length < 2) throw new Error("AI 未返回有效标题");
+    return { title, model: chosenModel };
+  }
+
   async function loadPipelineConfig(origin) {
     const payload = await readSessionJson(origin, `${origin}/api/v1/me/pipeline`);
     return sanitizePipelineConfig(payload);
@@ -874,6 +935,7 @@ function createDesktopAgent({ app, getWindow, getOrigin, emit = () => {}, depend
     models,
     usage,
     generateImage,
+    generateTitle,
     prefetchAfterLogin,
     runAgent
   };

@@ -6,7 +6,7 @@ import { ensureShell, openCommandPalette, setMobileNav, syncConnectionIndicator,
   syncSidebarConversations, syncThemeToggle, syncTodayBadge, syncUpdateUi, toggleSidebar, triggerTopbarSweep, triggerViewEnter, unmountShell } from "./shell.js";
 import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm, showPublish, showTaskForm,
   taskAdmin } from "./admin.js";
-import { abortOrphanTurn, applySlashCommand, attachFiles, cancelActiveChat, chooseSources, closeComposerPickers,
+import { abortOrphanTurn, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, closeComposerPickers,
   closeSlashMenu, copyReply, discardCheckpoint, generateImageFromComposer, handleSlashKeydown, loadDesktopModelState, loadEarlier,
   loadWorkspace, openDeckInStudio, openImageLightbox, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
   removeSource, resetChatState, resumeFailedTurn, retryTurn, runDesktopAgent, saveImageAutoPreference,
@@ -142,6 +142,7 @@ async function preloadSidebarData() {
       state.conversations = conversations;
       if (state.chatWorkspace) state.chatWorkspace.conversations = conversations;
       syncSidebarConversations();
+      void autoTitleRecentConversations({ force: false, limit: 12 }).catch(() => {});
     }
     if (todayData?.items) {
       state.today = todayData.items;
@@ -539,6 +540,7 @@ async function onClick(event) {
     case "chat-remove-source": removeSource(id); break;
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
+    case "chat-auto-titles": await autoTitleRecentConversations({ force: true, limit: 15, triggerButton: target }); break;
     case "chat-earlier": await loadEarlier(); break;
     case "chat-cancel": await cancelActiveChat(); break;
     case "chat-resume": await resumeFailedTurn(target); break;
