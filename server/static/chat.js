@@ -3,6 +3,7 @@ import { active, api, badge, button, cleanErrorMessage, copyText, deadline, dial
 import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, selectionSummaryText, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
 import { feedbackErrorStrip, recordClientLog } from "./feedback.js";
+import { CATEGORY_META, openBindProjectModal, openQuickProjectContextModal } from "./project.js";
 
 const readable = new Set(["docx", "pptx", "xlsx", "pdf", "txt", "md", "csv"]);
 const imageExts = new Set(["png", "jpg", "jpeg", "webp"]);
@@ -1444,11 +1445,13 @@ function welcomeHero(workspace) {
   const { task, project } = workspace;
   const firstName = state.me?.name || "";
   const heading = task ? task.title : project ? project.name : `${firstName ? `${firstName}，` : ""}今天要处理什么？`;
-  const tag = task ? "关联任务" : project ? "项目空间" : "";
+  const tag = task ? "关联任务" : project ? "项目空间 · 自动注入预整理上下文" : "";
+  const subcopy = project?.description ? `<p class="welcome-subcopy">${e(project.description)}</p>` : "";
   return `<div class="welcome-hero">
     <div class="welcome-emblem" aria-hidden="true">${icon("mark")}</div>
     ${tag ? `<span class="welcome-tag">${e(tag)}</span>` : ""}
     <h1>${e(heading)}</h1>
+    ${subcopy}
   </div>`;
 }
 
@@ -1457,17 +1460,46 @@ function welcomeBelow(workspace) {
   const examples = task ? [
     ["梳理交付要求", "先梳理这项任务的交付要求，列出需要补充的资料。"],
     ["生成初稿", task.kind === "pptx" ? "按任务要求生成一份可编辑 PPT，保留待确认的信息。" : "按任务要求生成一份可编辑 Word 初稿，保留待确认的信息。"]
+  ] : project ? [
+    ["梳理项目全貌与核心结论", "基于当前项目的预整理总览与共享资料，梳理项目目标、关键结论与下一步行动清单。"],
+    ["按项目口径起草 Word 方案", "结合项目上下文中的背景目标、会议决策与口径规范，起草一份可编辑的 Word 方案文稿。"],
+    ["基于项目资料制作汇报 PPT", "结合项目共享资料中的核心数据与结论，制作一份结构清晰的可编辑汇报 PPT。"]
   ] : [
     ["整理会议纪要", "帮我整理会议纪要，按议题、结论和后续行动展开。"],
     ["起草 Word 文档", "帮我起草一份可编辑 Word 文档。"],
     ["制作汇报 PPT", "帮我制作一份可编辑的汇报 PPT。"]
   ];
 
+  const enabledProjectItems = (project?.context || []).filter((c) => c.enabled !== false);
+  const projectSummaryCard = project
+    ? `<section class="welcome-tasks welcome-project-card" aria-label="当前项目预整理上下文">
+        <div class="between">
+          <span class="context-label">${icon("sparkles")}<span>已自动挂载项目预整理上下文（${enabledProjectItems.length} 项生效）</span></span>
+          <div class="actions">
+            <button type="button" class="text-button" data-act="project-quick-add" data-id="${e(project.id)}">${icon("plus")}上传文件 / 记决策</button>
+            <button type="button" class="text-button" data-act="route" data-id="projects/${e(project.id)}">项目空间${icon("right")}</button>
+          </div>
+        </div>
+        ${enabledProjectItems.length
+          ? `<div class="welcome-project-chips">${enabledProjectItems.slice(0, 6).map((item) => {
+              const cat = CATEGORY_META[item.category] || CATEGORY_META.doc;
+              return `<span class="welcome-project-chip" title="${e(item.digest?.summary || item.content || item.title)}">
+                <small class="project-cat-badge is-${e(cat.tone)}">${e(cat.tag)}</small>
+                <strong>${e(item.title)}</strong>
+              </span>`;
+            }).join("")}</div>`
+          : `<p class="hint">该项目暂未添加资料，点击右上角「上传文件 / 记决策」即可直接拖入文档并自动预整理。</p>`}
+      </section>`
+    : "";
+
   const quickTasks = !task && !project && workspace.tasks?.length
     ? `<section class="welcome-tasks" aria-label="今日待办任务">
         <div class="between">
           <span class="context-label">今日待办</span>
-          <button type="button" class="text-button" data-act="route" data-id="today">全部${icon("right")}</button>
+          <div class="actions">
+            <button type="button" class="text-button" data-act="chat-bind-project">${icon("layers")}关联项目上下文</button>
+            <button type="button" class="text-button" data-act="route" data-id="today">全部${icon("right")}</button>
+          </div>
         </div>
         <div class="welcome-task-grid">${workspace.tasks.slice(0, 4).map((item) => `
           <button type="button" class="welcome-task-item" data-act="route" data-id="chat/task/${encodeURIComponent(item.id)}">
@@ -1476,11 +1508,16 @@ function welcomeBelow(workspace) {
           </button>`).join("")}
         </div>
       </section>`
-    : "";
+    : (!task && !project
+      ? `<div class="welcome-bind-row">
+          <button type="button" class="text-button" data-act="chat-bind-project">${icon("layers")}<span>为当前会话关联「项目知识库上下文」（自动注入项目背景、决策与共享文档）</span></button>
+        </div>`
+      : "");
 
   return `<div class="welcome-below">
     <div class="prompt-examples">${examples.map(([label, value]) =>
       button(label, "chat-example", { id: value })).join("")}</div>
+    ${projectSummaryCard}
     ${quickTasks}
   </div>`;
 }
@@ -1502,15 +1539,23 @@ function contextAnchorBar(workspace) {
       </div>
     </div>`;
   }
-  return `<div class="context-anchor">
+  const allItems = Array.isArray(project.context) ? project.context : [];
+  const enabledItems = allItems.filter((c) => c.enabled !== false);
+  const fileCount = enabledItems.filter((c) => c.artifact_id).length;
+  return `<div class="context-anchor is-project-anchor">
     <div class="context-anchor-main">
       <span class="context-anchor-tag">项目空间</span>
       <strong title="${e(project.name)}">${e(project.name)}</strong>
-      <span class="hint">${project.context.length} 份共享资料</span>
+      <span class="context-anchor-status ${enabledItems.length ? "is-ready" : ""}">
+        ${icon(enabledItems.length ? "checkPlain" : "sparkles")}
+        <span>${enabledItems.length ? `已自动注入 ${enabledItems.length} 项预整理上下文${fileCount ? `（${fileCount} 份文档）` : ""}` : "待添加项目上下文"}</span>
+      </span>
     </div>
     <div class="context-anchor-actions">
-      <button type="button" class="text-button" data-act="toggle-context" data-id="context">共享资料</button>
-      <button type="button" class="text-button" data-act="route" data-id="projects/${e(project.id)}">打开项目${icon("right")}</button>
+      <button type="button" class="text-button" data-act="project-quick-add" data-id="${e(project.id)}" title="直接上传文件或补充决策到该项目">${icon("plus")}添加上下文</button>
+      <button type="button" class="text-button" data-act="toggle-context" data-id="context">预整理详情</button>
+      <button type="button" class="text-button" data-act="chat-bind-project" title="切换或解绑关联项目">切换项目</button>
+      <button type="button" class="text-button" data-act="route" data-id="projects/${e(project.id)}">项目页${icon("right")}</button>
     </div>
   </div>`;
 }
@@ -1584,11 +1629,66 @@ function contextBody(workspace) {
     </div>` : ""}
   </section>`;
 
+  const projectItems = Array.isArray(project?.context) ? project.context : [];
+  const enabledProjectItems = projectItems.filter((c) => c.enabled !== false);
+  const projectBrief = (project?.overview?.effective_brief || project?.brief || "").trim();
+  const projectSection = project
+    ? `<section class="context-group context-project-group">
+        <div class="between">
+          <p class="context-label">项目预整理上下文</p>
+          <div class="actions">
+            <button type="button" class="text-button" data-act="project-quick-add" data-id="${e(project.id)}" title="直接上传文件或补充决策到项目">${icon("plus")}传文件/记决策</button>
+            <button type="button" class="text-button" data-act="chat-bind-project" title="切换或解绑项目">切换</button>
+          </div>
+        </div>
+        <div class="context-project-head">
+          <h3>${e(project.name)}</h3>
+          <span class="context-source-tag is-ok">${icon("checkPlain")}<span>已注入 ${enabledProjectItems.length}/${projectItems.length} 项</span></span>
+        </div>
+        ${project.description ? `<p class="context-copy">${e(project.description)}</p>` : ""}
+        ${projectBrief ? `<details class="context-project-brief">
+          <summary>${icon("sparkles")}<span>查看项目预整理总览大纲</span></summary>
+          <div class="context-project-brief-body md-body">${renderMarkdown(projectBrief)}</div>
+        </details>` : ""}
+        ${projectItems.length ? `<ul class="context-files context-source-list">${projectItems.slice(0, 12).map((item) => {
+          const cat = CATEGORY_META[item.category] || CATEGORY_META.doc;
+          const isOn = item.enabled !== false;
+          const summaryText = item.digest?.summary || item.content || "";
+          return `<li class="context-source-row context-project-item ${isOn ? "" : "is-muted"}">
+            <div class="context-project-item-main">
+              <div class="context-project-item-top">
+                <span class="project-cat-badge is-${e(cat.tone)}">${e(cat.tag)}</span>
+                ${item.pinned ? `<span class="project-pin-mini" title="置顶优先">${icon("pin")}</span>` : ""}
+                ${item.artifact_id
+                  ? `<button type="button" class="context-source-link" data-act="preview" data-id="${e(item.artifact_id)}" data-name="${e(item.filename || item.title)}" title="点击预览 ${e(item.filename || item.title)}">
+                      <span class="context-source-name">${e(item.title)}</span>
+                    </button>`
+                  : `<span class="context-source-name"><strong>${e(item.title)}</strong></span>`}
+                <button type="button" class="context-source-tag ${isOn ? "is-ok" : ""}" data-act="project-context-toggle" data-project-id="${e(project.id)}" data-id="${e(item.id)}" data-enabled="${isOn ? "1" : "0"}" title="${isOn ? "当前已自动注入 AI（点击暂停）" : "当前已暂停（点击重新纳入 AI）"}">
+                  ${isOn ? "已生效" : "已暂停"}
+                </button>
+              </div>
+              ${summaryText ? `<small class="context-project-item-digest">${e(summaryText.slice(0, 110))}</small>` : ""}
+            </div>
+          </li>`;
+        }).join("")}</ul>` : '<p class="hint">该项目暂无共享资料，点击右上角「传文件/记决策」即可添加并自动预整理。</p>'}
+        <div class="actions">
+          ${button("添加资料 / 记决策", "project-quick-add", { id: project.id, icon: "plus", cls: "sm primary" })}
+          ${button("打开项目空间", "route", { id: "projects/" + project.id, icon: "right", cls: "sm" })}
+        </div>
+      </section>`
+    : (!task ? `<section class="context-group">
+        <div class="between">
+          <p class="context-label">项目知识库上下文</p>
+          <button type="button" class="text-button" data-act="chat-bind-project">${icon("layers")}关联项目</button>
+        </div>
+        <p class="hint">尚未关联项目空间。关联后，该项目下预整理的背景目标、会议决策、统一口径与多份共享文档将自动对本会话生效。</p>
+        ${button("关联项目上下文", "chat-bind-project", { icon: "layers", cls: "sm" })}
+      </section>` : "");
+
   return `<div class="studio-context-body">
     ${materialsSection}
-    ${project ? `<section class="context-group"><p class="context-label">项目共享资料</p><h3>${e(project.name)}</h3>
-      ${project.context.length ? `<ul class="context-files">${project.context.slice(0, 8).map((item) => `<li>${icon("clip")}<span>${e(item.title)}</span></li>`).join("")}</ul>` : '<p class="hint">暂无共享资料</p>'}
-      ${button("打开项目空间", "route", { id: "projects/" + project.id, icon: "right", cls: "sm" })}</section>` : ""}
+    ${projectSection}
     ${task ? `<section class="context-group">
       <p class="context-label">关联任务</p>
       <h3>${e(task.title)}</h3>
@@ -1835,6 +1935,7 @@ function slashCommands() {
     { id: "word", cmd: "/word", label: "起草可编辑 Word 文档", icon: "docx" },
     { id: "auto", cmd: "/auto", label: "自动判断回复或文档格式", icon: "message" },
     ...(showImage ? [{ id: "image", cmd: "/image", label: "展开生图参数面板", icon: "image" }] : []),
+    { id: "project", cmd: "/project", label: workspace?.project ? "上传项目文件或管理预整理上下文" : "关联项目知识库上下文", icon: "layers" },
     { id: "ref", cmd: "/ref", label: "引用已有办公文件作为资料", icon: "folder" },
     { id: "task", cmd: "/task", label: "打开右侧办公上下文与待办", icon: "panelRight" },
     { id: "clear", cmd: "/clear", label: "清空当前选区与已附资料", icon: "x" }
@@ -1938,6 +2039,10 @@ export async function applySlashCommand(id) {
     toggleImageDrawer(true);
     pulseComposer();
     textarea.focus();
+  } else if (id === "project") {
+    const ws = state.chatWorkspace;
+    if (ws?.project?.id) await openQuickProjectContextModal(ws.project.id);
+    else await openBindProjectModal("");
   } else if (id === "ref") {
     await showSources();
   } else if (id === "task") {
@@ -2236,19 +2341,107 @@ export async function attachFiles(files, input) {
   }
 }
 
+export async function refreshChatProjectContext(projectId) {
+  if (!projectId) return null;
+  const fresh = await api("/projects/" + encodeURIComponent(projectId));
+  projectCache.set(projectId, fresh);
+  const ws = state.chatWorkspace;
+  if (ws && ws.project?.id === projectId) {
+    ws.project = fresh;
+    updateContextDom(ws);
+    const welcomeCard = document.querySelector(".welcome-project-card");
+    if (welcomeCard && !ws.session?.turns?.length) {
+      const below = document.querySelector(".welcome-below");
+      if (below) below.outerHTML = welcomeBelow(ws);
+    }
+  }
+  return fresh;
+}
+
+export async function bindConversationProject(projectId) {
+  const ws = state.chatWorkspace;
+  if (!ws) return;
+  const nextPid = String(projectId || "").trim();
+  if (ws.task) {
+    throw new Error("关联任务的会话不能同时绑定项目");
+  }
+  if (ws.session?.id) {
+    const updated = await api(`/conversations/${encodeURIComponent(ws.session.id)}`, {
+      method: "PATCH",
+      body: { project_id: nextPid }
+    });
+    ws.session.project_id = updated.project_id;
+    const cached = sessionCache.get(ws.session.id);
+    if (cached) cached.project_id = updated.project_id;
+    if (Array.isArray(state.conversations)) {
+      state.conversations = state.conversations.map((c) => (c.id === ws.session.id ? { ...c, project_id: updated.project_id } : c));
+    }
+  } else {
+    history.replaceState(null, "", nextPid ? `#chat/project/${encodeURIComponent(nextPid)}` : "#chat");
+    state.route = nextPid ? ["chat", "project", nextPid] : ["chat"];
+  }
+  if (nextPid) {
+    const freshProj = await api("/projects/" + encodeURIComponent(nextPid));
+    projectCache.set(nextPid, freshProj);
+    ws.project = freshProj;
+    state.contextOpen = true;
+    state.studioTab = "context";
+    syncStudioDom();
+    toastMessage(`已关联项目「${freshProj.name}」，预整理上下文已自动注入`, "success");
+  } else {
+    ws.project = null;
+    toastMessage("已解除当前会话的项目上下文绑定", "info");
+  }
+  updateContextDom(ws);
+  if (!ws.session?.turns?.length) {
+    const hero = document.querySelector(".welcome-hero");
+    if (hero) hero.outerHTML = welcomeHero(ws);
+    const below = document.querySelector(".welcome-below");
+    if (below) below.outerHTML = welcomeBelow(ws);
+  }
+}
+
 export async function showSources() {
   const workspace = state.chatWorkspace;
   if (!workspace) return;
   const personal = await api("/files");
   if (state.chatWorkspace !== workspace) return;
-  const available = [...(workspace.task?.materials || []),
-    ...personal.filter((file) => !file.assignment_id || file.assignment_id === workspace.task?.id)]
-    .filter((file) => readable.has(file.extension));
+  const projectSharedFiles = (workspace.project?.context || [])
+    .filter((item) => item.artifact_id && item.extension && readable.has(String(item.extension).toLowerCase()))
+    .map((item) => ({
+      id: item.artifact_id,
+      name: item.filename || item.title,
+      extension: item.extension,
+      size: item.size
+    }));
+  const autoProjectFileIds = new Set(
+    (workspace.project?.context || [])
+      .filter((item) => item.enabled !== false && item.artifact_id)
+      .map((item) => item.artifact_id)
+  );
+  const available = [
+    ...(workspace.task?.materials || []),
+    ...projectSharedFiles,
+    ...personal.filter((file) => !file.assignment_id || file.assignment_id === workspace.task?.id)
+  ].filter((file) => readable.has(file.extension));
   const selected = new Map((draftFor(workspace).selected || []).map((file) => [file.id, file]));
   for (const file of available) if (!selected.has(file.id)) selected.set(file.id, file);
   workspace.availableSources = selected;
   const chosen = new Set((draftFor(workspace).selected || []).map((file) => file.id));
+  const enabledProjectCount = (workspace.project?.context || []).filter((c) => c.enabled !== false).length;
+  const projectBanner = workspace.project
+    ? `<div class="project-quick-banner">
+        <span class="project-digest-tag">${icon("checkPlain")}<span>项目「${e(workspace.project.name)}」已自动注入 ${enabledProjectCount} 项预整理上下文（含 ${autoProjectFileIds.size} 份项目文档，无需重复勾选）</span></span>
+        <button type="button" class="text-button" data-act="project-quick-add" data-id="${e(workspace.project.id)}">${icon("plus")}上传项目资料</button>
+      </div>`
+    : (!workspace.task
+      ? `<div class="project-quick-banner">
+          <span class="hint">需要携带整个项目的背景、会议决策与多份资料？</span>
+          <button type="button" class="text-button" data-act="chat-bind-project">${icon("layers")}关联项目上下文</button>
+        </div>`
+      : "");
   modal("引用资料", `<form class="stack" data-form="chat-sources">
+    ${projectBanner}
     <div class="file-list">${[...selected.values()].map((file) => fileMarkup(file, { check: "ids", checked: chosen.has(file.id) })).join("") ||
       '<p class="hint">当前可引用的文件为空。可以从输入区直接拖拽或添加附件。</p>'}</div>
     <div class="actions"><button class="button primary" type="submit">使用所选资料</button></div></form>`);

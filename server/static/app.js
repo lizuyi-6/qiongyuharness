@@ -8,16 +8,18 @@ import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm
   taskAdmin } from "./admin.js";
 import { clearFeedbackCache, copyFeedbackLog, feedbackPage, initClientLogCapture, openFeedbackDetail,
   openFeedbackModal, quickUploadFeedback, recordClientLog, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
-import { abortOrphanTurn, applyQueuedGuidanceNow, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, cancelPendingUpload, chooseSources, clearQueuedGuidance, closeComposerPickers,
+import { abortOrphanTurn, applyQueuedGuidanceNow, applySlashCommand, attachFiles, autoTitleRecentConversations, bindConversationProject, cancelActiveChat, cancelPendingUpload, chooseSources, clearQueuedGuidance, closeComposerPickers,
   closeSessionContextMenu, closeSlashMenu, copyReply, deleteConversation, discardCheckpoint, enqueueGuidanceFromForm, generateImageFromComposer, handleSlashKeydown,
   initSessionDragAndMenu, loadDesktopModelState, loadEarlier, loadWorkspace, openDeckInStudio, openImageLightbox,
-  openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, reattachSource, refreshDesktopUsage,
+  openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, reattachSource, refreshChatProjectContext, refreshDesktopUsage,
   removeQueuedGuidance, removeSource, resetChatState, resumeFailedTurn, retitleSingleConversation, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
   showSources, submitRenameConversation, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
   syncImageAutoIndicator, syncShellCanvasState, toggleComposerPicker, toggleDesktopUsage, toggleImageDrawer, togglePinConversation,
   toggleWorkspaceContext, triggerSlashMenu, updateSlashMenu, useExample, workspaceView } from "./chat.js";
-import { projectDialog, projectsView, submitProject, updateInvite } from "./project.js";
+import { cancelProjectPendingUpload, deleteProjectContextItem, filterProjectContext, openBatchPickFilesModal, openBindProjectModal,
+  openEditContextItemModal, openEditProjectBriefModal, openEditProjectInfoModal, openQuickProjectContextModal, projectDialog,
+  projectsView, runProjectPreorganize, submitProject, togglePinProjectContextItem, toggleProjectContextItem, updateInvite, uploadFilesToProject } from "./project.js";
 import { clearSelection, mountDeck } from "./slides.js";
 
 let historyOffset = 0;
@@ -520,6 +522,15 @@ async function handleUpload(list, element) {
 
 const actionCopy = { extension: "申请延期", comment: "留言", revoke: "撤销任务", close: "关闭任务" };
 
+async function refreshProjectAndChatView(projectId) {
+  if (state.route[0] === "projects" && (!projectId || state.route[1] === projectId)) {
+    await render(true);
+  }
+  if (projectId && state.chatWorkspace?.project?.id === projectId) {
+    await refreshChatProjectContext(projectId);
+  }
+}
+
 async function onClick(event) {
   if (!event.target.closest("[data-form=conversation]")) closeSlashMenu();
   if (!event.target.closest(".composer-picker")) closeComposerPickers();
@@ -590,6 +601,31 @@ async function onClick(event) {
     case "project-create": projectDialog("create"); break;
     case "project-join": projectDialog("join"); break;
     case "project-rotate": await updateInvite(id, render); break;
+    case "project-edit-info": openEditProjectInfoModal(id); break;
+    case "project-edit-brief": openEditProjectBriefModal(id); break;
+    case "project-pick-files": await openBatchPickFilesModal(id); break;
+    case "project-quick-add": await openQuickProjectContextModal(id); break;
+    case "chat-bind-project": await openBindProjectModal(state.chatWorkspace?.project?.id || ""); break;
+    case "project-filter": filterProjectContext(id); break;
+    case "project-cancel-upload": cancelProjectPendingUpload(target.dataset.projectId || state.route[1], id); break;
+    case "project-context-toggle":
+      await toggleProjectContextItem(target.dataset.projectId || state.route[1], id, target.dataset.enabled !== "1", refreshProjectAndChatView);
+      break;
+    case "project-context-pin":
+      await togglePinProjectContextItem(target.dataset.projectId || state.route[1], id, target.dataset.pinned !== "1", refreshProjectAndChatView);
+      break;
+    case "project-context-edit":
+      openEditContextItemModal(target.dataset.projectId || state.route[1], id);
+      break;
+    case "project-context-delete":
+      await deleteProjectContextItem(target.dataset.projectId || state.route[1], id, target.dataset.title || "", refreshProjectAndChatView);
+      break;
+    case "project-preorganize":
+      await runProjectPreorganize(id, { useAi: false, triggerButton: target, rerender: refreshProjectAndChatView });
+      break;
+    case "project-ai-preorganize":
+      await runProjectPreorganize(id, { useAi: true, triggerButton: target, rerender: refreshProjectAndChatView });
+      break;
     case "files-filter":
       state.filesFilter = id;
       localRefresh();
@@ -974,12 +1010,26 @@ async function handleForm(event) {
       dialog.close();
       await render(true);
       message = form.dataset.decision === "approve" ? "成果已验收通过" : "已退回修改，员工可继续修订";
-    } else if (type.startsWith("project-")) {
-      const key = await submitProject(type, id, values);
+    } else if (type === "chat-bind-project") {
+      await bindConversationProject(values.project_id || "");
       if (dialog.open) dialog.close();
-      if (type === "project-context") {
-        await render(true);
-        message = "共享资料已发布";
+    } else if (type.startsWith("project-")) {
+      const key = await submitProject(type, id, values, form);
+      if (dialog.open) dialog.close();
+      if (["project-context", "project-edit-info", "project-edit-brief", "project-context-edit", "project-batch-files"].includes(type)) {
+        if (type === "project-context" && form.isConnected && !form.closest("dialog")) {
+          form.reset();
+        }
+        await refreshProjectAndChatView(key);
+        message = type === "project-batch-files"
+          ? "已批量导入文档并自动完成预整理"
+          : type === "project-edit-info"
+            ? "项目目标与信息已更新"
+            : type === "project-edit-brief"
+              ? "项目预整理总览已保存"
+              : "项目上下文已保存并完成预整理";
+      } else if (state.route[0] === "chat" && state.chatWorkspace && !state.chatWorkspace.task) {
+        await bindConversationProject(key);
       } else {
         go("projects/" + encodeURIComponent(key));
       }
@@ -1140,6 +1190,34 @@ document.addEventListener("change", (event) => {
     selectDesktopModel(event.target, agentDesktopModels, "[data-agent-model-status]", "agent/last-model");
     return;
   }
+  if (event.target.matches("form[data-form=project-context] select[name=artifact_id]")) {
+    const form = event.target.form;
+    const titleInput = form?.elements?.title;
+    if (titleInput && !titleInput.value.trim() && event.target.value) {
+      const optText = event.target.options[event.target.selectedIndex]?.textContent || "";
+      const rawName = optText.replace(/（[^）]*）\s*$/, "").trim();
+      const stem = rawName.includes(".") ? rawName.slice(0, rawName.lastIndexOf(".")) : rawName;
+      if (stem) titleInput.value = stem.slice(0, 110);
+    }
+    return;
+  }
+  if (event.target.matches("[data-project-file-input]")) {
+    const projectId = event.target.dataset.projectId || state.route[1] || state.chatWorkspace?.project?.id;
+    const picked = [...(event.target.files || [])];
+    event.target.value = "";
+    if (!picked.length || !projectId) return;
+    uploadFilesToProject(projectId, picked, {
+      onComplete: async () => {
+        if (dialog.open && dialog.querySelector("[data-quick-project-modal]")) dialog.close();
+        await refreshProjectAndChatView(projectId);
+      }
+    }).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传项目资料失败");
+      recordClientLog("error", "project.upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
   if (!event.target.matches("[data-upload]")) return;
   handleUpload([...event.target.files], event.target).catch((error) => {
     const msg = cleanErrorMessage(error, "上传失败");
@@ -1157,6 +1235,10 @@ document.addEventListener("dragover", (event) => {
   if (!hasFiles) return;
   event.preventDefault();
   try { event.dataTransfer.dropEffect = "copy"; } catch {}
+  const projBox = event.target?.closest?.("[data-project-upload-box]");
+  if (projBox) projBox.classList.add("drag");
+  const projZone = event.target?.closest?.("[data-project-dropzone]") || document.querySelector("[data-project-dropzone]");
+  if (projZone) { projZone.classList.add("drag-over"); return; }
   const zone = event.target?.closest?.("[data-upload-zone]");
   if (zone) { zone.classList.add("drag"); return; }
   const filesZone = event.target?.closest?.("[data-files-dropzone]");
@@ -1166,6 +1248,9 @@ document.addEventListener("dragover", (event) => {
 });
 document.addEventListener("dragleave", (event) => {
   event.target?.closest?.("[data-upload-zone]")?.classList.remove("drag");
+  event.target?.closest?.("[data-project-upload-box]")?.classList.remove("drag");
+  const projZone = event.target?.closest?.("[data-project-dropzone]");
+  if (projZone && !projZone.contains(event.relatedTarget)) projZone.classList.remove("drag-over");
   const filesZone = event.target?.closest?.("[data-files-dropzone]");
   if (filesZone && !filesZone.contains(event.relatedTarget)) filesZone.classList.remove("drag-over");
   const chatZone = event.target?.closest?.("[data-chat-dropzone]");
@@ -1186,6 +1271,35 @@ document.addEventListener("drop", (event) => {
     return;
   }
   if (!dropped.length) return;
+  const quickProjModal = dialog.open ? dialog.querySelector("[data-quick-project-modal]") : null;
+  if (quickProjModal) {
+    const pid = quickProjModal.dataset.quickProjectModal;
+    uploadFilesToProject(pid, dropped, {
+      onComplete: async () => {
+        if (dialog.open && dialog.querySelector("[data-quick-project-modal]")) dialog.close();
+        await refreshProjectAndChatView(pid);
+      }
+    }).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传项目资料失败");
+      recordClientLog("error", "project.upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
+  const projZone = event.target?.closest?.("[data-project-dropzone]") || (state.route[0] === "projects" && state.route[1] ? document.querySelector("[data-project-dropzone]") : null);
+  if (projZone || (state.route[0] === "projects" && state.route[1])) {
+    const pid = projZone?.dataset?.projectDropzone || state.route[1];
+    uploadFilesToProject(pid, dropped, {
+      onComplete: async () => {
+        await refreshProjectAndChatView(pid);
+      }
+    }).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传项目资料失败");
+      recordClientLog("error", "project.upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
   const chatZone = event.target?.closest?.("[data-chat-dropzone]") || document.querySelector("[data-chat-dropzone]");
   if (state.route[0] === "chat" || chatZone) {
     attachFiles(dropped).catch((error) => {

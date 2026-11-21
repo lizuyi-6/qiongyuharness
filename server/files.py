@@ -271,7 +271,8 @@ def collect_sources(db, user, task, material_ids):
         row = file_for(db, user, key)
         task_material = task and row["label"] == "material" and row["template_id"] == task["template_id"]
         own_upload = row["owner_id"] == user["id"] and row["label"] != "material" and row["assignment_id"] in {assignment_id, None}
-        if not (task_material or own_upload):
+        project_shared = not row["assignment_id"] and row["label"] != "material" and shared_file_access(db, key, user["id"])
+        if not (task_material or own_upload or project_shared):
             fail(403, "请选择当前任务或已上传到工作台的资料")
         if row["extension"] not in {"docx", "pptx", "xlsx", "txt", "md", "csv", "pdf"}:
             fail(422, "当前可提取正文的资料包括 Word、PPT、Excel、PDF、TXT、Markdown 和 CSV")

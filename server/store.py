@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS artifacts_task ON artifacts(assignment_id, label);
 CREATE TABLE IF NOT EXISTS office_projects (
  id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL,
- invite_code TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+ description TEXT NOT NULL DEFAULT '', brief TEXT NOT NULL DEFAULT '',
+ invite_code TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS office_project_members (
  project_id TEXT NOT NULL REFERENCES office_projects(id), user_id TEXT NOT NULL REFERENCES users(id),
@@ -74,7 +75,10 @@ CREATE INDEX IF NOT EXISTS office_project_members_user ON office_project_members
 CREATE TABLE IF NOT EXISTS office_project_context (
  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES office_projects(id),
  author_id TEXT NOT NULL REFERENCES users(id), title TEXT NOT NULL, content TEXT NOT NULL,
- artifact_id TEXT REFERENCES artifacts(id), created_at TEXT NOT NULL, UNIQUE(project_id, artifact_id)
+ category TEXT NOT NULL DEFAULT 'doc', digest TEXT NOT NULL DEFAULT '',
+ pinned INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+ artifact_id TEXT REFERENCES artifacts(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+ UNIQUE(project_id, artifact_id)
 );
 CREATE INDEX IF NOT EXISTS office_project_context_project ON office_project_context(project_id, created_at);
 CREATE TABLE IF NOT EXISTS office_conversations (
@@ -257,6 +261,14 @@ def initialize():
             db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS project_id TEXT REFERENCES office_projects(id)")
             db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0")
             db.execute("ALTER TABLE office_conversations ADD COLUMN IF NOT EXISTS sort_order INTEGER")
+            db.execute("ALTER TABLE office_projects ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE office_projects ADD COLUMN IF NOT EXISTS brief TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE office_projects ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE office_project_context ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'doc'")
+            db.execute("ALTER TABLE office_project_context ADD COLUMN IF NOT EXISTS digest TEXT NOT NULL DEFAULT ''")
+            db.execute("ALTER TABLE office_project_context ADD COLUMN IF NOT EXISTS pinned INTEGER NOT NULL DEFAULT 0")
+            db.execute("ALTER TABLE office_project_context ADD COLUMN IF NOT EXISTS enabled INTEGER NOT NULL DEFAULT 1")
+            db.execute("ALTER TABLE office_project_context ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT ''")
         else:
             user_columns = {row["name"] for row in db.all("PRAGMA table_info(users)")}
             if "enabled" not in user_columns:
@@ -279,6 +291,24 @@ def initialize():
                 db.execute("ALTER TABLE office_conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             if "sort_order" not in conv_columns:
                 db.execute("ALTER TABLE office_conversations ADD COLUMN sort_order INTEGER")
+            proj_columns = {row["name"] for row in db.all("PRAGMA table_info(office_projects)")}
+            if "description" not in proj_columns:
+                db.execute("ALTER TABLE office_projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            if "brief" not in proj_columns:
+                db.execute("ALTER TABLE office_projects ADD COLUMN brief TEXT NOT NULL DEFAULT ''")
+            if "updated_at" not in proj_columns:
+                db.execute("ALTER TABLE office_projects ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+            ctx_columns = {row["name"] for row in db.all("PRAGMA table_info(office_project_context)")}
+            if "category" not in ctx_columns:
+                db.execute("ALTER TABLE office_project_context ADD COLUMN category TEXT NOT NULL DEFAULT 'doc'")
+            if "digest" not in ctx_columns:
+                db.execute("ALTER TABLE office_project_context ADD COLUMN digest TEXT NOT NULL DEFAULT ''")
+            if "pinned" not in ctx_columns:
+                db.execute("ALTER TABLE office_project_context ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            if "enabled" not in ctx_columns:
+                db.execute("ALTER TABLE office_project_context ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+            if "updated_at" not in ctx_columns:
+                db.execute("ALTER TABLE office_project_context ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email)")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_subject_unique ON users(subject)")
         users = [(user_id, None, None, name, department, role, True) for user_id, name, department, role in DEMO_USERS] if DEMO else []

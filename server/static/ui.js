@@ -173,7 +173,10 @@ export const eventLabels = {
   "schedule.updated":"更新重复计划", "auth.login":"企业身份登录", "image.started":"启动图片生成",
   "image.generated":"生成图片", "image.ai_generated":"AI 生成图片", "file.image":"查看图片",
   "feedback.submitted":"提交问题反馈", "feedback.updated":"更新反馈状态",
-  "conversation.deleted":"删除办公会话", "file.deleted":"删除文件"
+  "conversation.deleted":"删除办公会话", "file.deleted":"删除文件",
+  "project.created":"创建项目", "project.joined":"加入项目", "project.updated":"更新项目信息",
+  "project.file_uploaded":"上传项目资料", "project.context_published":"发布项目上下文",
+  "project.context_deleted":"移除项目上下文", "project.preorganized":"预整理项目上下文"
 };
 
 export function badge(value) {
@@ -477,7 +480,7 @@ export async function materializeFile(file) {
   return new File([buf], name, { type: file.type || "application/octet-stream", lastModified: file.lastModified || Date.now() });
 }
 
-export async function uploadOneFile(file, { assignment = "", target = "", signal = null, preMaterialized = false } = {}) {
+export async function uploadOneFile(file, { assignment = "", target = "", extraFields = null, signal = null, preMaterialized = false } = {}) {
   const ready = preMaterialized ? file : await materializeFile(file);
   if (signal?.aborted) {
     const abortErr = new DOMException("已取消上传", "AbortError");
@@ -489,6 +492,11 @@ export async function uploadOneFile(file, { assignment = "", target = "", signal
     const form = new FormData();
     form.append("file", ready, ready.name);
     if (assignment) form.append("assignment_id", assignment);
+    if (extraFields && typeof extraFields === "object") {
+      for (const [k, v] of Object.entries(extraFields)) {
+        if (v !== undefined && v !== null && v !== "") form.append(k, String(v));
+      }
+    }
     try {
       return await api(target || "/files", { method: "POST", body: form, timeoutMs: 120_000, signal });
     } catch (err) {

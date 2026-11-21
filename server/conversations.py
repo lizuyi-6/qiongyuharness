@@ -326,6 +326,7 @@ def conversation_summary(row):
 class ConversationPatch(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     pinned: bool | None = None
+    project_id: str | None = Field(default=None, max_length=100)
 
 
 class ConversationReorder(BaseModel):
@@ -487,16 +488,26 @@ def patch_thread_route(key: str, body: ConversationPatch, user: User):
             if len(cleaned) < 1:
                 fail(422, "标题不能为空")
             next_title = cleaned
+        next_project = current["project_id"]
+        if body.project_id is not None:
+            raw_pid = body.project_id.strip()
+            if raw_pid:
+                if current["assignment_id"]:
+                    fail(422, "关联任务的会话不能同时绑定项目")
+                project_for(db, raw_pid, user)
+                next_project = raw_pid
+            else:
+                next_project = None
         next_pinned = int(bool(body.pinned)) if body.pinned is not None else int(bool(current["pinned"]))
         if body.pinned is not None and bool(body.pinned) != bool(current["pinned"]):
             db.execute(
-                "UPDATE office_conversations SET title=?, pinned=?, sort_order=NULL WHERE id=?",
-                (next_title, next_pinned, key),
+                "UPDATE office_conversations SET title=?, pinned=?, project_id=?, sort_order=NULL WHERE id=?",
+                (next_title, next_pinned, next_project, key),
             )
         else:
             db.execute(
-                "UPDATE office_conversations SET title=?, pinned=? WHERE id=?",
-                (next_title, next_pinned, key),
+                "UPDATE office_conversations SET title=?, pinned=?, project_id=? WHERE id=?",
+                (next_title, next_pinned, next_project, key),
             )
         updated = owned_thread(db, key, user)
     return conversation_summary(updated)
@@ -615,8 +626,7 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
         plugin_context = {"项目": project, "资料": sources} if project else None
         if project and gateway.MODE in {"dsh", "desktop"}:
             payload["项目"] = project
-            payload["参考资料"] = []
-            payload["接入说明"] = "如需查阅项目资料，可先调用 office_context_read。"
+            payload["接入说明"] = "已载入项目预整理上下文与参考资料；如需再次查阅完整授权资料，也可调用 office_context_read。"
         return {
             "kind": "slide_freeform",
             "system": prompting.SLIDE_FREEFORM_SYSTEM,
@@ -678,8 +688,7 @@ def build_turn_request(body, task, sources, recent, latest, project, scope, assi
     plugin_context = {"项目": project, "资料": sources} if project else None
     if project and gateway.MODE in {"dsh", "desktop"}:
         payload["项目"] = project
-        payload["参考资料"] = []
-        payload["接入说明"] = "先调用 office_context_read，获取本轮授权资料。"
+        payload["接入说明"] = "已载入项目预整理上下文与参考资料；如需再次查阅完整授权资料，也可调用 office_context_read。"
     return {"kind": "conversation",
             "system": prompting.conversation_system(body.mode, operation, genre,
                                                     include_pptx=include_pptx,
