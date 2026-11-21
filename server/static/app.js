@@ -8,10 +8,10 @@ import { assignmentValues, auditPage, changeAssignment, clearAdmin, saveTaskForm
   taskAdmin } from "./admin.js";
 import { clearFeedbackCache, copyFeedbackLog, feedbackPage, initClientLogCapture, openFeedbackDetail,
   openFeedbackModal, quickUploadFeedback, recordClientLog, saveFeedbackUpdate, submitFeedbackForm } from "./feedback.js";
-import { abortOrphanTurn, applyQueuedGuidanceNow, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, chooseSources, clearQueuedGuidance, closeComposerPickers,
+import { abortOrphanTurn, applyQueuedGuidanceNow, applySlashCommand, attachFiles, autoTitleRecentConversations, cancelActiveChat, cancelPendingUpload, chooseSources, clearQueuedGuidance, closeComposerPickers,
   closeSessionContextMenu, closeSlashMenu, copyReply, deleteConversation, discardCheckpoint, enqueueGuidanceFromForm, generateImageFromComposer, handleSlashKeydown,
   initSessionDragAndMenu, loadDesktopModelState, loadEarlier, loadWorkspace, openDeckInStudio, openImageLightbox,
-  openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, refreshDesktopUsage,
+  openRenameConversationModal, openSessionContextMenu, pickComposerOption, prefetchDesktopModels, reattachSource, refreshDesktopUsage,
   removeQueuedGuidance, removeSource, resetChatState, resumeFailedTurn, retitleSingleConversation, retryTurn, runDesktopAgent, saveImageAutoPreference,
   saveWorkspaceInput, scrollToLatest, selectChatModel, selectDesktopModel, sendMessage, showConversationHistory,
   showSources, submitRenameConversation, switchStudioTab, syncActiveChatView, syncChatSubmit, syncComposerGrow, syncDesktopUsagePanel,
@@ -563,6 +563,8 @@ async function onClick(event) {
     case "image-lightbox": openImageLightbox(id, target.dataset.alt || "", target.dataset.meta || ""); break;
     case "chat-retry": retryTurn(id); break;
     case "chat-remove-source": removeSource(id); break;
+    case "chat-cancel-upload": cancelPendingUpload(id); break;
+    case "chat-reattach-source": reattachSource(id); break;
     case "chat-sources": await showSources(); break;
     case "chat-history": showConversationHistory(); break;
     case "chat-auto-titles": await autoTitleRecentConversations({ force: true, limit: 15, triggerButton: target }); break;
@@ -1184,6 +1186,15 @@ document.addEventListener("drop", (event) => {
     return;
   }
   if (!dropped.length) return;
+  const chatZone = event.target?.closest?.("[data-chat-dropzone]") || document.querySelector("[data-chat-dropzone]");
+  if (state.route[0] === "chat" || chatZone) {
+    attachFiles(dropped).catch((error) => {
+      const msg = cleanErrorMessage(error, "上传失败");
+      recordClientLog("error", "upload", msg);
+      toastMessage(msg, "error");
+    });
+    return;
+  }
   const zone = event.target?.closest?.("[data-upload-zone]");
   if (zone) {
     handleUpload(dropped, zone.querySelector("input")).catch((error) => {
@@ -1196,15 +1207,6 @@ document.addEventListener("drop", (event) => {
   const filesZone = event.target?.closest?.("[data-files-dropzone]");
   if (filesZone) {
     handleUpload(dropped, null).catch((error) => {
-      const msg = cleanErrorMessage(error, "上传失败");
-      recordClientLog("error", "upload", msg);
-      toastMessage(msg, "error");
-    });
-    return;
-  }
-  const chatZone = event.target?.closest?.("[data-chat-dropzone]") || document.querySelector("[data-chat-dropzone]");
-  if (chatZone) {
-    attachFiles(dropped).catch((error) => {
       const msg = cleanErrorMessage(error, "上传失败");
       recordClientLog("error", "upload", msg);
       toastMessage(msg, "error");

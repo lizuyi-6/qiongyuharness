@@ -453,7 +453,7 @@ export function extractDroppedFiles(dataTransfer) {
   return picked;
 }
 
-async function materializeFile(file) {
+export async function materializeFile(file) {
   const name = String(file?.name || "文件");
   const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
   if (!UPLOAD_EXTENSIONS.has(ext)) {
@@ -477,6 +477,33 @@ async function materializeFile(file) {
   return new File([buf], name, { type: file.type || "application/octet-stream", lastModified: file.lastModified || Date.now() });
 }
 
+export async function uploadOneFile(file, { assignment = "", target = "", signal = null, preMaterialized = false } = {}) {
+  const ready = preMaterialized ? file : await materializeFile(file);
+  if (signal?.aborted) {
+    const abortErr = new DOMException("已取消上传", "AbortError");
+    throw abortErr;
+  }
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    if (signal?.aborted) throw new DOMException("已取消上传", "AbortError");
+    const form = new FormData();
+    form.append("file", ready, ready.name);
+    if (assignment) form.append("assignment_id", assignment);
+    try {
+      return await api(target || "/files", { method: "POST", body: form, timeoutMs: 120_000, signal });
+    } catch (err) {
+      if (signal?.aborted || err?.name === "AbortError") throw err;
+      lastError = err;
+      if (attempt < 2 && err?.transient) {
+        await new Promise((r) => setTimeout(r, 800));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError || new Error("上传失败，请重试");
+}
+
 export async function uploadSelected(files, assignment = "", target = "") {
   const list = Array.from(files || []);
   if (!list.length) return [];
@@ -497,25 +524,7 @@ export async function uploadSelected(files, assignment = "", target = "") {
         materialized.length > 1 ? `正在上传（${i + 1}/${materialized.length}）：${file.name}` : `正在上传：${file.name}`,
         "info"
       );
-      let lastError = null;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        const form = new FormData();
-        form.append("file", file, file.name);
-        if (assignment) form.append("assignment_id", assignment);
-        try {
-          uploaded.push(await api(target || "/files", { method: "POST", body: form, timeoutMs: 120_000 }));
-          lastError = null;
-          break;
-        } catch (err) {
-          lastError = err;
-          if (attempt < 2 && err?.transient) {
-            await new Promise((r) => setTimeout(r, 800));
-            continue;
-          }
-          throw err;
-        }
-      }
-      if (lastError) throw lastError;
+      uploaded.push(await uploadOneFile(file, { assignment, target, preMaterialized: true }));
     }
     return uploaded;
   } finally {

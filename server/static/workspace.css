@@ -597,8 +597,15 @@ body.is-dragging-session .session-trash-zone.is-over svg {
   justify-content: flex-end;
   animation: turn-user-in 220ms var(--ease-line) both;
 }
-.request-entry p {
+.request-bubble {
   max-width: min(540px, 88%);
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+}
+.request-entry p {
+  max-width: 100%;
+  margin: 0;
   padding: 10px 16px;
   border: 1px solid var(--line);
   border-radius: 18px 18px 6px 18px;
@@ -608,6 +615,39 @@ body.is-dragging-session .session-trash-zone.is-over svg {
   line-height: 1.65;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.request-materials {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.request-material-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: min(260px, 100%);
+  padding: 4px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--bg-page);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 530;
+  cursor: pointer;
+  transition: border-color var(--t-fast), background var(--t-fast), color var(--t-fast);
+}
+.request-material-chip:hover {
+  border-color: var(--hairline);
+  background: var(--bg-subtle);
+  color: var(--ink);
+}
+.request-material-chip svg { width: 12.5px; height: 12.5px; flex: none; color: var(--ink-3); }
+.request-material-chip:hover svg { color: var(--ink); }
+.request-material-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .request-scope {
   display: inline-block;
@@ -1562,19 +1602,119 @@ body.is-dragging-session .session-trash-zone.is-over svg {
 .attached-file {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   max-width: 100%;
-  padding: 3px 10px;
-  border: 1px solid var(--line);
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--line-strong);
   border-radius: var(--radius-pill);
   background: var(--bg-rail);
   color: var(--ink);
   overflow-wrap: anywhere;
   font-size: 12px;
   animation: chip-pop 180ms var(--ease-panel) both;
+  transition: border-color var(--t-fast), background var(--t-fast);
 }
-.attached-file button { padding: 1px; border: 0; color: var(--ink-3); background: transparent; }
-.attached-file button:hover { color: var(--ink); }
+.attached-file.is-ready {
+  border-color: color-mix(in srgb, var(--ok) 38%, var(--line-strong));
+  background: color-mix(in srgb, var(--ok) 6%, var(--bg-rail));
+}
+.attached-file.is-uploading {
+  border-style: dashed;
+  border-color: var(--hairline);
+}
+.attached-file.is-error {
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-page));
+  color: var(--danger);
+}
+.attached-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.attached-file.is-uploading .attached-main,
+.attached-file.is-error .attached-main { cursor: default; }
+.attached-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-2);
+  flex: none;
+}
+.attached-file.is-error .attached-icon { color: var(--danger); }
+.attached-name {
+  max-width: min(210px, 46vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 530;
+}
+.attached-size {
+  font-size: 11px;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.attached-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 580;
+  white-space: nowrap;
+}
+.attached-status.is-ok {
+  background: color-mix(in srgb, var(--ok) 15%, var(--bg-page));
+  color: var(--ok);
+}
+.attached-status.is-ok svg { width: 10.5px; height: 10.5px; }
+.attached-status.is-uploading {
+  background: var(--bg-page);
+  color: var(--ink-2);
+}
+.attached-status.is-error {
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg-page));
+  color: var(--danger);
+}
+.attached-spinner {
+  width: 11px;
+  height: 11px;
+  border: 1.6px solid var(--line-strong);
+  border-top-color: var(--ink);
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+.attached-remove,
+.attached-file button[data-act=chat-remove-source],
+.attached-file button[data-act=chat-cancel-upload] {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--ink-3);
+  background: transparent;
+  cursor: pointer;
+  flex: none;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.attached-remove:hover,
+.attached-file button[data-act=chat-remove-source]:hover,
+.attached-file button[data-act=chat-cancel-upload]:hover {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-page));
+}
 .attached-file svg { width: 12px; height: 12px; }
 .chat-composer .error { padding: 4px 2px 0; }
 
@@ -2149,6 +2289,86 @@ body.is-dragging-session .session-trash-zone.is-over svg {
 .context-files { display: grid; gap: 6px; }
 .context-files li { display: flex; gap: 7px; align-items: flex-start; font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
 .context-files svg { width: 13px; height: 13px; margin-top: 3px; color: var(--ink-3); }
+
+.context-subblock {
+  display: grid;
+  gap: 5px;
+  margin-top: 2px;
+}
+.context-sublabel {
+  font-size: 11px;
+  font-weight: 560;
+  color: var(--ink-3);
+}
+.context-source-list .context-source-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-page);
+}
+.context-source-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.context-source-link:hover { color: var(--accent); }
+.context-source-link svg { margin-top: 0; flex: none; }
+.context-source-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-source-tag {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  font-size: 10.5px;
+  font-weight: 580;
+}
+.context-source-tag.is-ok {
+  background: color-mix(in srgb, var(--ok) 14%, var(--bg-subtle));
+  color: var(--ok);
+}
+.context-source-tag.is-uploading {
+  background: var(--bg-subtle);
+  color: var(--ink-2);
+}
+.context-source-tag.is-error {
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-subtle));
+  color: var(--danger);
+}
+.context-source-remove {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  flex: none;
+}
+.context-source-remove:hover {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, var(--bg-subtle));
+}
+.context-source-remove svg { width: 12px; height: 12px; margin-top: 0; color: currentColor; }
+.context-source-reattach { font-size: 11.5px; white-space: nowrap; }
 
 /* 仅在极窄手机竖屏（<=720px）才改为上下/浮层，桌面与半屏始终左右并排同屏 */
 @media (max-width: 720px) {

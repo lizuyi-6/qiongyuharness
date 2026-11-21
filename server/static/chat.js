@@ -1,5 +1,5 @@
-import { active, api, badge, button, cleanErrorMessage, copyText, deadline, dialog, e, fileMarkup, go, icon, modal, outputWarnings, post, readDraft, saveDraft,
-  state, toastMessage, uploadMarkup, uploadSelected, uuid } from "./ui.js";
+import { active, api, badge, button, cleanErrorMessage, copyText, deadline, dialog, e, fileMarkup, go, icon, materializeFile, modal, outputWarnings, post, readDraft, saveDraft,
+  state, toastMessage, uploadMarkup, uploadOneFile, uploadSelected, uuid } from "./ui.js";
 import { deckFiles, deckPanel, refreshCanvasLive, selectDeckFile, selectionChip, selectionSummaryText, setCanvasLiveState, studioArtifacts } from "./slides.js";
 import { renderMarkdown } from "./markdown.js";
 import { feedbackErrorStrip, recordClientLog } from "./feedback.js";
@@ -16,6 +16,8 @@ let usageRequestId = 0;
 const activeTurns = new Map();
 // 按 threadId 跟踪思考过程中用户追加的引导消息队列。
 const queuedGuidance = new Map();
+// 按 draftKey 跟踪当前正在上传 / 上传失败的附件占位项，确保拖入即显示状态且可随时取消。
+const pendingUploads = new Map();
 const modelCache = new Map();
 const modelInFlight = new Map();
 const sessionCache = new Map();
@@ -131,8 +133,14 @@ export function resetChatState() {
   for (const live of activeTurns.values()) {
     try { void live.cancel?.(); } catch {}
   }
+  for (const list of pendingUploads.values()) {
+    for (const item of list) {
+      try { item.controller?.abort(); } catch {}
+    }
+  }
   activeTurns.clear();
   queuedGuidance.clear();
+  pendingUploads.clear();
   modelCache.clear();
   modelInFlight.clear();
   sessionCache.clear();
@@ -205,7 +213,7 @@ function sessionSignature(session) {
     session.title,
     session.updated_at,
     session.has_earlier,
-    (session.turns || []).map((t) => [t.id, t.status, t.reply?.length || 0, t.error || "", t.steps?.length || 0, t.file?.id || "", t.images?.length || 0])
+    (session.turns || []).map((t) => [t.id, t.status, t.reply?.length || 0, t.error || "", t.steps?.length || 0, t.file?.id || "", t.images?.length || 0, t.materials?.length || 0])
   ]);
 }
 
@@ -858,24 +866,56 @@ export function canSubmitChat(workspace = state.chatWorkspace) {
   return selectedModelAvailable(workspace);
 }
 
+function pendingUploadListFor(draftKey) {
+  if (!draftKey) return [];
+  return pendingUploads.get(draftKey) || [];
+}
+
+function hasActiveUploadsFor(workspace = state.chatWorkspace) {
+  const key = workspace?.draftKey;
+  if (!key) return false;
+  return pendingUploadListFor(key).some((item) => item.status === "uploading");
+}
+
+function readableSourcesOnly(list) {
+  return (Array.isArray(list) ? list : []).filter((file) => readable.has(String(file?.extension || "").toLowerCase()));
+}
+
+function formatFileSizeCompact(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.ceil(n / 1024))} KB`;
+}
+
+function sourceIconName(ext) {
+  const low = String(ext || "").toLowerCase();
+  if (imageExts.has(low)) return "image";
+  if (low === "docx" || low === "pptx" || low === "xlsx") return low;
+  return "clip";
+}
+
 export function syncChatSubmit(form = chatForm(), workspace = state.chatWorkspace) {
   if (!form) return;
   const isBusy = Boolean(form.dataset.busy);
+  const uploading = hasActiveUploadsFor(workspace);
   const threadId = currentLiveThreadId(workspace);
   const live = activeTurnFor(threadId);
   const hasText = Boolean(form.elements?.message?.value?.trim());
   const canQueue = Boolean(isBusy && live && live.kind !== "image" && hasText);
-  const disabled = isBusy ? !canQueue : !canSubmitChat(workspace);
+  const disabled = uploading ? true : (isBusy ? !canQueue : !canSubmitChat(workspace));
   form.querySelectorAll('button[type="submit"]').forEach((control) => {
     control.disabled = disabled;
     control.classList.toggle("is-queue-mode", Boolean(isBusy && live && live.kind !== "image"));
     control.classList.toggle("ready", hasText && !disabled);
-    control.title = isBusy && live && live.kind !== "image" ? "追加引导（Enter）" : "发送（Enter）";
-    control.setAttribute("aria-label", isBusy && live && live.kind !== "image" ? "追加引导信息" : "发送消息");
+    control.title = uploading
+      ? "等待文件上传完成后发送…"
+      : (isBusy && live && live.kind !== "image" ? "追加引导（Enter）" : "发送（Enter）");
+    control.setAttribute("aria-label", uploading ? "等待文件上传完成" : (isBusy && live && live.kind !== "image" ? "追加引导信息" : "发送消息"));
   });
   const resumeBtn = document.querySelector(".checkpoint-resume-btn");
   if (resumeBtn) {
-    const canResume = !form.dataset.busy && (canSubmitChat(workspace) || Boolean(workspace?.checkpoint?.hasCompletedResult));
+    const canResume = !form.dataset.busy && !uploading && (canSubmitChat(workspace) || Boolean(workspace?.checkpoint?.hasCompletedResult));
     resumeBtn.disabled = !canResume;
   }
 }
@@ -1252,10 +1292,28 @@ function artifactCard(file) {
   return `<div class="session-file">${fileMarkup(file, { edit: true })}</div>`;
 }
 
+function turnMaterialsMarkup(materials) {
+  const list = Array.isArray(materials) ? materials.filter((f) => f && f.name) : [];
+  if (!list.length) return "";
+  return `<div class="request-materials" aria-label="本轮附带的参考资料">${list.map((file) => {
+    const ext = String(file.extension || "").toLowerCase();
+    const isImg = imageExts.has(ext);
+    const sizeText = formatFileSizeCompact(file.size);
+    const act = file.id ? (isImg ? "preview-image" : "preview") : "";
+    if (act) {
+      return `<button type="button" class="request-material-chip" data-act="${act}" data-id="${e(file.id)}" data-name="${e(file.name)}" title="点击预览 ${e(file.name)}${sizeText ? `（${sizeText}）` : ""}">
+        ${icon(sourceIconName(ext))}<span class="request-material-name">${e(file.name)}</span>
+      </button>`;
+    }
+    return `<span class="request-material-chip">${icon(sourceIconName(ext))}<span class="request-material-name">${e(file.name)}</span></span>`;
+  }).join("")}</div>`;
+}
+
 function liveTurnMarkup(live) {
   const selectionHtml = live.selection
     ? `<small class="request-scope">${e(selectionSummaryText(live.selection))}</small><br>`
     : "";
+  const materialsHtml = turnMaterialsMarkup(live.materials);
   const steps = Array.isArray(live.steps) ? live.steps : [];
   const stepsHtml = steps.map((step, idx) =>
     `<li class="${idx === steps.length - 1 ? "active" : "done"}"><span class="step-dot" aria-hidden="true"></span><span>${e(step)}</span></li>`
@@ -1264,7 +1322,7 @@ function liveTurnMarkup(live) {
   const hasThinking = Boolean(thinkingText.trim());
   const canStop = live.canCancel && live.phase !== "complete";
   return `<section class="conversation-turn pending-turn" data-live-thread="${e(live.threadId)}">
-    <div class="request-entry"><p>${selectionHtml}${e(live.message)}</p></div>
+    <div class="request-entry"><div class="request-bubble">${materialsHtml}<p>${selectionHtml}${e(live.message)}</p></div></div>
     <div class="response-entry">
       <div class="response-head">
         <p class="response-byline"><span class="response-mark is-working">${icon("mark")}</span><strong>穹驭</strong></p>
@@ -1287,12 +1345,13 @@ function turnView(turn, index, canRetry = false) {
   const isOrphanRunning = turn.status === "running" && !turn.reply && !turn.error;
   const reply = turn.reply || turn.error || (turn.status === "running" ? "正在执行…" : "");
   const images = Array.isArray(turn.images) ? turn.images : [];
+  const materialsHtml = turnMaterialsMarkup(turn.materials);
   const pipeline = turn.pipeline;
   const pipelineLabel = pipeline?.verdict === "pass" ? "验收通过" : pipeline?.verdict === "fail" ? "验收未通过" :
     pipeline?.verdict === "skipped" && pipeline?.tier === "light" ? "轻量任务 · 未验收" : "";
   const reviewLabels = { pass: "复核：通过", fail: "复核：未通过", not_needed: "复核：无需复核", unavailable: "复核：不可用" };
   return `<section class="conversation-turn">
-    <div class="request-entry"><p>${turn.selection ? `<small class="request-scope">${e(selectionSummaryText(turn.selection))}</small><br>` : ""}${e(turn.message)}</p></div>
+    <div class="request-entry"><div class="request-bubble">${materialsHtml}<p>${turn.selection ? `<small class="request-scope">${e(selectionSummaryText(turn.selection))}</small><br>` : ""}${e(turn.message)}</p></div></div>
     ${reply || images.length ? `<div class="response-entry">
       <div class="response-head">
         <p class="response-byline"><span class="response-mark">${icon("mark")}</span><strong>穹驭</strong></p>
@@ -1456,10 +1515,77 @@ function contextAnchorBar(workspace) {
   </div>`;
 }
 
+function sessionHistoryMaterials(workspace) {
+  const map = new Map();
+  const turns = workspace?.session?.turns || [];
+  for (const turn of turns) {
+    for (const file of turn?.materials || []) {
+      if (file?.id && file?.name && !map.has(file.id)) map.set(file.id, file);
+    }
+  }
+  const activeLive = activeTurnFor(workspace?.session?.id);
+  for (const file of activeLive?.materials || []) {
+    if (file?.id && file?.name && !map.has(file.id)) map.set(file.id, file);
+  }
+  return [...map.values()];
+}
+
 function contextBody(workspace) {
   const task = workspace.task;
   const project = workspace.project;
+  const draft = draftFor(workspace);
+  const currentSelected = draft.selected || [];
+  const currentIds = new Set(currentSelected.map((f) => f.id));
+  const pending = pendingUploadListFor(workspace.draftKey);
+  const historyMaterials = sessionHistoryMaterials(workspace);
+  const previousOnly = historyMaterials.filter((f) => !currentIds.has(f.id));
+  const hasAnyMaterials = currentSelected.length > 0 || pending.length > 0 || previousOnly.length > 0;
+
+  const materialsSection = `<section class="context-group">
+    <div class="between">
+      <p class="context-label">本会话参考资料</p>
+      <button type="button" class="text-button" data-act="chat-sources">管理资料</button>
+    </div>
+    ${!hasAnyMaterials ? '<p class="hint">拖拽文档到会话区，或点输入框左下角回形针/文件夹即可添加。</p>' : ""}
+    ${(currentSelected.length || pending.length) ? `<div class="context-subblock">
+      <small class="context-sublabel">当前已挂载（下轮将发给 AI）</small>
+      <ul class="context-files context-source-list">
+        ${currentSelected.map((file) => {
+          const ext = String(file.extension || "").toLowerCase();
+          const isImg = imageExts.has(ext);
+          return `<li class="context-source-row">
+            <button type="button" class="context-source-link" data-act="${isImg ? "preview-image" : "preview"}" data-id="${e(file.id)}" data-name="${e(file.name)}" title="点击预览 ${e(file.name)}">
+              ${icon(sourceIconName(ext))}<span class="context-source-name">${e(file.name)}</span>
+            </button>
+            <span class="context-source-tag is-ok">${isImg ? "已存文件库" : "已上传"}</span>
+            <button type="button" class="context-source-remove" data-act="chat-remove-source" data-id="${e(file.id)}" title="移除该文件" aria-label="移除 ${e(file.name)}">${icon("x")}</button>
+          </li>`;
+        }).join("")}
+        ${pending.map((item) => `<li class="context-source-row">
+          <span class="context-source-link">${icon(sourceIconName(item.extension))}<span class="context-source-name">${e(item.name)}</span></span>
+          <span class="context-source-tag ${item.status === "error" ? "is-error" : "is-uploading"}">${item.status === "error" ? "上传失败" : "上传中…"}</span>
+          <button type="button" class="context-source-remove" data-act="chat-cancel-upload" data-id="${e(item.tempId)}" title="${item.status === "error" ? "关闭" : "取消上传"}" aria-label="取消 ${e(item.name)}">${icon("x")}</button>
+        </li>`).join("")}
+      </ul>
+    </div>` : ""}
+    ${previousOnly.length ? `<div class="context-subblock">
+      <small class="context-sublabel">本会话已读取过</small>
+      <ul class="context-files context-source-list">
+        ${previousOnly.map((file) => {
+          const ext = String(file.extension || "").toLowerCase();
+          return `<li class="context-source-row">
+            <button type="button" class="context-source-link" data-act="preview" data-id="${e(file.id)}" data-name="${e(file.name)}" title="点击预览 ${e(file.name)}">
+              ${icon(sourceIconName(ext))}<span class="context-source-name">${e(file.name)}</span>
+            </button>
+            ${readable.has(ext) ? `<button type="button" class="text-button context-source-reattach" data-act="chat-reattach-source" data-id="${e(file.id)}" title="重新挂载到当前输入框">再次引用</button>` : ""}
+          </li>`;
+        }).join("")}
+      </ul>
+    </div>` : ""}
+  </section>`;
+
   return `<div class="studio-context-body">
+    ${materialsSection}
     ${project ? `<section class="context-group"><p class="context-label">项目共享资料</p><h3>${e(project.name)}</h3>
       ${project.context.length ? `<ul class="context-files">${project.context.slice(0, 8).map((item) => `<li>${icon("clip")}<span>${e(item.title)}</span></li>`).join("")}</ul>` : '<p class="hint">暂无共享资料</p>'}
       ${button("打开项目空间", "route", { id: "projects/" + project.id, icon: "right", cls: "sm" })}</section>` : ""}
@@ -1499,10 +1625,41 @@ function studioPane(workspace, activeTab) {
   </aside>`;
 }
 
-function selectedFiles(selected) {
-  return selected.map((file) => `<span class="attached-file">${icon("clip")}<span>${e(file.name)}</span>
-    <button type="button" data-act="chat-remove-source" data-id="${e(file.id)}" aria-label="移除 ${e(file.name)}">${icon("x")}</button>
-  </span>`).join("");
+function selectedFiles(selected, pending = []) {
+  const readyHtml = (Array.isArray(selected) ? selected : []).map((file) => {
+    const ext = String(file.extension || "").toLowerCase();
+    const isImg = imageExts.has(ext);
+    const sizeText = formatFileSizeCompact(file.size);
+    const statusLabel = isImg ? "已上传 · 文件库" : "已上传";
+    const tip = isImg
+      ? `${file.name}${sizeText ? `（${sizeText}）` : ""} · 图片已上传至「我的文件」，点击预览`
+      : `${file.name}${sizeText ? `（${sizeText}）` : ""} · 已上传成功，发送时 AI 将读取，点击预览`;
+    return `<span class="attached-file is-ready ${isImg ? "is-image" : ""}" data-file-id="${e(file.id)}">
+      <button type="button" class="attached-main" data-act="${isImg ? "preview-image" : "preview"}" data-id="${e(file.id)}" data-name="${e(file.name)}" title="${e(tip)}">
+        <span class="attached-icon">${icon(sourceIconName(ext))}</span>
+        <span class="attached-name">${e(file.name)}</span>
+        ${sizeText ? `<span class="attached-size">${e(sizeText)}</span>` : ""}
+        <span class="attached-status is-ok">${icon("checkPlain")}<span>${e(statusLabel)}</span></span>
+      </button>
+      <button type="button" class="attached-remove" data-act="chat-remove-source" data-id="${e(file.id)}" title="取消移除 ${e(file.name)}" aria-label="移除 ${e(file.name)}">${icon("x")}</button>
+    </span>`;
+  }).join("");
+
+  const pendingHtml = (Array.isArray(pending) ? pending : []).map((item) => {
+    const isErr = item.status === "error";
+    const sizeText = formatFileSizeCompact(item.size);
+    return `<span class="attached-file ${isErr ? "is-error" : "is-uploading"}" data-temp-id="${e(item.tempId)}" title="${e(isErr ? (item.error || "上传失败") : `正在上传 ${item.name}…`)}">
+      <span class="attached-main">
+        <span class="attached-icon">${isErr ? icon("alert") : '<span class="attached-spinner" aria-hidden="true"></span>'}</span>
+        <span class="attached-name">${e(item.name)}</span>
+        ${sizeText ? `<span class="attached-size">${e(sizeText)}</span>` : ""}
+        <span class="attached-status ${isErr ? "is-error" : "is-uploading"}">${e(isErr ? "上传失败" : "上传中…")}</span>
+      </span>
+      <button type="button" class="attached-remove" data-act="chat-cancel-upload" data-id="${e(item.tempId)}" title="${isErr ? "关闭失败提示" : "取消上传"}" aria-label="${isErr ? "关闭" : "取消上传"} ${e(item.name)}">${icon("x")}</button>
+    </span>`;
+  }).join("");
+
+  return readyHtml + pendingHtml;
 }
 
 function composer(workspace) {
@@ -1517,6 +1674,7 @@ function composer(workspace) {
   const imageAutoOn = showImageControls && imageAutoPreference();
   const drawerOpen = showImageControls && Boolean(state.imageDrawerOpen);
   const selectedCount = (draft.selected || []).length;
+  const pendingList = pendingUploadListFor(workspace.draftKey);
   const draftText = draft.message || "";
   if (workspace.task && !active(workspace.task.status)) {
     return `<div class="composer-wrap"><div class="chat-composer">${blocked ? '<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>' : ""}
@@ -1528,7 +1686,7 @@ function composer(workspace) {
     ${blocked ? '<p class="notice" role="status">请在桌面客户端中使用 AI 办理</p>' : ""}
     <div class="guidance-queue" data-chat-guidance>${guidanceQueueMarkup(workspace.session?.id || "")}</div>
     <div class="attached-files" data-chat-selection>${selectionChip(draft.selection)}</div>
-    <div class="attached-files" data-chat-selected>${selectedFiles(draft.selected || [])}</div>
+    <div class="attached-files" data-chat-selected>${selectedFiles(draft.selected || [], pendingList)}</div>
     <div class="composer-grow" data-composer-grow data-replicated-value="${e(draftText + "\n")}">
       <textarea required name="message" rows="1" maxlength="6000" aria-label="办公请求"
         placeholder="描述你想完成的工作，输入 / 唤起指令…" ${blocked ? "disabled" : ""}>${e(draftText)}</textarea>
@@ -1861,70 +2019,226 @@ export function useExample(value) {
   form.elements.message.focus();
 }
 
-function updateSources(workspace, change) {
+function syncSourcesDom(workspace = state.chatWorkspace) {
+  const activeWs = state.chatWorkspace;
+  if (!workspace || !activeWs || workspace.draftKey !== activeWs.draftKey) return;
   const form = chatForm();
-  if (workspace !== state.chatWorkspace || !form) return;
-  const selected = change(draftFor(workspace).selected || []);
-  writeDraft(workspace, form, { selected });
-  form.querySelector("[data-chat-selected]").innerHTML = selectedFiles(selected);
-  const countEl = form.querySelector("[data-sources-count]");
-  const btnEl = form.querySelector("[data-sources-btn]");
-  if (countEl) {
-    countEl.textContent = String(selected.length);
-    countEl.hidden = selected.length === 0;
+  const selected = draftFor(activeWs).selected || [];
+  const pending = pendingUploadListFor(activeWs.draftKey);
+  if (form) {
+    const slot = form.querySelector("[data-chat-selected]");
+    if (slot) slot.innerHTML = selectedFiles(selected, pending);
+    const countEl = form.querySelector("[data-sources-count]");
+    const btnEl = form.querySelector("[data-sources-btn]");
+    if (countEl) {
+      countEl.textContent = String(selected.length);
+      countEl.hidden = selected.length === 0;
+    }
+    if (btnEl) btnEl.classList.toggle("has-value", selected.length > 0);
+    syncChatSubmit(form, activeWs);
   }
-  if (btnEl) btnEl.classList.toggle("has-value", selected.length > 0);
+  updateContextDom(activeWs);
+}
+
+function updateSources(workspace, change) {
+  const targetWs = workspace || state.chatWorkspace;
+  if (!targetWs) return;
+  const form = (targetWs === state.chatWorkspace || targetWs.draftKey === state.chatWorkspace?.draftKey) ? chatForm() : null;
+  const selected = change(draftFor(targetWs).selected || []);
+  writeDraft(targetWs, form?.dataset?.busy ? null : form, { selected });
+  syncSourcesDom(targetWs);
 }
 
 export function removeSource(id) {
-  updateSources(state.chatWorkspace, (sources) => sources.filter((file) => file.id !== id));
+  const workspace = state.chatWorkspace;
+  if (!workspace || !id) return;
+  const current = draftFor(workspace).selected || [];
+  const removed = current.find((file) => file.id === id);
+  updateSources(workspace, (sources) => sources.filter((file) => file.id !== id));
+  if (removed) {
+    const isBusy = Boolean(chatForm()?.dataset?.busy || activeTurnFor(currentLiveThreadId(workspace)));
+    toastMessage(
+      isBusy ? `已移除「${removed.name}」（后续轮次与重做将不再携带该文件）` : `已取消文件「${removed.name}」`,
+      "info"
+    );
+  }
+}
+
+export function cancelPendingUpload(tempId) {
+  const workspace = state.chatWorkspace;
+  if (!workspace || !tempId) return;
+  const key = workspace.draftKey;
+  const list = pendingUploadListFor(key);
+  const target = list.find((item) => item.tempId === tempId);
+  if (target?.controller) {
+    try { target.controller.abort(); } catch {}
+  }
+  const next = list.filter((item) => item.tempId !== tempId);
+  if (next.length) pendingUploads.set(key, next);
+  else pendingUploads.delete(key);
+  syncSourcesDom(workspace);
+  if (target && target.status === "uploading") {
+    toastMessage(`已取消上传「${target.name}」`, "info");
+  }
+}
+
+export function reattachSource(fileId) {
+  const workspace = state.chatWorkspace;
+  if (!workspace || !fileId) return;
+  const historyList = sessionHistoryMaterials(workspace);
+  const found = historyList.find((file) => file.id === fileId);
+  if (!found) return;
+  const current = draftFor(workspace).selected || [];
+  if (current.some((f) => f.id === fileId)) {
+    toastMessage(`「${found.name}」已在当前输入框中`, "info");
+    return;
+  }
+  if (readableSourcesOnly(current).length >= 8) {
+    toastMessage("每轮最多添加 8 份参考资料", "error");
+    return;
+  }
+  updateSources(workspace, (sources) => [...sources, found]);
+  toastMessage(`已重新挂载「${found.name}」`, "success");
 }
 
 export async function attachFiles(files, input) {
   const workspace = state.chatWorkspace;
   if (!workspace) throw new Error("请先打开会话后再添加附件");
-  if (chatForm()?.dataset.busy) throw new Error("请等待当前请求执行结束");
+  const rawList = Array.from(files || []);
+  if (!rawList.length) return;
   const existing = draftFor(workspace).selected || [];
-  const docFiles = [];
-  const imgFiles = [];
-  for (const file of files) {
-    const ext = String(file?.name || "").includes(".") ? file.name.split(".").pop().toLowerCase() : "";
-    if (readable.has(ext)) docFiles.push(file);
-    else if (imageExts.has(ext)) imgFiles.push(file);
-    else throw new Error(`「${file?.name || "文件"}」格式不支持，请选择 Word、PowerPoint、Excel、PDF、TXT、Markdown、CSV 或常见图片`);
-  }
-  if (existing.length + docFiles.length > 8) throw new Error("每轮最多添加 8 份参考资料");
-  const controls = chatForm()?.querySelectorAll("button[type=submit]");
-  controls?.forEach((control) => { control.disabled = true; });
-  try {
-    const allUploaded = await uploadSelected([...docFiles, ...imgFiles], workspace.task?.id || "");
-    const addedDocs = allUploaded.filter((item) => readable.has(String(item.extension || "").toLowerCase()));
-    const addedImgs = allUploaded.filter((item) => imageExts.has(String(item.extension || "").toLowerCase()));
-    if (addedDocs.length) {
-      updateSources(workspace, (sources) => [...sources, ...addedDocs]);
+  const currentPending = pendingUploadListFor(workspace.draftKey);
+  const existingDocCount = readableSourcesOnly(existing).length
+    + currentPending.filter((p) => p.status === "uploading" && readable.has(p.extension)).length;
+
+  const accepted = [];
+  let addedDocCount = 0;
+  for (const file of rawList) {
+    const name = String(file?.name || "文件");
+    const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+    if (!readable.has(ext) && !imageExts.has(ext)) {
+      if (input) input.value = "";
+      throw new Error(`「${name}」格式不支持，请选择 Word、PowerPoint、Excel、PDF、TXT、Markdown、CSV 或常见图片`);
     }
-    if (addedDocs.length && addedImgs.length) {
-      toastMessage(`已加入 ${addedDocs.length} 份参考资料，${addedImgs.length} 张图片已保存到「我的文件」`, "success");
-    } else if (addedDocs.length) {
-      toastMessage("附件已加入会话", "success");
-    } else if (addedImgs.length) {
-      toastMessage("图片已上传到「我的文件」（当前会话参考资料仅支持文档与表格）", "success");
+    if (readable.has(ext)) {
+      if (existingDocCount + addedDocCount >= 8) {
+        if (input) input.value = "";
+        throw new Error("每轮最多添加 8 份参考资料");
+      }
+      addedDocCount += 1;
     }
-  } catch (error) {
-    recordClientLog("error", "upload", cleanErrorMessage(error, "拖拽上传失败"), {
-      count: files.length,
-      names: files.slice(0, 4).map((f) => f?.name || "")
+    accepted.push({
+      file,
+      tempId: uuid(),
+      name,
+      extension: ext,
+      size: typeof file.size === "number" ? file.size : 0,
+      status: "uploading",
+      error: "",
+      controller: new AbortController()
     });
-    throw error;
-  } finally {
-    syncChatSubmit(chatForm(), workspace);
-    if (input) input.value = "";
+  }
+  if (input) input.value = "";
+
+  // 0 毫秒立刻在输入框上方渲染「上传中…」占位卡片与取消按钮，消除拖入无反应的焦虑
+  const getKey = () => (state.chatWorkspace && (state.chatWorkspace === workspace || state.chatWorkspace.session?.id === workspace.session?.id))
+    ? state.chatWorkspace.draftKey
+    : workspace.draftKey;
+  const appendPending = (items) => {
+    const k = getKey();
+    pendingUploads.set(k, [...pendingUploadListFor(k), ...items]);
+    syncSourcesDom(state.chatWorkspace || workspace);
+  };
+  const removePendingById = (tempId) => {
+    for (const [k, arr] of pendingUploads.entries()) {
+      if (arr.some((it) => it.tempId === tempId)) {
+        const next = arr.filter((it) => it.tempId !== tempId);
+        if (next.length) pendingUploads.set(k, next);
+        else pendingUploads.delete(k);
+      }
+    }
+  };
+  const markPendingError = (tempId, errMsg) => {
+    for (const [k, arr] of pendingUploads.entries()) {
+      let hit = false;
+      const next = arr.map((it) => {
+        if (it.tempId !== tempId) return it;
+        hit = true;
+        return { ...it, status: "error", error: errMsg, controller: null };
+      });
+      if (hit) pendingUploads.set(k, next);
+    }
+  };
+
+  appendPending(accepted);
+
+  // 第一时间把所有 File 读入内存，杜绝 Electron 拖放句柄失效
+  const materializedPairs = [];
+  for (const entry of accepted) {
+    if (entry.controller.signal.aborted) continue;
+    try {
+      const readyFile = await materializeFile(entry.file);
+      materializedPairs.push({ entry, readyFile });
+    } catch (err) {
+      const msg = cleanErrorMessage(err, `读取「${entry.name}」失败`);
+      markPendingError(entry.tempId, msg);
+      syncSourcesDom(state.chatWorkspace || workspace);
+      recordClientLog("error", "upload", msg, { name: entry.name });
+      toastMessage(msg, "error");
+    }
+  }
+
+  let addedDocs = 0;
+  let addedImgs = 0;
+  for (const { entry, readyFile } of materializedPairs) {
+    if (entry.controller.signal.aborted) {
+      removePendingById(entry.tempId);
+      syncSourcesDom(state.chatWorkspace || workspace);
+      continue;
+    }
+    try {
+      const uploaded = await uploadOneFile(readyFile, {
+        assignment: (state.chatWorkspace || workspace).task?.id || "",
+        signal: entry.controller.signal,
+        preMaterialized: true
+      });
+      removePendingById(entry.tempId);
+      const targetWs = (state.chatWorkspace && (state.chatWorkspace === workspace || state.chatWorkspace.session?.id === workspace.session?.id))
+        ? state.chatWorkspace
+        : workspace;
+      updateSources(targetWs, (sources) => {
+        if (sources.some((s) => s.id === uploaded.id)) return sources;
+        return [...sources, uploaded];
+      });
+      const ext = String(uploaded.extension || entry.extension || "").toLowerCase();
+      if (readable.has(ext)) addedDocs += 1;
+      else if (imageExts.has(ext)) addedImgs += 1;
+    } catch (err) {
+      if (entry.controller.signal.aborted || err?.name === "AbortError") {
+        removePendingById(entry.tempId);
+        syncSourcesDom(state.chatWorkspace || workspace);
+        continue;
+      }
+      const msg = cleanErrorMessage(err, `上传「${entry.name}」失败`);
+      markPendingError(entry.tempId, msg);
+      syncSourcesDom(state.chatWorkspace || workspace);
+      recordClientLog("error", "upload", msg, { name: entry.name });
+      toastMessage(msg, "error");
+    }
+  }
+
+  if (addedDocs && addedImgs) {
+    toastMessage(`已上传 ${addedDocs} 份参考资料与 ${addedImgs} 张图片`, "success");
+  } else if (addedDocs) {
+    toastMessage(addedDocs > 1 ? `已上传 ${addedDocs} 份参考资料` : "文件已上传并加入当前会话", "success");
+  } else if (addedImgs) {
+    toastMessage("图片已上传至「我的文件」（可点击预览或随时移除）", "success");
   }
 }
 
 export async function showSources() {
   const workspace = state.chatWorkspace;
-  if (chatForm()?.dataset.busy) return;
+  if (!workspace) return;
   const personal = await api("/files");
   if (state.chatWorkspace !== workspace) return;
   const available = [...(workspace.task?.materials || []),
@@ -1936,7 +2250,7 @@ export async function showSources() {
   const chosen = new Set((draftFor(workspace).selected || []).map((file) => file.id));
   modal("引用资料", `<form class="stack" data-form="chat-sources">
     <div class="file-list">${[...selected.values()].map((file) => fileMarkup(file, { check: "ids", checked: chosen.has(file.id) })).join("") ||
-      '<p class="hint">当前可引用的文件为空。可以从输入区直接添加附件。</p>'}</div>
+      '<p class="hint">当前可引用的文件为空。可以从输入区直接拖拽或添加附件。</p>'}</div>
     <div class="actions"><button class="button primary" type="submit">使用所选资料</button></div></form>`);
 }
 
@@ -2027,8 +2341,13 @@ function setComposerLocked(form, locked, workspace = state.chatWorkspace) {
   const threadId = currentLiveThreadId(workspace);
   const live = activeTurnFor(threadId);
   const allowGuidanceTyping = Boolean(locked && (!live || live.kind !== "image"));
-  for (const field of form.querySelectorAll("select, input[type=file], button[data-act=chat-sources], button[data-act=chat-remove-source], button[data-act=slash-trigger], button[data-act=chat-generate-image], button[data-act=picker-toggle]")) {
+  // 注意：思考过程中绝不锁死 chat-remove-source / chat-cancel-upload / chat-sources / input[type=file]，
+  // 确保用户随时可以取消/移除已上传文件或管理附件。
+  for (const field of form.querySelectorAll("select, button[data-act=slash-trigger], button[data-act=chat-generate-image], button[data-act=picker-toggle]")) {
     field.disabled = locked;
+  }
+  for (const removeBtn of form.querySelectorAll("button[data-act=chat-remove-source], button[data-act=chat-cancel-upload], button[data-act=chat-sources], input[type=file]")) {
+    removeBtn.disabled = false;
   }
   const textarea = form.elements?.message;
   if (textarea) {
@@ -2418,6 +2737,8 @@ async function refreshConversationInPlace(workspace, threadId, { selectId = "", 
   }
   const selChip = document.querySelector("[data-chat-selection]");
   if (selChip) selChip.innerHTML = "";
+  syncSourcesDom(currentWorkspace);
+  updateContextDom(currentWorkspace);
   scrollToLatest();
 
   const artifacts = studioArtifacts(freshSession);
@@ -2604,6 +2925,7 @@ async function runConversationTurn({
   writeDraft(workspace, form, { newId: threadId, pending: { id: requestId, signature } });
   const liveKind = inferLiveCanvasKind(message, payload.mode, payload.selection || draft.selection, workspace);
   const canCancel = !clientExecutionRequired() || typeof window.officeDesktop?.cancelAgent === "function";
+  const initialMaterials = readableSourcesOnly(selected);
   const live = {
     threadId,
     runId: null,
@@ -2611,6 +2933,7 @@ async function runConversationTurn({
     kind: "turn",
     message,
     selection: payload.selection || draft.selection || null,
+    materials: initialMaterials,
     steps: [],
     statusText: resume ? "正在从断点恢复执行…" : "正在思考…",
     liveKind,
@@ -2623,6 +2946,7 @@ async function runConversationTurn({
   };
   activeTurns.set(threadId, live);
   emitConversationsUpdated();
+  updateContextDom(workspace);
 
   const initialInView = () => Boolean(form?.isConnected && state.me?.id === user);
   let pendingAutoNext = null;
@@ -2634,16 +2958,36 @@ async function runConversationTurn({
   document.querySelector("[data-checkpoint-card]")?.remove();
   try {
     if (!workspace.session) {
+      const oldDraftKey = workspace.draftKey;
       const created = await post("/conversations", {
         id: threadId, assignment_id: workspace.task?.id || null,
         project_id: workspace.project?.id || null
       });
       workspace.session = created;
       ensureConversationListed(created, workspace);
+      const nextDraftKey = "chat/" + threadId;
+      const latestOldDraft = readDraft(oldDraftKey) || {};
+      const migratedSelected = Array.isArray(latestOldDraft.selected) ? latestOldDraft.selected : selected;
+      saveDraft(nextDraftKey, {
+        ...(readDraft(nextDraftKey) || {}),
+        selected: migratedSelected,
+        mode: payload.mode
+      });
+      if (oldDraftKey && oldDraftKey !== nextDraftKey) {
+        saveDraft(oldDraftKey, { message: "", selected: [], selection: null, newId: null, pending: null });
+        if (pendingUploads.has(oldDraftKey)) {
+          pendingUploads.set(nextDraftKey, [
+            ...pendingUploadListFor(nextDraftKey),
+            ...pendingUploadListFor(oldDraftKey)
+          ]);
+          pendingUploads.delete(oldDraftKey);
+        }
+      }
+      workspace.draftKey = nextDraftKey;
       if (initialInView()) {
-        workspace.draftKey = "chat/" + threadId;
         history.replaceState(null, "", "#chat/" + encodeURIComponent(threadId));
         state.route = ["chat", threadId];
+        updateContextDom(workspace);
       }
     }
     if (isViewingThread(threadId, user)) {
@@ -2683,13 +3027,15 @@ async function runConversationTurn({
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);
     workspace.checkpoint = null;
-    writeDraft(workspace, null, { message: "", newId: null, pending: null, selection: null });
+    const latestThreadDraft = readDraft("chat/" + threadId) || readDraft(workspace.draftKey) || {};
+    const currentSelected = Array.isArray(latestThreadDraft.selected) ? latestThreadDraft.selected : selected;
+    writeDraft(workspace, null, { message: "", newId: null, pending: null, selection: null, selected: currentSelected });
     const latestFileId = completed.file && ["pptx", "docx"].includes(completed.file.extension)
       ? completed.file.id
       : (completed.images?.[0]?.file?.id || "");
     const targetPage = completed.file?.extension === "pptx" ? ((payload.selection || draft.selection)?.slide || 1) : 1;
     const deck = latestFileId ? { fileId: latestFileId, page: targetPage } : draft.deck;
-    saveDraft("chat/" + threadId, { selected, mode: payload.mode, deck });
+    saveDraft("chat/" + threadId, { selected: currentSelected, mode: payload.mode, deck });
     if (completed.file && workspace.task) {
       const key = "submit/" + workspace.task.id;
       const submission = readDraft(key) || {};
@@ -2737,11 +3083,14 @@ async function runConversationTurn({
     if (followups.length && state.me?.id === user) {
       queuedGuidance.delete(threadId);
       syncGuidanceDom(threadId);
+      const nextSel = Array.isArray((readDraft("chat/" + threadId) || {}).selected)
+        ? (readDraft("chat/" + threadId) || {}).selected
+        : currentSelected;
       pendingAutoNext = {
         kind: "followup",
         message: formatFollowUpGuidanceMessage(followups.map((item) => item.text)),
         mode: payload.mode,
-        selected: [],
+        selected: nextSel,
         selection: null
       };
     }
@@ -2749,6 +3098,9 @@ async function runConversationTurn({
     activeTurns.delete(threadId);
     sessionCache.delete(threadId);
     emitConversationsUpdated();
+    const key = workspace.session?.id ? "chat/" + threadId : workspace.draftKey;
+    const latestDraftNow = readDraft(key) || readDraft(workspace.draftKey) || draft;
+    const latestSelectedNow = Array.isArray(latestDraftNow.selected) ? latestDraftNow.selected : selected;
     const redirectTexts = Array.isArray(live.redirectGuidance) && live.redirectGuidance.length ? live.redirectGuidance : null;
     if (redirectTexts && state.me?.id === user) {
       if (isViewingThread(threadId, user)) {
@@ -2759,7 +3111,7 @@ async function runConversationTurn({
         kind: "redirect",
         message: formatMergedGuidanceMessage(message, redirectTexts),
         mode: payload.mode,
-        selected,
+        selected: latestSelectedNow,
         selection: payload.selection || draft.selection || null
       };
     } else {
@@ -2768,9 +3120,8 @@ async function runConversationTurn({
     if (error instanceof Error) error.message = cleanedMessage;
     else error = new Error(cleanedMessage);
     if (state.me?.id === user) {
-      const key = workspace.session?.id ? "chat/" + threadId : workspace.draftKey;
       const pending = error.retryAsNew ? null : { id: requestId, signature };
-      saveDraft(key, { ...draft, message, mode: payload.mode, newId: threadId, pending });
+      saveDraft(key, { ...draft, selected: latestSelectedNow, message, mode: payload.mode, newId: threadId, pending });
       workspace.draftKey = key;
       workspace.checkpoint = await loadCheckpointFor(threadId, user);
     }
@@ -2821,10 +3172,13 @@ async function runConversationTurn({
         if (state.me?.id !== user || activeTurnFor(threadId)) return;
         const targetWorkspace = state.chatWorkspace?.session?.id === threadId ? state.chatWorkspace : workspace;
         const targetForm = isViewingThread(threadId, user) ? chatForm() : null;
+        const nextSelected = Array.isArray((draftFor(targetWorkspace) || {}).selected)
+          ? (draftFor(targetWorkspace) || {}).selected
+          : (nextJob.selected || []);
         const nextPayload = {
           message: nextJob.message,
           mode: nextJob.selection ? "auto" : (nextJob.mode || "auto"),
-          material_ids: (nextJob.selected || []).map((file) => file.id),
+          material_ids: readableSourcesOnly(nextSelected).map((file) => file.id),
           ...(nextJob.selection ? { selection: nextJob.selection } : {})
         };
         toastMessage(
@@ -2836,7 +3190,7 @@ async function runConversationTurn({
           form: targetForm,
           message: nextJob.message,
           payload: nextPayload,
-          selected: nextJob.selected || [],
+          selected: nextSelected,
           draft: draftFor(targetWorkspace),
           allowAiImages,
           resume: false,
@@ -2854,12 +3208,16 @@ export async function sendMessage(form, rerender) {
   if (clientExecutionRequired() && typeof window.officeDesktop?.runAgent !== "function") {
     throw new Error("请在桌面客户端中使用 AI 办理");
   }
+  if (hasActiveUploadsFor(workspace)) {
+    throw new Error("附件正在上传中，请稍候完成后再发送");
+  }
   const message = form.elements.message.value.trim();
   if (!message) throw new Error("请输入工作要求");
   const draft = draftFor(workspace);
   const selected = draft.selected || [];
+  const docSelected = readableSourcesOnly(selected);
   const payload = {
-    message, mode: draft.selection ? "auto" : form.elements.mode.value, material_ids: selected.map((file) => file.id),
+    message, mode: draft.selection ? "auto" : form.elements.mode.value, material_ids: docSelected.map((file) => file.id),
     ...(draft.selection ? { selection: draft.selection } : {})
   };
   if (clientExecutionRequired() && !selectedModelAvailable(workspace)) {

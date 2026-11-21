@@ -252,12 +252,62 @@ def owned_thread(db, key, user):
     return row
 
 
-def public_turn(row):
+def _load_turn_materials_map(db, rows) -> dict[str, dict[str, Any]]:
+    needed: list[str] = []
+    seen: set[str] = set()
+    for row in rows or ():
+        res = unpack(row["result"] or "{}")
+        if isinstance(res.get("materials"), list):
+            continue
+        inp = unpack(row["input"] or "{}")
+        for mid in inp.get("material_ids") or ():
+            if isinstance(mid, str) and mid and mid not in seen:
+                seen.add(mid)
+                needed.append(mid)
+    if not needed:
+        return {}
+    placeholders = ",".join("?" for _ in needed)
+    found = db.all(
+        f"SELECT id, name, extension, size FROM artifacts WHERE id IN ({placeholders})",
+        tuple(needed),
+    )
+    return {
+        r["id"]: {"id": r["id"], "name": r["name"], "extension": r["extension"], "size": r["size"]}
+        for r in found
+    }
+
+
+def _material_metas_for_ids(db, material_ids: list[str]) -> list[dict[str, Any]]:
+    ids = [str(mid) for mid in dict.fromkeys(material_ids or ()) if isinstance(mid, str) and mid]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    found = {
+        r["id"]: {"id": r["id"], "name": r["name"], "extension": r["extension"], "size": r["size"]}
+        for r in db.all(f"SELECT id, name, extension, size FROM artifacts WHERE id IN ({placeholders})", tuple(ids))
+    }
+    return [found[mid] for mid in ids if mid in found]
+
+
+def public_turn(row, materials_by_id: dict[str, dict[str, Any]] | None = None):
     result = unpack(row["result"])
-    body=unpack(row["input"])
-    return {"id": row["id"], "message": body["message"], "selection":body.get("selection"), "status": row["status"],
-            **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry", "pipeline",
-                "kind", "prompt", "model", "size", "quality", "width", "height", "images") if name in result}}
+    body = unpack(row["input"])
+    materials = result.get("materials") if isinstance(result.get("materials"), list) else None
+    if materials is None:
+        mids = body.get("material_ids") or []
+        if mids and materials_by_id:
+            materials = [materials_by_id[mid] for mid in dict.fromkeys(mids) if mid in materials_by_id]
+        else:
+            materials = []
+    return {
+        "id": row["id"],
+        "message": body["message"],
+        "selection": body.get("selection"),
+        "materials": materials,
+        "status": row["status"],
+        **{name: result[name] for name in ("reply", "steps", "file", "error", "output_telemetry", "pipeline",
+            "kind", "prompt", "model", "size", "quality", "width", "height", "images") if name in result},
+    }
 
 
 def conversation_summary(row):
@@ -372,7 +422,8 @@ def thread(key: str, user: User, limit: int = Query(50, ge=1, le=100), offset: i
         session = owned_thread(db, key, user)
         turns = db.all("SELECT * FROM office_turns WHERE conversation_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                        (key, limit, offset))
-    return {**conversation_summary(session), "turns": [public_turn(row) for row in reversed(turns)],
+        materials_map = _load_turn_materials_map(db, turns)
+    return {**conversation_summary(session), "turns": [public_turn(row, materials_map) for row in reversed(turns)],
             "has_earlier": len(turns) == limit}
 
 
@@ -1119,6 +1170,7 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
             return {"replay": replay_row}
         task = writable_task(db, assignment, user)
         data = collect_sources(db, user, task, body.material_ids)
+        material_metas = _material_metas_for_ids(db, body.material_ids)
         project_data = project_sources(db, session["project_id"], user)
         target = selection_target(db, key, body, user)
         recent, latest = history_for(db, key)
@@ -1176,10 +1228,13 @@ async def prepare_conversation(key, body, user, *, engine="desktop", allow_repla
             selection_target(db, key, body, user)
         recent, latest = history_for(db, key)
         prompt_data = build_turn_request(body, task, sources, recent, latest, project, scope, assignment)
+        initial_result = {"steps": steps}
+        if material_metas:
+            initial_result["materials"] = material_metas
         db.execute("INSERT INTO runs(id,assignment_id,user_id,kind,engine,status,usage,created_at) VALUES(?,?,?,?,?,?,?,?)",
                    (run, assignment, user["id"], "conversation", engine, "running", pack({"model": None}), now))
         db.execute("INSERT INTO office_turns(id,conversation_id,request_id,input,result,status,created_at) VALUES(?,?,?,?,?,?,?)",
-                   (run, key, str(body.id), request, pack({"steps": steps}), "running", now))
+                   (run, key, str(body.id), request, pack(initial_result), "running", now))
         title = " ".join(body.message.split())[:42] if session["title"] == "新会话" else session["title"]
         db.execute("UPDATE office_conversations SET title=?,updated_at=? WHERE id=?", (title, now, key))
         audit(db, "agent.started", user["id"], assignment, run_id=run, engine=engine)
@@ -1330,7 +1385,8 @@ async def complete_turn(key, run, payload, user, *, expected_engine):
         else:
             db.execute("UPDATE office_conversations SET updated_at=? WHERE id=?", (instant(), key))
         audit(db, "agent.completed", user["id"], assignment, run_id=run, engine=expected_engine, usage=stored_usage)
-        return public_turn(db.one("SELECT * FROM office_turns WHERE id=?", (run,)))
+        completed_row = db.one("SELECT * FROM office_turns WHERE id=?", (run,))
+        return public_turn(completed_row, _load_turn_materials_map(db, [completed_row]))
 
 
 async def server_turn(prepared):
